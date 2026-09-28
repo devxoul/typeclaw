@@ -860,7 +860,8 @@ export function resolveModel(ref: KnownModelRef | ModelRef | string): Model<Know
   // Anthropic's streamSimple gates adaptive thinking on the resolved model's
   // `reasoning` capability, so a dated Sonnet 5 alias must inherit that too.
   // That entry's compat and thinkingLevelMap are used, minus
-  // `allowedFallbackModels` (see the Fable 5 record). Without a catalog match
+  // `allowedFallbackModels` (see the Fable 5 record) and `supportsStrictTools`
+  // (see the Anthropic records in providers.ts). Without a catalog match
   // `thinkingLevelMap` is deliberately not carried: it varies per model even
   // within one provider, so copying the template's would be a guess.
   const builtin = findBuiltinModel(providerId, modelId)
@@ -869,7 +870,10 @@ export function resolveModel(ref: KnownModelRef | ModelRef | string): Model<Know
   if (catalogMetadata !== undefined) {
     const catalogCompat: Record<string, unknown> | undefined =
       catalogMetadata.compat === undefined ? undefined : { ...catalogMetadata.compat }
-    if (catalogCompat !== undefined) delete catalogCompat.allowedFallbackModels
+    if (catalogCompat !== undefined) {
+      delete catalogCompat.allowedFallbackModels
+      delete catalogCompat.supportsStrictTools
+    }
     compat = catalogCompat as Model<KnownApi>['compat']
   }
   return {
