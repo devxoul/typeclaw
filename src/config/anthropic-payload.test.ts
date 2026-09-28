@@ -3,6 +3,7 @@ import { describe, expect, test } from 'bun:test'
 import { normalizeContext, type Context, type Model } from '@earendil-works/pi-ai'
 import { streamSimple } from '@earendil-works/pi-ai/api/anthropic-messages'
 
+import { resolveModel } from './config'
 import { KNOWN_PROVIDERS } from './providers'
 
 // End-to-end payload guard for the curated Anthropic models, driving pi-ai's
@@ -56,11 +57,20 @@ async function buildAnthropicPayload(model: Model<'anthropic-messages'>): Promis
   return captured
 }
 
+// Dated aliases resolve through pi's catalog compat, which itself sets
+// `supportsStrictTools`, so they need the same guarantee as curated records.
+const DATED_ALIASES = ['anthropic/claude-sonnet-5-20260701', 'anthropic/claude-opus-5-5-20260922'] as const
+
 function anthropicModels(): Array<[string, Model<'anthropic-messages'>]> {
-  return Object.entries(KNOWN_PROVIDERS.anthropic.models).map(([id, model]) => [
-    `anthropic/${id}`,
-    model as Model<'anthropic-messages'>,
-  ])
+  return [
+    ...Object.entries(KNOWN_PROVIDERS.anthropic.models).map(
+      ([id, model]) =>
+        [`anthropic/${id}`, model as Model<'anthropic-messages'>] as [string, Model<'anthropic-messages'>],
+    ),
+    ...DATED_ALIASES.map(
+      (ref) => [ref, resolveModel(ref) as Model<'anthropic-messages'>] as [string, Model<'anthropic-messages'>],
+    ),
+  ]
 }
 
 describe('anthropic messages payload', () => {
