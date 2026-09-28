@@ -393,6 +393,13 @@ export const KNOWN_PROVIDERS = {
       // these catalog fields Sonnet 4.6 and Opus 4.7 fall back to budget
       // thinking, which Anthropic deprecates on 4.6 and rejects with a 400 on
       // 4.7+ (platform.claude.com/docs/en/build-with-claude/extended-thinking).
+      //
+      // No Anthropic record sets `compat.supportsStrictTools`. With it, pi sends
+      // its strict-preferring built-ins (read/write/edit/bash) as strict tools,
+      // turning each optional param into a nullable union. Together with our
+      // own enum-union tool params that exceeds Anthropic's 16-union-param
+      // request cap, and every channel turn 400s. Guarded by
+      // anthropic-payload.test.ts.
       'claude-sonnet-4-6': {
         id: 'claude-sonnet-4-6',
         name: 'Claude Sonnet 4.6',
@@ -405,7 +412,7 @@ export const KNOWN_PROVIDERS = {
         contextWindow: 1000000,
         maxTokens: 64000,
         thinkingLevelMap: { max: 'max' },
-        compat: { forceAdaptiveThinking: true, supportsStrictTools: true },
+        compat: { forceAdaptiveThinking: true },
       },
       // Sonnet 5 (Jul 1 2026) is the drop-in successor to Sonnet 4.6 with a
       // caveat set that affects consumers of this record:
@@ -431,7 +438,7 @@ export const KNOWN_PROVIDERS = {
         contextWindow: 1000000,
         maxTokens: 128000,
         thinkingLevelMap: { xhigh: 'xhigh', max: 'max' },
-        compat: { forceAdaptiveThinking: true, supportsStrictTools: true },
+        compat: { forceAdaptiveThinking: true },
       },
       'claude-opus-4-7': {
         id: 'claude-opus-4-7',
@@ -445,7 +452,7 @@ export const KNOWN_PROVIDERS = {
         contextWindow: 1000000,
         maxTokens: 128000,
         thinkingLevelMap: { xhigh: 'xhigh', max: 'max' },
-        compat: { forceAdaptiveThinking: true, supportsTemperature: false, supportsStrictTools: true },
+        compat: { forceAdaptiveThinking: true, supportsTemperature: false },
       },
       // Opus 4.8 was never in pi 0.73's adaptive id list, so it already got
       // budget thinking (a 400 on 4.7+) before this migration. The catalog
@@ -467,7 +474,6 @@ export const KNOWN_PROVIDERS = {
           supportsMidConvoToolChanges: true,
           forceAdaptiveThinking: true,
           supportsTemperature: false,
-          supportsStrictTools: true,
         },
       },
       // Opus 5.5 (Sep 22 2026) keeps adaptive thinking permanently on: both
@@ -504,7 +510,6 @@ export const KNOWN_PROVIDERS = {
           supportsMidConvoToolChanges: true,
           forceAdaptiveThinking: true,
           supportsTemperature: false,
-          supportsStrictTools: true,
         },
       },
       // Fable 5 (Jun 2026) is a NEW TIER above Opus — Anthropic's most
@@ -533,7 +538,6 @@ export const KNOWN_PROVIDERS = {
           supportsMidConvoSystemMessages: true,
           supportsMidConvoToolChanges: true,
           forceAdaptiveThinking: true,
-          supportsStrictTools: true,
         },
       },
     },

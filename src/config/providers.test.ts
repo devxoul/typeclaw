@@ -102,6 +102,7 @@ describe('KNOWN_PROVIDERS', () => {
         expect(builtin, `${ref} in pi-ai catalog`).toBeDefined()
         const upstreamCompat: Record<string, unknown> = { ...builtin?.compat }
         delete upstreamCompat.allowedFallbackModels
+        delete upstreamCompat.supportsStrictTools
         expect(model.api, `${ref} API drift`).toBe(builtin?.api)
         expect('compat' in model ? model.compat : {}, `${ref} compat drift`).toEqual(upstreamCompat)
         expect('thinkingLevelMap' in model ? model.thinkingLevelMap : undefined, `${ref} thinking map drift`).toEqual(
