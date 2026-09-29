@@ -1,8 +1,9 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
+import { archiveContainerLogs, type DockerLogArchiveRuntime } from './log-archive'
 import type { DockerExec, DockerExecResult } from './shared'
 import { planStop, stop } from './stop'
 
@@ -150,6 +151,56 @@ describe('stop (composition)', () => {
     expect(result.running).toBe(false)
     expect(calls.find((c) => c[0] === 'stop')).toBeUndefined()
     expect(calls.find((c) => c[0] === 'rm')).toEqual(['rm', CONTAINER_ID])
+  })
+
+  test('removes a stopped container after publishing its rotated log archive above 64 MiB', async () => {
+    const { exec, calls } = fakeDockerExec({ scenario: { exists: true, running: false } })
+    const runtime: DockerLogArchiveRuntime = {
+      inspectLogConfig: async () => ({
+        exitCode: 0,
+        stdout: '{"Type":"json-file","Config":{"max-size":"20m","max-file":"5"}}',
+        stderr: '',
+      }),
+      resolveDockerBinary: () => '/usr/bin/docker',
+      capture: async ({ maxBytes, output }) => {
+        if (maxBytes !== 100_000_000) throw new Error('unexpected capture limit')
+        await output.truncate(68 * 1024 * 1024)
+        return { exitCode: 0, overflowed: false, stderrExcerpt: '', timedOut: false }
+      },
+    }
+    let snapshot: string | undefined
+    const result = await stop({
+      cwd: root,
+      exec,
+      archiveLogs: async (input) => {
+        const archive = await archiveContainerLogs(input, runtime)
+        if (archive.ok) snapshot = archive.path
+        return archive
+      },
+    })
+
+    expect(result.ok).toBe(true)
+    expect(snapshot).toBeDefined()
+    expect((await stat(snapshot!)).size).toBe(68 * 1024 * 1024)
+    expect(calls.find((call) => call[0] === 'rm')).toEqual(['rm', CONTAINER_ID])
+  })
+
+  test('preserves a stopped container when unbounded logs exceed the archive limit', async () => {
+    const { exec, calls } = fakeDockerExec({ scenario: { exists: true, running: false } })
+    const result = await stop({
+      cwd: root,
+      exec,
+      archiveLogs: async (input) =>
+        await archiveContainerLogs(input, {
+          inspectLogConfig: async () => ({ exitCode: 0, stdout: '{"Type":"json-file","Config":{}}', stderr: '' }),
+          resolveDockerBinary: () => '/usr/bin/docker',
+          capture: async () => ({ exitCode: -1, overflowed: true, stderrExcerpt: '', timedOut: false }),
+        }),
+    })
+
+    expect(result.ok).toBe(false)
+    if (!result.ok) expect(result.reason).toContain(`docker logs --timestamps ${CONTAINER_ID}`)
+    expect(calls.find((call) => call[0] === 'rm')).toBeUndefined()
   })
 
   test('tolerates "no such container" from docker rm (user removed it out-of-band)', async () => {
