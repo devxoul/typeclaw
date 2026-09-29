@@ -203,6 +203,33 @@ describe('stop (composition)', () => {
     expect(calls.find((call) => call[0] === 'rm')).toBeUndefined()
   })
 
+  test('restart stop phase reports stale OOM after archival and before removal', async () => {
+    const fake = fakeDockerExec({ scenario: { exists: true, running: false } })
+    const events: string[] = []
+    const exec: DockerExec = async (args, options) => {
+      if (args[0] === 'inspect' && args.some((arg) => arg.includes('{{.State.OOMKilled}}'))) {
+        return { exitCode: 0, stdout: `${CONTAINER_ID}|false|true|137|6442450944|2026-09-29T04:58:43Z\n`, stderr: '' }
+      }
+      if (args[0] === 'rm') events.push('remove')
+      return fake.exec(args, options)
+    }
+    const result = await stop({
+      cwd: root,
+      exec,
+      archiveLogs: async () => {
+        events.push('archive')
+        return { ok: true, status: 'archived', path: '/archive.log' }
+      },
+      onWarning: (message) => events.push(message),
+    })
+    expect(result.ok).toBe(true)
+    expect(events).toEqual([
+      'archive',
+      'agent runtime was SIGKILLed (137) and the container recorded an OOM kill during this run (likely container memory limit 6144 MiB). Restart the agent and reduce memory-heavy parallel work.',
+      'remove',
+    ])
+  })
+
   test('tolerates "no such container" from docker rm (user removed it out-of-band)', async () => {
     const { exec } = fakeDockerExec({
       scenario: { exists: true, running: true },

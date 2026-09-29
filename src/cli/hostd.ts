@@ -239,6 +239,8 @@ function formatLog(event: DaemonLogEvent | SupervisorLogEvent): string {
       return `[hostd] deregistered ${event.containerName} (${event.reason})`
     case 'registration-skipped':
       return `[hostd] skipped persisted registration ${event.containerName}: ${event.reason}`
+    case 'container-exited':
+      return `[hostd] ${event.containerName}: ${event.reason}`
     case 'restart-scheduled':
       return `[hostd] restart scheduled for ${event.containerName}${event.build ? ' (with rebuild)' : ''}`
     case 'restart-completed':

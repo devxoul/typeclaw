@@ -43,6 +43,9 @@ function fakeExec(alive: Set<string> = new Set()): DockerExec {
       const name = filter.replace(/^name=\^?/, '').replace(/\$$/, '')
       return { exitCode: 0, stdout: alive.has(name) ? `${name}\n` : '', stderr: '' }
     }
+    if (args[0] === 'inspect') {
+      return { exitCode: 0, stdout: `${'a'.repeat(64)}|true|false|0|0|0001-01-01T00:00:00Z\n`, stderr: '' }
+    }
     return { exitCode: 1, stdout: '', stderr: 'unknown command' }
   }
 }
@@ -198,6 +201,95 @@ describe('startDaemon', () => {
     expect(list.ok).toBe(true)
     if (!list.ok) return
     expect((list.result as ListResult).registrations).toEqual([{ containerName: 'coder', cwd: '/x2' }])
+  })
+
+  test('reports each stop of a stopped runtime with a recorded OOM once, not on healthy probes', async () => {
+    const events: string[] = []
+    // `finishedAt === null` means running; otherwise the container is stopped
+    // with that Docker FinishedAt. The container ID never changes.
+    let finishedAt: string | null = null
+    // Probe count is the signal that hostd observed the current state; waiting on
+    // it instead of wall-clock sleeps keeps the test deterministic under load.
+    let inspections = 0
+    const exec: DockerExec = async (args) => {
+      if (args[0] === 'ps') return { exitCode: 0, stdout: 'coder\n', stderr: '' }
+      if (args[0] === 'inspect') {
+        inspections += 1
+        const stopped = finishedAt !== null
+        return {
+          exitCode: 0,
+          stdout: `${'b'.repeat(64)}|${!stopped}|${stopped}|${stopped ? 137 : 0}|6442450944|${finishedAt ?? '0001-01-01T00:00:00Z'}\n`,
+          stderr: '',
+        }
+      }
+      return { exitCode: 1, stdout: '', stderr: 'unexpected command' }
+    }
+    daemon = await startDaemon({
+      exec,
+      gcIntervalMs: 20,
+      gcMissesToDeregister: 4,
+      onLog: (event) => {
+        if (event.kind === 'container-exited') events.push(event.reason)
+      },
+    })
+    await send({ kind: 'register', containerName: 'coder', cwd: '/x' })
+    await waitFor(() => inspections >= 2)
+    expect(events).toEqual([])
+    finishedAt = '2026-09-29T04:58:43.000000001Z'
+    await waitFor(() => events.length === 1)
+    expect(events).toEqual([
+      'agent runtime was SIGKILLed (137) and the container recorded an OOM kill during this run (likely container memory limit 6144 MiB). Restart the agent and reduce memory-heavy parallel work.',
+    ])
+    // Repeated probes of the same stop stay silent and keep the registration.
+    const afterFirstReport = inspections
+    await waitFor(() => inspections >= afterFirstReport + 3)
+    expect(events).toHaveLength(1)
+    expect(daemon.registered()).toEqual(['coder'])
+    expect(existsSync(registrationFilePath('coder'))).toBe(true)
+    // The same container restarted and crashed again between two probes: hostd
+    // never saw it running, but the new FinishedAt makes it a new stop.
+    finishedAt = '2026-09-29T05:01:10.000000002Z'
+    await waitFor(() => events.length === 2)
+    // A later observed run followed by another stop is reported as well.
+    finishedAt = null
+    const beforeRunning = inspections
+    await waitFor(() => inspections > beforeRunning)
+    finishedAt = '2026-09-29T05:07:30.000000003Z'
+    await waitFor(() => events.length === 3)
+    expect(daemon.registered()).toEqual(['coder'])
+  })
+
+  test('inspect failure preserves present registration; exit 137 without OOMKilled reports SIGKILL', async () => {
+    const events: string[] = []
+    let failInspect = true
+    const exec: DockerExec = async (args) => {
+      if (args[0] === 'ps') return { exitCode: 0, stdout: 'coder\n', stderr: '' }
+      if (args[0] === 'inspect') {
+        if (failInspect) return { exitCode: 1, stdout: '', stderr: 'daemon unavailable' }
+        return {
+          exitCode: 0,
+          stdout: `${'c'.repeat(64)}|false|false|137|6442450944|2026-09-29T04:58:43Z\n`,
+          stderr: '',
+        }
+      }
+      return { exitCode: 1, stdout: '', stderr: 'unexpected command' }
+    }
+    daemon = await startDaemon({
+      exec,
+      gcIntervalMs: 20,
+      gcMissesToDeregister: 3,
+      onLog: (event) => {
+        if (event.kind === 'container-exited') events.push(event.reason)
+      },
+    })
+    await send({ kind: 'register', containerName: 'coder', cwd: '/x' })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    expect(events).toEqual([])
+    expect(daemon.registered()).toEqual(['coder'])
+    failInspect = false
+    await waitFor(() => events.length === 1)
+    expect(events[0]).toContain('SIGKILL (137)')
+    expect(events[0]).not.toContain('container recorded an OOM kill')
   })
 
   test('GC removes registrations whose containers vanished', async () => {
@@ -1058,6 +1150,58 @@ describe('startDaemon', () => {
     expect(startCalls[0]?.cwd).toBe('/agent/with-broker')
     expect(startCalls[0]?.wsHostPort).toBe(54321)
     expect(startCalls[0]?.brokerToken).toBe('btok')
+  })
+
+  test('restore during a stopped container preserves broker, tokens, and registration', async () => {
+    const startCalls: PortbrokerStartInput[] = []
+    const portbroker: PortbrokerCallbacks = {
+      start: async (input) => {
+        startCalls.push(input)
+      },
+      stop: async () => {},
+      forwardedPorts: () => [],
+    }
+    const name = 'with-broker'
+    const d1 = await startDaemon({ exec: fakeExec(new Set([name])), gcIntervalMs: 1_000_000, portbroker })
+    await send({
+      kind: 'register',
+      containerName: name,
+      cwd: '/agent/with-broker',
+      restartToken: 't',
+      wsHostPort: 54321,
+      portForward: { allow: '*' },
+      brokerToken: 'btok',
+    })
+    await d1.stop()
+    startCalls.length = 0
+    const exec: DockerExec = async (args) => {
+      if (args[0] === 'ps') return { exitCode: 0, stdout: `${name}\n`, stderr: '' }
+      if (args[0] === 'inspect')
+        return {
+          exitCode: 0,
+          stdout: `${'a'.repeat(64)}|false|true|137|6442450944|2026-09-29T04:58:43Z\n`,
+          stderr: '',
+        }
+      return { exitCode: 1, stdout: '', stderr: 'unexpected command' }
+    }
+    const exits: string[] = []
+    daemon = await startDaemon({
+      exec,
+      gcIntervalMs: 20,
+      gcMissesToDeregister: 1,
+      portbroker,
+      onLog: (event) => {
+        if (event.kind === 'container-exited') exits.push(event.reason)
+      },
+    })
+    await waitFor(() => startCalls.length === 1)
+    expect(startCalls[0]?.brokerToken).toBe('btok')
+    expect(exits).toHaveLength(1)
+    await new Promise((resolve) => setTimeout(resolve, 65))
+    expect(daemon.registered()).toEqual([name])
+    expect(existsSync(registrationFilePath(name))).toBe(true)
+    expect(startCalls).toHaveLength(1)
+    expect(exits).toHaveLength(1)
   })
 
   test('boot-time restore skips persisted registrations whose container is gone, and unlinks the leftover file', async () => {
