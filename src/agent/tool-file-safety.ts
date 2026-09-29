@@ -107,6 +107,7 @@ export async function enforceAndPinToolFiles(
 
   let dir: string | undefined
   const rewrites: Rewrite[] = []
+  const omittedLinks: { root: string; count: number; names: string[] }[] = []
   const verified: VerifiedInput[] = []
   const maxBytes = maxInputBytes(options.tool)
   const identityOptions = {
@@ -180,7 +181,7 @@ export async function enforceAndPinToolFiles(
           await source.close()
         }
       } else {
-        copiedBytes += await snapshotDirectoryTree({
+        const snapshot = await snapshotDirectoryTree({
           source: input,
           destination: pinned,
           agentDir: options.agentDir,
@@ -192,6 +193,10 @@ export async function enforceAndPinToolFiles(
           hidden: options.hidden,
           signal: options.signal,
         })
+        copiedBytes += snapshot.copied
+        if (snapshot.omittedLinks.count > 0) {
+          omittedLinks.push({ root: input.original, ...snapshot.omittedLinks })
+        }
       }
       const executionValue = input.target.uri ? pathToFileURL(pinned).href : pinned
       input.target.set(executionValue)
@@ -215,7 +220,7 @@ export async function enforceAndPinToolFiles(
     restoreResult(result) {
       let restored = result
       for (const rewrite of rewrites) restored = replaceResultPath(restored, rewrite)
-      return restored
+      return appendSnapshotOmissions(restored, omittedLinks)
     },
     async cleanup() {
       if (cleaned) return
@@ -914,7 +919,7 @@ async function snapshotDirectoryTree(options: {
   operandCount: number
   hidden?: HiddenPaths
   signal?: AbortSignal
-}): Promise<number> {
+}): Promise<{ copied: number; omittedLinks: { count: number; names: string[] } }> {
   if (process.platform !== 'linux') {
     throw new Error('directory tool inputs require Linux inode anchoring; refusing an unanchored traversal')
   }
@@ -925,7 +930,7 @@ async function snapshotDirectoryTree(options: {
       throw new Error(`tool input changed while waiting for snapshot capacity: ${options.source.original}`)
     }
     await mkdir(options.destination, { mode: 0o700 })
-    const state = { copied: 0, entries: 0 }
+    const state = { copied: 0, entries: 0, omittedLinks: { count: 0, names: [] as string[] } }
     const identityVerifier = createPrivateSurfaceReadIdentityVerifier({
       tool: options.tool,
       agentDir: options.agentDir,
@@ -942,7 +947,7 @@ async function snapshotDirectoryTree(options: {
       openedRoot === realAgentDir,
     )
     await chmod(options.destination, 0o500)
-    return state.copied
+    return { copied: state.copied, omittedLinks: state.omittedLinks }
   } finally {
     await root.close()
   }
@@ -952,7 +957,7 @@ async function snapshotOpenedDirectory(
   directory: FileHandle,
   destination: string,
   options: Parameters<typeof snapshotDirectoryTree>[0],
-  state: { copied: number; entries: number },
+  state: { copied: number; entries: number; omittedLinks: { count: number; names: string[] } },
   identityVerifier: PrivateSurfaceIdentityVerifier,
   isAgentRoot: boolean,
 ): Promise<void> {
@@ -971,7 +976,11 @@ async function snapshotOpenedDirectory(
     const candidate = path.join(sourcePath, entry.name)
     if (entry.isSymbolicLink()) {
       if (isDeniedSnapshotPath(candidate, options)) continue
-      throw new Error(`directory snapshot refuses symbolic link: ${entry.name}`)
+      state.omittedLinks.count += 1
+      if (state.omittedLinks.names.length < 12) {
+        state.omittedLinks.names.push(path.relative(options.source.resolved, candidate))
+      }
+      continue
     }
     if (entry.isDirectory()) {
       if (isDeniedSnapshotPath(candidate, options)) continue
@@ -1220,6 +1229,18 @@ function inputCountTooLarge(count: number, maxCount: number): Error {
 
 function outputCountTooLarge(count: number, maxCount: number): Error {
   return new Error(`tool output count exceeds the per-invocation limit (${count} > ${maxCount})`)
+}
+
+function appendSnapshotOmissions(
+  result: ToolResult,
+  omissions: readonly { root: string; count: number; names: string[] }[],
+): ToolResult {
+  if (omissions.length === 0) return result
+  const notes = omissions.map(({ root, count, names }) => {
+    const remainder = count - names.length
+    return `Directory snapshot omitted ${count} symbolic link${count === 1 ? '' : 's'} under ${JSON.stringify(root)} (not followed): ${names.map((name) => JSON.stringify(name)).join(', ')}${remainder > 0 ? `, and ${remainder} more` : ''}.`
+  })
+  return { ...result, content: [...result.content, { type: 'text', text: notes.join('\n') }] }
 }
 
 function replaceResultPath(result: ToolResult, rewrite: Rewrite): ToolResult {
