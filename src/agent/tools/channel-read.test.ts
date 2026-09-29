@@ -66,7 +66,10 @@ describe('createChannelReadTool — mode: history', () => {
     const router = makeRouter()
     router.registerHistory('slack-bot', async () => ({
       ok: true,
-      messages: [userMessage({ text: 'first' }), userMessage({ authorName: 'Bot', isBot: true, text: 'second' })],
+      messages: [
+        userMessage({ externalMessageId: '001700000000.000001', text: 'first' }),
+        userMessage({ externalMessageId: '001700000000.000002', authorName: 'Bot', isBot: true, text: 'second' }),
+      ],
     }))
     const tool = createChannelReadTool({ router })
 
@@ -75,6 +78,8 @@ describe('createChannelReadTool — mode: history', () => {
 
     // then
     const text = (result.content[0] as { text: string }).text
+    expect(text).toContain('[message_id=001700000000.000001] Alice (<@UALICE>): first')
+    expect(text).toContain('[message_id=001700000000.000002] BOT (Bot): second')
     expect(text).toContain('Alice (<@UALICE>): first')
     expect(text).toContain('BOT (Bot): second')
     expect(text.indexOf('first')).toBeLessThan(text.indexOf('second'))
@@ -152,7 +157,7 @@ describe('createChannelReadTool — mode: message', () => {
     const router = makeRouter()
     router.registerMessageGet('discord-bot', async (args) => {
       seen.push(args)
-      return { ok: true, message: userMessage({ text: 'the one message' }) }
+      return { ok: true, message: userMessage({ externalMessageId: '000987654321', text: 'the one message' }) }
     })
     const tool = createChannelReadTool({ router })
 
@@ -167,7 +172,10 @@ describe('createChannelReadTool — mode: message', () => {
 
     // then
     expect(seen).toEqual([{ chat: 'C9', thread: null, messageId: 'M123' }])
-    expect((result.content[0] as { text: string }).text).toContain('the one message')
+    const content = result.content[0]
+    if (content?.type !== 'text') throw new Error('expected text content')
+    expect(content.text).toContain('[message_id=000987654321] Alice')
+    expect(content.text).toContain('the one message')
     expect(result.details).toMatchObject({ ok: true, count: 1 })
   })
 

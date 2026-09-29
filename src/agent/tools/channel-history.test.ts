@@ -5,6 +5,7 @@ import { defaultHistoryConfig, type ChannelAdapterConfig } from '@/channels/sche
 import type { ChannelHistoryMessage, FetchHistoryArgs, FetchHistoryResult, HistoryCallback } from '@/channels/types'
 
 import { createChannelHistoryTool, type ChannelHistoryOrigin } from './channel-history'
+import { renderHistoryMessage } from './channel-history-render'
 
 function emptyAdapterConfig(): ChannelAdapterConfig {
   return {
@@ -228,6 +229,37 @@ describe('createChannelHistoryTool', () => {
     expect(idxFirst).toBeGreaterThan(-1)
     expect(idxSecond).toBeGreaterThan(idxFirst)
     expect(idxThird).toBeGreaterThan(idxSecond)
+  })
+
+  test('exposes each native message id beside its message, without numeric conversion', async () => {
+    const router = await makeRouter()
+    router.registerHistory('slack-bot', async () => ({
+      ok: true,
+      messages: [
+        userMessage({ externalMessageId: '001700000000.000001', text: 'first' }),
+        userMessage({ externalMessageId: '001700000000.000002', text: 'second' }),
+      ],
+    }))
+
+    const result = await runTool(createChannelHistoryTool({ router, origin: slackThreadOrigin }), {})
+    const content = result.content[0]
+    if (content?.type !== 'text') throw new Error('expected text content')
+    const text = content.text
+    expect(text).toContain('[message_id=001700000000.000001] Alice (<@UALICE>): first')
+    expect(text).toContain('[message_id=001700000000.000002] Alice (<@UALICE>): second')
+  })
+
+  test('keeps the existing line when an adapter supplies no message id', () => {
+    const message = userMessage()
+    const withoutId = { ...message, externalMessageId: undefined } as unknown as ChannelHistoryMessage
+
+    expect(renderHistoryMessage(withoutId)).toBe('[2023-11-14T22:13:20.000Z] Alice (<@UALICE>): hello')
+  })
+
+  test('keeps the existing line when an adapter supplies an empty message id', () => {
+    expect(renderHistoryMessage(userMessage({ externalMessageId: '' }))).toBe(
+      '[2023-11-14T22:13:20.000Z] Alice (<@UALICE>): hello',
+    )
   })
 
   test('renders bot entries with a BOT marker and user entries with @mention', async () => {
