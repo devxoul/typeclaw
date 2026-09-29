@@ -7,6 +7,7 @@ import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js'
 import { CallToolResultSchema, type CallToolResult, type ListToolsRequest } from '@modelcontextprotocol/sdk/types.js'
 
 import type { McpServer } from '@/config/config'
+import { withToolOomPriorityArgv } from '@/container/tool-oom-priority'
 import type { ToolFileOperands } from '@/plugin'
 import { resolveSecret } from '@/secrets/resolve'
 
@@ -207,7 +208,8 @@ export function createTransport(
   authProvider?: OAuthClientProvider,
 ): Transport {
   if (server.command) {
-    return new StdioClientTransport({ command: server.command, args: server.args, env: resolveServerEnv(server, env) })
+    const [command = server.command, ...args] = withToolOomPriorityArgv([server.command, ...server.args])
+    return new StdioClientTransport({ command, args, env: resolveServerEnv(server, env) })
   }
   const url = new URL(requiredUrl(server))
   return authProvider === undefined

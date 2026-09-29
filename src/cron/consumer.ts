@@ -4,6 +4,8 @@ import { promptWithFallback, resolveFallbackChain } from '@/agent/model-fallback
 import type { SessionOrigin } from '@/agent/session-origin'
 import { getConfig } from '@/config'
 import type { ModelRef } from '@/config/providers'
+import { readOomEvents, toolOomNote } from '@/container/oom-events'
+import { withToolOomPriorityArgv } from '@/container/tool-oom-priority'
 import type { HookBus } from '@/plugin'
 import type { Stream, Unsubscribe } from '@/stream'
 
@@ -143,7 +145,7 @@ export function createCronConsumer({
           if (job.kind === 'prompt') {
             if (!(await runPrompt(job, createSessionForCron, stream, logger))) outcome = 'failed'
           } else if (job.kind === 'exec') {
-            await runExec(job, cwd)
+            await runExec(job, cwd, logger)
           } else {
             if (invokeHandler === undefined) {
               throw new Error(
@@ -347,7 +349,7 @@ function describe(err: unknown): string {
   return err instanceof Error ? err.message : String(err)
 }
 
-async function runExec(job: ExecJob, cwd: string): Promise<void> {
+async function runExec(job: ExecJob, cwd: string, logger: CronConsumerLogger): Promise<void> {
   const [cmd, ...args] = job.command
   if (!cmd) throw new Error(`exec job ${job.id}: empty command`)
   // Inject TYPECLAW_PARENT_ORIGIN_JSON so a child that proxies into the
@@ -363,8 +365,9 @@ async function runExec(job: ExecJob, cwd: string): Promise<void> {
     ...(job.scheduledByRole !== undefined ? { scheduledByRole: job.scheduledByRole } : {}),
     ...(job.scheduledByOrigin !== undefined ? { scheduledByOrigin: job.scheduledByOrigin } : {}),
   }
+  const oomBefore = readOomEvents()
   const proc = Bun.spawn({
-    cmd: [cmd, ...args],
+    cmd: withToolOomPriorityArgv([cmd, ...args]),
     cwd,
     stdout: 'ignore',
     stderr: 'pipe',
@@ -375,8 +378,11 @@ async function runExec(job: ExecJob, cwd: string): Promise<void> {
   })
   const stderrText = new Response(proc.stderr).text()
   const [code, stderr] = await Promise.all([proc.exited, stderrText])
+  const note = toolOomNote(oomBefore, code, 'cron exec', { log: logger.warn })
   if (code !== 0) {
-    throw new Error(`exec job ${job.id} exited with code ${code}: ${stderr.trim() || 'no stderr'}`)
+    throw new Error(
+      `exec job ${job.id} exited with code ${code}: ${stderr.trim() || 'no stderr'}${note === null ? '' : `\n${note}`}`,
+    )
   }
 }
 

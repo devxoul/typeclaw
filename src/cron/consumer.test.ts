@@ -299,6 +299,38 @@ describe('createCronConsumer', () => {
     consumer.stop()
   })
 
+  test.skipIf(process.platform !== 'linux')(
+    'exec job and its grandchild inherit OOM priority without raising the runtime',
+    async () => {
+      const stream = createStream()
+      const consumer = createCronConsumer({
+        stream,
+        cwd: root,
+        createSessionForCron: makeFakeSessionFactory().createSessionForCron,
+        logger: silentLogger,
+      })
+      consumer.start()
+      try {
+        const before = (await Bun.file('/proc/self/oom_score_adj').text()).trim()
+        publishCron(
+          stream,
+          execJob('score', [
+            '/bin/sh',
+            '-c',
+            // Publish both lines atomically: waitForFile returns as soon as the file exists.
+            '{ cat /proc/self/oom_score_adj; /bin/sh -c "cat /proc/self/oom_score_adj"; } > score.tmp && mv score.tmp score.txt',
+          ]),
+        )
+        const scores = await waitForFile(join(root, 'score.txt'))
+        await waitForConsumerIdle(consumer)
+        expect(scores.trim().split('\n')).toEqual(['600', '600'])
+        expect((await Bun.file('/proc/self/oom_score_adj').text()).trim()).toBe(before)
+      } finally {
+        consumer.stop()
+      }
+    },
+  )
+
   test('exec job spawn injects TYPECLAW_PARENT_ORIGIN_JSON describing the cron job', async () => {
     const stream = createStream()
     const factory = makeFakeSessionFactory()

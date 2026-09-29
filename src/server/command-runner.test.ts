@@ -544,6 +544,16 @@ describe('runExecForCommand', () => {
     expect(result.exitCode).toBe(3)
   })
 
+  test.skipIf(process.platform !== 'linux')('plugin exec shell and grandchild inherit OOM priority', async () => {
+    const result = await runExecForCommand(
+      ['cat /proc/self/oom_score_adj; sh -c "cat /proc/self/oom_score_adj"'] as unknown as TemplateStringsArray,
+      [],
+      { cwd: '/tmp', signal: new AbortController().signal },
+    )
+    expect(result.exitCode).toBe(0)
+    expect(result.stdout.trim().split('\n')).toEqual(['600', '600'])
+  })
+
   // Windows lacks POSIX process-group signals; covered on Unix. #899
   test.skipIf(onWindows)('aborts a long-running shell promptly via process-group SIGTERM', async () => {
     // Spawn a shell that sleeps for 30s with a background grandchild also

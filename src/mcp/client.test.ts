@@ -1,4 +1,7 @@
 import { describe, expect, test } from 'bun:test'
+import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
 import type { OAuthClientProvider } from '@modelcontextprotocol/sdk/client/auth.js'
 import type { RequestOptions } from '@modelcontextprotocol/sdk/shared/protocol.js'
@@ -296,6 +299,32 @@ describe('createTransport', () => {
     expect(objectGraphContains(withAuth, authProvider)).toBe(true)
     expect(objectGraphContains(bare, authProvider)).toBe(false)
     expect(objectGraphContains(stdio, authProvider)).toBe(false)
+  })
+  test.skipIf(process.platform !== 'linux')('stdio server and child inherit OOM priority', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'typeclaw-mcp-oom-'))
+    const output = join(dir, 'score.txt')
+    const stdio = createTransport(
+      {
+        ...server(),
+        command: '/bin/sh',
+        args: [
+          '-c',
+          `cat /proc/self/oom_score_adj > ${output}; /bin/sh -c 'cat /proc/self/oom_score_adj' >> ${output}`,
+        ],
+      },
+      {},
+    )
+    try {
+      const closed = new Promise<void>((resolve) => {
+        stdio.onclose = resolve
+      })
+      await stdio.start()
+      await closed
+      expect((await readFile(output, 'utf8')).trim().split('\n')).toEqual(['600', '600'])
+    } finally {
+      await stdio.close()
+      await rm(dir, { recursive: true, force: true })
+    }
   })
 })
 

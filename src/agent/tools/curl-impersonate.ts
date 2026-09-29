@@ -22,6 +22,9 @@ import { randomBytes } from 'node:crypto'
 
 import { spawn } from 'bun'
 
+import { readOomEvents, toolOomNote } from '@/container/oom-events'
+import { withToolOomPriorityArgv } from '@/container/tool-oom-priority'
+
 export const CURL_IMPERSONATE_BINARY = 'curl_chrome136'
 export const DEFAULT_TIMEOUT_SECONDS = 30
 
@@ -192,8 +195,9 @@ export async function curlImpersonate(req: CurlImpersonateRequest): Promise<Curl
   // a 30s hang. process.kill(-pid) addresses the negative PID, which signals
   // the entire process group, killing both atomically. detached: true makes
   // the child the pgid leader so -pid is well-defined.
+  const oomBefore = readOomEvents()
   const proc = spawn({
-    cmd,
+    cmd: withToolOomPriorityArgv(cmd),
     stdout: 'pipe',
     stderr: 'pipe',
     detached: true,
@@ -219,9 +223,14 @@ export async function curlImpersonate(req: CurlImpersonateRequest): Promise<Curl
       throw new CurlImpersonateError('aborted', exitCode, stderr)
     }
 
+    const oomNote = toolOomNote(oomBefore, exitCode, 'web search', { log: (line) => console.warn(line) })
     if (exitCode !== 0) {
       const detail = stderr.trim() || 'no stderr'
-      throw new CurlImpersonateError(`curl-impersonate exited ${exitCode}: ${detail}`, exitCode, stderr)
+      throw new CurlImpersonateError(
+        `curl-impersonate exited ${exitCode}: ${detail}${oomNote === null ? '' : `\n${oomNote}`}`,
+        exitCode,
+        stderr,
+      )
     }
 
     return parseCurlOutput(stdoutBuf, sentinel, stderr)
