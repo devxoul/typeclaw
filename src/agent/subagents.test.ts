@@ -249,6 +249,130 @@ describe('invokeSubagent', () => {
     expect(calls.disposed).toBe(1)
   })
 
+  test('passes the completed assistant response to the handler before disposal', async () => {
+    const listeners = new Set<(event: unknown) => void>()
+    let captured = null as string | null
+    const session = {
+      subscribe: (listener: (event: unknown) => void) => {
+        listeners.add(listener)
+        return () => listeners.delete(listener)
+      },
+      prompt: async () => {
+        for (const listener of listeners) {
+          listener({
+            type: 'message_end',
+            message: { role: 'assistant', content: [{ type: 'text', text: 'fix: repair app' }] },
+          })
+        }
+        expect(captured).toBeNull()
+      },
+      dispose: () => {},
+    } as unknown as AgentSession
+    await invokeSubagent('message', {
+      registry: {
+        message: {
+          systemPrompt: 'Return a commit message.',
+          handler: async (_ctx, runSession) => {
+            await runSession({
+              onFinalMessage: (text) => {
+                captured = text
+              },
+            })
+          },
+        },
+      },
+      createSessionForSubagent: async () => session,
+      agentDir: '/agent',
+      userPrompt: 'choose a message',
+    })
+    expect(captured).toBe('fix: repair app')
+  })
+
+  test('handler callback receives terminal assistant text, not an earlier review block or nonempty message', async () => {
+    for (const [name, messages, expected] of [
+      ['message', ['first answer', ''], null],
+      ['reviewer', ['<review>approved</review>', 'final plain-language summary'], 'final plain-language summary'],
+      ['researcher', ['<report>findings</report>', 'final plain-language summary'], 'final plain-language summary'],
+    ] as const) {
+      const listeners = new Set<(event: unknown) => void>()
+      const session = {
+        subscribe: (listener: (event: unknown) => void) => {
+          listeners.add(listener)
+          return () => listeners.delete(listener)
+        },
+        prompt: async () => {
+          for (const content of messages) {
+            for (const listener of listeners) listener({ type: 'message_end', message: { role: 'assistant', content } })
+          }
+        },
+        dispose: () => {},
+      } as unknown as AgentSession
+      let received = 'not-called' as string | null
+      await invokeSubagent(name, {
+        registry: {
+          [name]: {
+            systemPrompt: 'Return final text.',
+            handler: async (_ctx, runSession) => {
+              await runSession({
+                onFinalMessage: (text) => {
+                  received = text
+                },
+              })
+            },
+          },
+        },
+        createSessionForSubagent: async () => session,
+        agentDir: '/agent',
+        userPrompt: 'q',
+      })
+      expect(received).toBe(expected)
+    }
+  })
+
+  test('handler callback discards earlier text after a soft provider failure', async () => {
+    const listeners = new Set<(event: unknown) => void>()
+    let leafMessage: unknown
+    const session = {
+      subscribe: (listener: (event: unknown) => void) => {
+        listeners.add(listener)
+        return () => listeners.delete(listener)
+      },
+      prompt: async () => {
+        for (const listener of listeners) {
+          listener({ type: 'message_end', message: { role: 'assistant', content: 'stale subject' } })
+          leafMessage = {
+            role: 'assistant',
+            content: 'feat: incomplete',
+            stopReason: 'error',
+            errorMessage: 'provider failed',
+          }
+          listener({ type: 'message_end', message: leafMessage })
+        }
+      },
+      dispose: () => {},
+      sessionManager: { getLeafEntry: () => ({ type: 'message', message: leafMessage }) },
+    } as unknown as AgentSession
+    let received = 'not-called' as string | null
+    await invokeSubagent('message', {
+      registry: {
+        message: {
+          systemPrompt: 'Return a commit message.',
+          handler: async (_ctx, runSession) => {
+            await runSession({
+              onFinalMessage: (text) => {
+                received = text
+              },
+            })
+          },
+        },
+      },
+      createSessionForSubagent: async () => session,
+      agentDir: '/agent',
+      userPrompt: 'choose a message',
+    })
+    expect(received).toBeNull()
+  })
+
   test('handler may skip the session entirely', async () => {
     // given
     const { session, calls } = fakeSession()

@@ -120,6 +120,8 @@ type Subagent<P = unknown> = SubagentShared<P> & {
 
 A subagent inherits its system prompt, payload schema, and optional `inFlightKey(payload)` from `SubagentShared`. Stream and direct plugin dispatch default to the subagent name; tool spawns without an explicit key remain request-unique. A declared key deduplicates matching work within a trusted parent-session scope when one exists, and process-wide for scheduler dispatches without a parent. Memory's `memory-logger` keys by `parentSessionId` so different parent sessions run in parallel while duplicate runs against the same session deduplicate. `defineSubagent(subagent)` is the identity helper.
 
+An optional subagent `handler(ctx, runSession)` can call `runSession({ userPrompt, onFinalMessage })`. The callback fires after a completed session turn with the terminal assistant message's text (trimmed), or `null` when the terminal message is empty or the provider failed. It receives raw assistant text, not the `<review>`/`<report>` block projection used by subagent orchestration. The handler may persist the returned text with trusted plugin code rather than granting the model a file-write tool. `runSession` itself still resolves to `void`; `ctx.spawnSubagent` does not return the text.
+
 ### Cron
 
 `cronJobs` is a `Record<string, PluginCronJob>`; the runtime prefixes each key with `__plugin_<plugin-name>_` to form the global cron id (no collision with `cron.json` user jobs or across plugins). `PluginCronJob` is a discriminated union on `kind`:

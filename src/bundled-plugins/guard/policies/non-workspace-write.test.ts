@@ -91,6 +91,32 @@ describe('non-workspace-write guard policy', () => {
       reason: expect.stringContaining('nonWorkspaceWrite'),
     })
   })
+  test('still blocks an ordinary session writing the backup message path', async () => {
+    const agentDir = await makeAgentDir()
+    const result = await checkNonWorkspaceWriteGuard({
+      tool: 'write',
+      args: { path: path.join(agentDir, '.typeclaw', 'backup-message.tmp'), content: 'chore: backup' },
+      agentDir,
+      origin: { kind: 'tui', sessionId: 's1' },
+    })
+    expect(result).toEqual({
+      kind: 'acknowledgement-required',
+      reason: expect.stringContaining('nonWorkspaceWrite'),
+    })
+  })
+  test('still blocks an ordinary session writing the backup diagnosis path', async () => {
+    const agentDir = await makeAgentDir()
+    const result = await checkNonWorkspaceWriteGuard({
+      tool: 'write',
+      args: { path: path.join(agentDir, 'sessions', 'backup-diagnostics.log'), content: 'diagnosis' },
+      agentDir,
+      origin: { kind: 'tui', sessionId: 's1' },
+    })
+    expect(result).toEqual({
+      kind: 'acknowledgement-required',
+      reason: expect.stringContaining('nonWorkspaceWrite'),
+    })
+  })
 })
 
 async function makeAgentDir(): Promise<string> {
