@@ -260,10 +260,14 @@ export function createOutboundCallback(deps: {
 
     try {
       const rendered = toTelegramMarkdownV2(text)
-      const sendOptions: { message_thread_id?: number; reply_to_message_id?: number; parse_mode: 'MarkdownV2' } = {
-        parse_mode: 'MarkdownV2',
-      }
+      const sendOptions: {
+        message_thread_id?: number
+        reply_to_message_id?: number
+        parse_mode: 'MarkdownV2'
+        link_preview_options?: { is_disabled: boolean }
+      } = { parse_mode: 'MarkdownV2' }
       if (threadId !== undefined) sendOptions.message_thread_id = threadId
+      if (msg.link_previews === false) sendOptions.link_preview_options = { is_disabled: true }
       const replyToId = parseTelegramMessageId(msg.replyTo?.externalMessageId)
       if (replyToId !== undefined) sendOptions.reply_to_message_id = replyToId
       const sent = await client.sendMessage(msg.chat, rendered, sendOptions)

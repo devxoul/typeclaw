@@ -231,6 +231,8 @@ export type OutboundMessage = {
   // Adapters that always need text (e.g. some webhook backends in the
   // future) must validate this themselves.
   text?: string
+  // false suppresses URL previews where the adapter supports them; otherwise ignored.
+  link_previews?: boolean
   // Each attachment is uploaded once. Order is preserved. For Slack, the
   // first attachment carries `text` as the file's `initial_comment` so
   // both arrive in a single API call; subsequent attachments are uploaded

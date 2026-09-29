@@ -119,6 +119,7 @@ const slackChannelRootOrigin: ChannelReplyOrigin = {
 type ChannelReplyParams = {
   text?: string
   attachments?: { path: string; filename?: string }[]
+  link_previews?: boolean
   more_work_this_turn: boolean
   resolve_review_thread?: boolean
 }
@@ -198,6 +199,19 @@ describe('createChannelReplyTool', () => {
       text: 'hi',
     })
     expect(result.details).toEqual({ ok: true })
+  })
+
+  test('passes preview suppression to the router for an origin reply', async () => {
+    const calls: OutboundMessage[] = []
+    const tool = createChannelReplyTool({
+      router: fakeRouter(async (msg) => {
+        calls.push(msg)
+        return { ok: true }
+      }),
+      origin: slackThreadOrigin,
+    })
+    await runTool(tool, { text: 'https://example.org', link_previews: false, more_work_this_turn: false })
+    expect(calls[0]?.link_previews).toBe(false)
   })
 
   test('surfaces messageId and messageIds from the router result in details', async () => {
