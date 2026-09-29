@@ -72,6 +72,7 @@ import {
 } from './slack-bot-slash-commands'
 import { slackTsToMillis } from './slack-bot-time'
 import { toSlackMrkdwn } from './slack-format'
+import { invalidSlackThreadTs } from './slack-thread-ts'
 
 // One slash command per logical agent gesture. Mirrors the discord-bot
 // SLASH_COMMANDS constant so the cross-platform set stays consistent — when
@@ -986,6 +987,8 @@ export function createOutboundCallback(deps: {
     if (text === '' && attachments.length === 0) {
       return { ok: false, error: 'message has neither text nor attachments' }
     }
+    const invalidThread = invalidSlackThreadTs(msg.thread)
+    if (invalidThread !== null) return { ok: false, error: invalidThread }
     const tag = await formatChannelTag(msg.workspace, msg.chat)
     logger.info(
       `[slack-bot] outbound ${tag} text_len=${text.length} attachments=${attachments.length}${msg.thread ? ` thread=${msg.thread}` : ''}`,

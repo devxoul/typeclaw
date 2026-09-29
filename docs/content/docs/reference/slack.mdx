@@ -97,6 +97,7 @@ In role match rules, DMs are addressed by the canonical `dm` **bucket** scope, n
 - **No reply attribution**: RTM user-session events don't carry parent authorship, so a reply can't be proven to target the bot's own message without an extra lookup; reply-trigger engagement is therefore not surfaced for this adapter.
 - **Group mentions**: `@here`, `@channel`, and `@everyone` are treated as bot mentions for engagement.
 - **No combined send**: text chunks post first as separate messages, then file uploads follow — a failed upload won't leave a text-only message unposted.
+- **Thread IDs**: outbound replies require the parent message's exact Slack `ts` string (for example, `1700000000.000100`), including six digits after the decimal. Malformed IDs are rejected before sending. User-adapter file uploads do not pass the thread ID to the SDK, so files still post at the channel root even when a valid thread was requested.
 - **Re-auth has no dedicated CLI command**: the session can expire, but `slack` is excluded from both `channel set` and `channel reauth`, and `channel add slack` refuses an already-configured adapter. To re-authenticate today, remove the `channels.slack` block from `secrets.json` (and the `slack` entry from `typeclaw.json` if present), then run `typeclaw channel add slack` again to scan a fresh QR code.
 
 ## Config

@@ -337,6 +337,65 @@ describe('createSlackAdapter', () => {
     expect(sent).toEqual([['C0123456789', 'hello', undefined]])
   })
 
+  test('user Slack sends reject malformed thread ids and preserve valid ids', async () => {
+    const sent: unknown[] = []
+    let uploads = 0
+    const r = router()
+    const adapter = createSlackAdapter({
+      router: r,
+      configRef: () => config,
+      logger: logger(),
+      credentialsStore: { getAccount: async () => account() },
+      createClient: () =>
+        fakeClient({
+          sendMessage: async (...args: unknown[]) => void sent.push(args),
+          uploadFile: async () => {
+            uploads++
+            throw new Error('unexpected upload')
+          },
+        }),
+      createListener: () => new FakeListener() as unknown as SlackListener,
+    })
+    await adapter.start()
+    const target = { adapter: 'slack' as const, workspace: 'T0123456789', chat: 'C0123456789', text: 'hello' }
+    expect(await r.outbound?.({ ...target, thread: '1700000000.0001' })).toMatchObject({
+      ok: false,
+      error: expect.stringContaining('Slack thread'),
+    })
+    expect(await r.outbound?.({ ...target, replyTo: { externalMessageId: '1700000000.0001' } })).toMatchObject({
+      ok: false,
+      error: expect.stringContaining('Slack thread'),
+    })
+    expect(
+      await r.outbound?.({
+        ...target,
+        text: undefined,
+        attachments: [{ path: '/agent/a.png' }],
+        thread: '1700000000.0001',
+      }),
+    ).toMatchObject({ ok: false, error: expect.stringContaining('Slack thread') })
+    expect(uploads).toBe(0)
+    expect(
+      await r.outbound?.({
+        ...target,
+        thread: '1700000000.000100',
+        replyTo: { externalMessageId: '1700000000.0001' },
+      }),
+    ).toMatchObject({ ok: false, error: expect.stringContaining('Slack thread') })
+    expect(sent).toHaveLength(0)
+    expect(await r.outbound?.({ ...target, thread: '1700000000.000100' })).toEqual({ ok: true })
+    expect(sent).toEqual([['C0123456789', 'hello', '1700000000.000100']])
+    expect(
+      await r.outbound?.({
+        ...target,
+        thread: '1700000000.0001',
+        replyTo: { externalMessageId: '1700000000.000200' },
+      }),
+    ).toEqual({ ok: true })
+    expect(sent[1]).toEqual(['C0123456789', 'hello', '1700000000.000200'])
+    await adapter.stop()
+  })
+
   test('listener start failure rolls back registrations', async () => {
     const r = router()
     const listener = new FakeListener()
