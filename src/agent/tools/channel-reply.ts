@@ -58,10 +58,10 @@ export function createChannelReplyTool({
       'addressing fields (adapter, workspace, chat, thread) are filled in from the session origin, so ' +
       'you only supply the text. To post somewhere else (different chat, break out of the current ' +
       'thread, etc.), use `channel_send` instead. ' +
-      'On success the result carries `messageId` (the posted message id) and `messageIds` (every id when ' +
-      'the text was split into multiple posts) when the platform reports them; pass `messageId` as a ' +
-      '`channel_send` `thread` to post follow-ups into the same thread. Some adapters do not report an id, ' +
-      'in which case both are absent.',
+      'On success the result carries adapter-reported posted-message ids (`messageId` and `messageIds` ' +
+      'in send order) when available. For follow-ups, reuse `channel_reply` or the existing ' +
+      '`channel_send` thread/root coordinates; a returned id starts a thread only where the adapter ' +
+      'accepts a message id as `thread` (e.g. a new top-level Slack post).',
     parameters: Type.Object({
       text: Type.Optional(
         Type.String({
@@ -365,7 +365,10 @@ export function createChannelReplyTool({
       // prose (just machine error text), so they keep the lighter prefix.
       if (result.ok) {
         const echo = renderOutboundEcho(text, attachments)
-        const receipt = `posted to ${origin.adapter}:${origin.workspace}/${origin.chat}: ${echo}`
+        const receipt =
+          `posted to ${origin.adapter}:${origin.workspace}/${origin.chat}: ${echo}` +
+          (result.messageId !== undefined ? `\nmessage_id=${JSON.stringify(result.messageId)}` : '') +
+          (result.messageIds !== undefined ? `\nmessage_ids=${JSON.stringify(result.messageIds)}` : '')
         const hint = consecutiveSendHint(
           router.getConsecutiveSendCount({
             adapter: origin.adapter,

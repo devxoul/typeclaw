@@ -282,20 +282,18 @@ export type SendErrorCode =
   | 'callback-rejected'
   | 'skip-locked'
 
-// `messageId` is the platform-native id of the posted message (Slack `ts`,
-// Discord snowflake, Telegram `message_id`, Webex/GitHub comment id, KakaoTalk
-// `log_id`, LINE `message_id`). It is the SAME id shape an inbound carries as
-// `externalMessageId`, so an agent can feed it straight back into a follow-up
-// `thread` / `replyTo` to keep posting into one conversation. For a send the
-// adapter splits into multiple posts (long text chunked, or attachments +
-// text), `messageId` is the post a reply should anchor to — usually the FIRST
-// post, but adapter-specific: KakaoTalk uploads files BEFORE the text, so the
-// text post (the message a human replies to) is the anchor even though it is
-// last. `messageIds` always lists every post in send order, so a caller that
-// needs a specific post (rather than the reply anchor) can index it directly.
-// Optional throughout: an adapter whose SDK does not hand back an id (legacy
-// slack/discord user-account adapters) omits both, and callers must treat a
-// missing id as "not available", never as an error.
+// `messageId` is an adapter-reported id of a posted message (e.g. Slack `ts`,
+// Discord snowflake, Telegram `message_id`, Webex/GitHub comment id). The
+// optional `messageIds` lists reported posted-message ids in send order,
+// including when a send is split; some adapters do not report attachment ids.
+// `messageId` is adapter-selected, not necessarily the first post (KakaoTalk
+// reports the text id after attachments). Neither field is universally a
+// `thread` coordinate: Discord uses a thread channel id, Telegram a topic id,
+// GitHub review replies a root comment id, and Slack replies keep the original
+// thread root rather than their own new `ts`. Reuse existing conversation
+// coordinates for follow-ups; a newly posted id can start a thread only when
+// that adapter accepts a message id as `thread` (e.g. a top-level Slack post).
+// Adapters with no reported ids omit the fields; missing ids are not an error.
 // `reactionRef` is the outbound message's adapter-owned TARGET ref — the entity
 // a later ReactionRequest reacts to. It is explicitly NOT the per-reaction
 // removal-instance ref returned by `ReactionResult.reactionRef` after an add.

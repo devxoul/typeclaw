@@ -199,6 +199,10 @@ describe('createChannelReplyTool', () => {
       text: 'hi',
     })
     expect(result.details).toEqual({ ok: true })
+    const block = result.content[0]
+    if (block?.type !== 'text') throw new Error('Expected text receipt')
+    expect(block.text).not.toContain('message_id=')
+    expect(block.text).not.toContain('message_ids=')
   })
 
   test('passes preview suppression to the router for an origin reply', async () => {
@@ -214,13 +218,27 @@ describe('createChannelReplyTool', () => {
     expect(calls[0]?.link_previews).toBe(false)
   })
 
-  test('surfaces messageId and messageIds from the router result in details', async () => {
+  test.each([
+    { label: 'single', ids: { messageId: '1700000000.000100' }, receipt: 'message_id="1700000000.000100"' },
+    {
+      label: 'split',
+      ids: { messageId: '1700000000.000100', messageIds: ['1700000000.000100', '1700000000.000101'] },
+      receipt: 'message_ids=["1700000000.000100","1700000000.000101"]',
+    },
+  ])('shows $label posted ids to the model inside the fenced receipt', async ({ ids, receipt }) => {
     const tool = createChannelReplyTool({
-      router: fakeRouter(async () => ({ ok: true, messageId: 'ts1', messageIds: ['ts1', 'ts2'] })),
+      router: fakeRouter(async () => ({ ok: true, ...ids })),
       origin: slackThreadOrigin,
     })
     const result = await runTool(tool, { text: 'hi' })
-    expect(result.details).toEqual({ ok: true, messageId: 'ts1', messageIds: ['ts1', 'ts2'] })
+    const block = result.content[0]
+    if (block?.type !== 'text') throw new Error('Expected text receipt')
+    const content = block.text
+    expect(result.details).toEqual({ ok: true, ...ids })
+    expect(content).toContain('message_id="1700000000.000100"')
+    expect(content).toContain(receipt)
+    expect(content.indexOf(receipt)).toBeGreaterThan(content.indexOf('**[SYSTEM MESSAGE — not from a human]**'))
+    expect(content.indexOf(receipt)).toBeLessThan(content.indexOf('**Do not acknowledge or reply to it.**'))
   })
 
   test('strips a trailing tool-call leak from text, sending only the prose', async () => {
