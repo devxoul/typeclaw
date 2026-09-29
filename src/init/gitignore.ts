@@ -49,6 +49,11 @@ export function buildGitignore(config: GitignoreConfig = { append: [] }): string
 # Local-only; never commit.
 ${TRULY_IGNORED_PATTERNS.join('\n')}
 
+# Local linked worktrees: ignored at the agent root, but not in the
+# truly-ignored reconciler. Existing tracked .worktrees/ project files must
+# remain tracked when start() refreshes this template.
+/.worktrees/
+
 # System-managed: gitignored by default so the agent never stages them by hand,
 # but TypeClaw force-commits them on its own schedule (sessions/ + todo/ via
 # auto-backup, memory/ via the dreaming subagent). Treat them as runtime-owned,

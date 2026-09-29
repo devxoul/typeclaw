@@ -138,6 +138,32 @@ describe('untrackTrulyIgnoredFiles', () => {
     }
   })
 
+  test('ignores root linked worktrees without untracking existing project files', async () => {
+    const dir = await makeRepo()
+    try {
+      await gitInit(dir)
+      await mkdir(join(dir, '.worktrees'))
+      await writeFile(join(dir, '.worktrees', 'tracked.txt'), 'retained\n')
+      await runGit(dir, ['add', '.worktrees/tracked.txt'])
+      await runGit(dir, ['commit', '-m', 'initial'])
+      await writeFile(join(dir, '.gitignore'), buildGitignore())
+      await runGit(dir, ['worktree', 'add', '-b', 'dev', '.worktrees/dev'])
+
+      expect(await runGit(dir, ['check-ignore', '-v', '--no-index', '.worktrees/dev/tracked.txt'])).toContain(
+        '/.worktrees/',
+      )
+      expect((await untrackTrulyIgnoredFiles(dir)).untracked).not.toContain('.worktrees/tracked.txt')
+      expect(await isTracked(dir, '.worktrees/tracked.txt')).toBe(true)
+      await mkdir(join(dir, 'packages', '.worktrees'), { recursive: true })
+      await writeFile(join(dir, 'packages', '.worktrees', 'ordinary.txt'), 'included\n')
+      expect(await runGit(dir, ['status', '--porcelain=v1', '-z', '--untracked-files=all'])).toContain(
+        '?? packages/.worktrees/ordinary.txt',
+      )
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
   test('untracks custom append matches', async () => {
     const dir = await makeRepo()
     try {

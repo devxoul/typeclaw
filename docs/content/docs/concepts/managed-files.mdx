@@ -25,7 +25,9 @@ The `Dockerfile` is gitignored for this reason. Tracking it would produce noisy 
 - `sessions/` is JSONL logs of every agent session. The bundled `backup` plugin commits them on idle with an LLM-generated commit subject. The reason they're gitignored is so the agent doesn't accidentally stage them via `git add .` — but their history is preserved.
 - `memory/` is the long-term memory (`MEMORY.md`) and muscle-memory skills, force-committed by the `dreaming` subagent. Same reason: gitignored so the agent doesn't stage them by hand, but committed by TypeClaw on its own schedule.
 
-The visual cue in the managed `.gitignore` template is two sections — "truly ignored" and "system-managed." Don't merge them; they're different.
+The managed `.gitignore` ignores root-level `.worktrees/` so linked worktrees stay out of `git status`; existing tracked files there stay tracked when `start` refreshes the template.
+
+The visual cue in the managed `.gitignore` template is three sections — "truly ignored" (also untracked on refresh), "local linked worktrees" (new paths ignored without untracking old ones), and "system-managed" (force-committed by TypeClaw). Don't merge them; they're different.
 
 ## The guards
 
