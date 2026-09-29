@@ -493,7 +493,7 @@ function selectStagingSnapshot(entries: readonly PorcelainEntry[], cwd: string):
       if (isAgentOwned(path)) continue
       const forceAdded = FORCE_ADD_PREFIXES.some((prefix) => path.startsWith(prefix))
       if (entry.kind === 'untracked') {
-        if (forceAdded || !hasDirectoryEntry(join(cwd, path))) continue
+        if (forceAdded || !hasDirectoryEntry(join(cwd, path)) || isNestedRepository(join(cwd, path))) continue
         untrackedPaths.add(path)
       }
       paths.push(path)
@@ -551,6 +551,11 @@ function selectForcePaths(
 
 function hasDirectoryEntry(path: string): boolean {
   return lstatSync(path, { throwIfNoEntry: false }) !== undefined
+}
+
+function isNestedRepository(path: string): boolean {
+  if (!lstatSync(path, { throwIfNoEntry: false })?.isDirectory()) return false
+  return hasDirectoryEntry(join(path, '.git'))
 }
 
 function uniquePaths(paths: readonly string[]): string[] {
