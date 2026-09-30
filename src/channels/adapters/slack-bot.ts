@@ -1263,20 +1263,19 @@ export function createSlackBotAdapter(options: SlackBotAdapterOptions): SlackBot
       const text = event.text ?? ''
       const userId = event.user ?? 'unknown'
       const inboundWorkspace = event.channel_type === 'im' ? '@dm' : (teamId ?? 'unknown')
-      const [resolvedUserName, inboundTag] = await Promise.all([
-        event.user !== undefined && event.user !== '' ? authorResolver.resolve(event.user) : Promise.resolve(userId),
-        formatChannelTag(inboundWorkspace, event.channel),
-      ])
-      logger.info(
-        `[slack-bot] inbound source=${source} ts=${event.ts} user=${formatLabel(resolvedUserName, userId)} ${inboundTag} text_len=${text.length}`,
-      )
 
       if (teamId === null) {
         logger.warn(`[slack-bot] dropped ts=${event.ts} reason=pre_connected (team_id unknown)`)
         return
       }
 
-      const dedupeMatch = dedupe.check(event)
+      const verdict = classifyInbound(event, options.configRef(), {
+        teamId,
+        botUserId,
+        ...(options.selfAliasesRef ? { selfAliases: options.selfAliasesRef() } : {}),
+      })
+      const isBotMention = verdict.kind === 'route' && verdict.payload.isBotMention
+      const dedupeMatch = dedupe.check(event, isBotMention)
       if (dedupeMatch !== null) {
         logger.info(
           `[slack-bot] dropped ts=${event.ts} reason=duplicate_delivery (source=${source}, matched=${dedupeMatch})`,
@@ -1284,21 +1283,19 @@ export function createSlackBotAdapter(options: SlackBotAdapterOptions): SlackBot
         return
       }
 
-      // Intercept `!cmd` thread-message commands BEFORE classifyInbound. A
-      // command is control traffic — neither dropped nor routed to the agent —
-      // so it must short-circuit here. Bypassing classifyInbound also bypasses
-      // its self_author / no_user drops, so we replicate those guards: never
-      // execute a command from our own message (echo loop) or a userless
-      // system event. The `reserve` closure marks dedupe synchronously the
-      // instant the command is recognised (before the router await), closing
-      // the check→execute race for duplicate deliveries.
+      // Intercept `!cmd` before acting on the classifier verdict: commands are
+      // control traffic, not agent messages. Retain self-author/userless floors.
+      // The handler reserves synchronously before executing, and a consumed
+      // command cannot later promote into a mention.
       if (event.user !== undefined && event.user !== '' && (botUserId === null || event.user !== botUserId)) {
+        let commandReserved = false
         const reserve = (): boolean => {
-          if (dedupe.check(event) !== null) return false
-          dedupe.mark(event)
+          if (dedupe.check(event, isBotMention) !== null) return false
+          dedupe.mark(event, true)
+          commandReserved = true
           return true
         }
-        const outcome = await handleThreadCommand(
+        const outcomePromise = handleThreadCommand(
           {
             text: event.text ?? '',
             channel: event.channel,
@@ -1309,24 +1306,27 @@ export function createSlackBotAdapter(options: SlackBotAdapterOptions): SlackBot
           },
           reserve,
         )
-        if (outcome.kind === 'executed') return
-        if (outcome.kind === 'duplicate') {
-          logger.info(`[slack-bot] dropped ts=${event.ts} reason=duplicate_delivery (thread-command race)`)
+        // The handler reserves synchronously before its first await. Do not
+        // await a non-command: regular delivery must reserve in this same tick.
+        if (commandReserved) {
+          await outcomePromise
           return
         }
       }
 
-      const verdict = classifyInbound(event, options.configRef(), {
-        teamId,
-        botUserId,
-        ...(options.selfAliasesRef ? { selfAliases: options.selfAliasesRef() } : {}),
-      })
       if (verdict.kind === 'drop') {
         logger.info(`[slack-bot] dropped ts=${event.ts} reason=${verdict.reason}${dropHint(verdict.reason)}`)
         return
       }
 
-      dedupe.mark(event)
+      dedupe.mark(event, isBotMention)
+      const [resolvedUserName, inboundTag] = await Promise.all([
+        event.user !== undefined && event.user !== '' ? authorResolver.resolve(event.user) : Promise.resolve(userId),
+        formatChannelTag(inboundWorkspace, event.channel),
+      ])
+      logger.info(
+        `[slack-bot] inbound source=${source} ts=${event.ts} user=${formatLabel(resolvedUserName, userId)} ${inboundTag} text_len=${text.length}`,
+      )
       const hintedText = await addSlackMentionHints(verdict.payload.text, authorResolver.resolve, { botUserId })
       const slackAttachments = Array.isArray(event.attachments) ? event.attachments : undefined
       const referenceResult = await enrichSlackReferenceContext({

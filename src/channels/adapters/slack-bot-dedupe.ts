@@ -4,48 +4,58 @@ export const SLACK_DEDUPE_CAPACITY = 256
 
 export type SlackDedupeMatch = 'client_msg_id' | 'channel_ts'
 
-export type SlackDedupeKeys = {
-  channelTs: string
-  clientMsgId: string | null
-}
+type DedupeEvent = Pick<SlackInboundMessageEvent, 'channel' | 'ts' | 'client_msg_id' | 'text'>
+type Delivery = { text: string | undefined; mentioned: boolean }
 
 export type SlackDedupe = {
-  check: (event: Pick<SlackInboundMessageEvent, 'channel' | 'ts' | 'client_msg_id'>) => SlackDedupeMatch | null
-  mark: (event: Pick<SlackInboundMessageEvent, 'channel' | 'ts' | 'client_msg_id'>) => void
+  check: (event: DedupeEvent, isBotMention?: boolean) => SlackDedupeMatch | null
+  mark: (event: DedupeEvent, isBotMention?: boolean) => void
 }
 
-// Two parallel insertion-ordered Sets. `client_msg_id` is the primary key
-// because it is stable across Slack-side resends of the same user gesture
-// (observed in the wild: a single Slack mention surfaced as two `message`
-// events ~21s apart with different `ts` values, identical text, and — per
-// Slack's API contract — identical `client_msg_id`). `channel:ts` is the
-// fallback because it is the only key available for events Slack does not
-// stamp with `client_msg_id` (bot messages, system messages, and historically
-// `app_mention` envelopes).
+// Keep both retry identities: client_msg_id survives Slack resends with a fresh
+// ts, while channel:ts also covers app_mention envelopes without client_msg_id.
+// An identity may promote from observation to mention only on changed raw text.
+// Once mentioned, further edits cannot re-engage it while either ring retains it.
 export function createSlackDedupe(capacity: number = SLACK_DEDUPE_CAPACITY): SlackDedupe {
-  const tsRing = new Set<string>()
-  const clientMsgIdRing = new Set<string>()
+  const tsRing = new Map<string, Delivery>()
+  const clientMsgIdRing = new Map<string, Delivery>()
 
-  const remember = (ring: Set<string>, key: string): void => {
-    if (ring.has(key)) return
-    if (ring.size >= capacity) {
-      const oldest = ring.values().next().value
+  const remember = (ring: Map<string, Delivery>, key: string, delivery: Delivery): void => {
+    if (!ring.has(key) && ring.size >= capacity) {
+      const oldest = ring.keys().next().value
       if (oldest !== undefined) ring.delete(oldest)
     }
-    ring.add(key)
+    ring.set(key, delivery)
   }
+  const isDuplicate = (previous: Delivery | undefined, event: DedupeEvent, mentioned: boolean): boolean =>
+    previous !== undefined &&
+    !(
+      mentioned &&
+      !previous.mentioned &&
+      previous.text !== undefined &&
+      event.text !== undefined &&
+      previous.text !== event.text
+    )
 
   return {
-    check: (event) => {
+    check: (event, mentioned = false) => {
       const cmid = event.client_msg_id
-      if (cmid !== undefined && cmid !== '' && clientMsgIdRing.has(cmid)) return 'client_msg_id'
-      if (tsRing.has(`${event.channel}:${event.ts}`)) return 'channel_ts'
+      if (cmid && isDuplicate(clientMsgIdRing.get(cmid), event, mentioned)) return 'client_msg_id'
+      if (isDuplicate(tsRing.get(`${event.channel}:${event.ts}`), event, mentioned)) return 'channel_ts'
       return null
     },
-    mark: (event) => {
-      remember(tsRing, `${event.channel}:${event.ts}`)
+    mark: (event, mentioned = false) => {
+      const key = `${event.channel}:${event.ts}`
       const cmid = event.client_msg_id
-      if (cmid !== undefined && cmid !== '') remember(clientMsgIdRing, cmid)
+      const byTs = tsRing.get(key)
+      const byClient = cmid ? clientMsgIdRing.get(cmid) : undefined
+      const delivery = byClient ?? byTs ?? { text: event.text, mentioned: false }
+      // Share the latch across both identities, including envelopes omitting cmid.
+      delivery.mentioned ||= mentioned || (byTs?.mentioned ?? false)
+      if (byTs !== undefined) byTs.mentioned ||= delivery.mentioned
+      if (mentioned) delivery.text = event.text
+      remember(tsRing, key, delivery)
+      if (cmid) remember(clientMsgIdRing, cmid, delivery)
     },
   }
 }

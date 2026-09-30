@@ -78,6 +78,29 @@ describe('createSlackDedupe', () => {
     expect(dedupe.check({ channel: 'C0', ts: 't3', client_msg_id: 'cmid-3' })).toBe('client_msg_id')
   })
 
+  test('an observed message can add a mention once, but later edits and retries cannot re-engage', () => {
+    const dedupe = createSlackDedupe()
+    const original = { channel: 'C0', ts: 't1', client_msg_id: 'cmid-1', text: '질문입니다' }
+    const edited = { ...original, text: '<@UBOT> 질문입니다' }
+    dedupe.mark(original, false)
+    expect(dedupe.check(edited, true)).toBeNull()
+    dedupe.mark(edited, true)
+    expect(dedupe.check(edited, true)).toBe('client_msg_id')
+    expect(dedupe.check({ ...edited, text: '<@UBOT> 추가 질문' }, true)).toBe('client_msg_id')
+    expect(dedupe.check({ ...edited, ts: 't2' }, true)).toBe('client_msg_id')
+  })
+
+  test('same-version message and app_mention deliveries cannot promote an observed message', () => {
+    const dedupe = createSlackDedupe()
+    const event = { channel: 'C0', ts: 't1', text: '<@UBOT> hello' }
+    dedupe.mark(event, false)
+    expect(dedupe.check(event, true)).toBe('channel_ts')
+    const edited = { ...event, text: '<@UBOT> hello again' }
+    expect(dedupe.check(edited, true)).toBeNull()
+    dedupe.mark(edited, true)
+    expect(dedupe.check(edited, true)).toBe('channel_ts')
+  })
+
   test('default capacity matches the published constant', () => {
     expect(SLACK_DEDUPE_CAPACITY).toBe(256)
   })
