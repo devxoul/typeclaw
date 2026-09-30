@@ -8,6 +8,7 @@ type DedupeEvent = Pick<SlackInboundMessageEvent, 'channel' | 'ts' | 'client_msg
 type Delivery = { text: string | undefined; mentioned: boolean }
 
 export type SlackDedupe = {
+  // A suppressed delivery still associates its retry identities synchronously.
   check: (event: DedupeEvent, isBotMention?: boolean) => SlackDedupeMatch | null
   mark: (event: DedupeEvent, isBotMention?: boolean) => void
 }
@@ -37,25 +38,46 @@ export function createSlackDedupe(capacity: number = SLACK_DEDUPE_CAPACITY): Sla
       previous.text !== event.text
     )
 
+  const associate = (event: DedupeEvent): Delivery => {
+    const key = `${event.channel}:${event.ts}`
+    const cmid = event.client_msg_id
+    const byTs = tsRing.get(key)
+    const byClient = cmid ? clientMsgIdRing.get(cmid) : undefined
+    const delivery = byClient ?? byTs ?? { text: event.text, mentioned: false }
+    if (byTs !== undefined && byTs !== delivery) {
+      if (byTs.mentioned && !delivery.mentioned) delivery.text = byTs.text
+      delivery.mentioned ||= byTs.mentioned
+      // Earlier resends can leave several timestamp aliases. Reconcile all of
+      // them, not only the two keys on this envelope. Scans are bounded by the
+      // ring capacities and needed only when two distinct records converge.
+      for (const [alias, previous] of tsRing) {
+        if (previous === byTs) tsRing.set(alias, delivery)
+      }
+      for (const [alias, previous] of clientMsgIdRing) {
+        if (previous === byTs) clientMsgIdRing.set(alias, delivery)
+      }
+    }
+    remember(tsRing, key, delivery)
+    if (cmid) remember(clientMsgIdRing, cmid, delivery)
+    return delivery
+  }
+
   return {
     check: (event, mentioned = false) => {
       const cmid = event.client_msg_id
-      if (cmid && isDuplicate(clientMsgIdRing.get(cmid), event, mentioned)) return 'client_msg_id'
-      if (isDuplicate(tsRing.get(`${event.channel}:${event.ts}`), event, mentioned)) return 'channel_ts'
-      return null
+      const match =
+        cmid && isDuplicate(clientMsgIdRing.get(cmid), event, mentioned)
+          ? 'client_msg_id'
+          : isDuplicate(tsRing.get(`${event.channel}:${event.ts}`), event, mentioned)
+            ? 'channel_ts'
+            : null
+      if (match !== null) associate(event)
+      return match
     },
     mark: (event, mentioned = false) => {
-      const key = `${event.channel}:${event.ts}`
-      const cmid = event.client_msg_id
-      const byTs = tsRing.get(key)
-      const byClient = cmid ? clientMsgIdRing.get(cmid) : undefined
-      const delivery = byClient ?? byTs ?? { text: event.text, mentioned: false }
-      // Share the latch across both identities, including envelopes omitting cmid.
-      delivery.mentioned ||= mentioned || (byTs?.mentioned ?? false)
-      if (byTs !== undefined) byTs.mentioned ||= delivery.mentioned
+      const delivery = associate(event)
+      delivery.mentioned ||= mentioned
       if (mentioned) delivery.text = event.text
-      remember(tsRing, key, delivery)
-      if (cmid) remember(clientMsgIdRing, cmid, delivery)
     },
   }
 }
