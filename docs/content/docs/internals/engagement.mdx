@@ -98,6 +98,12 @@ A second, milder runtime notice rides the **same** fenced `**[SYSTEM MESSAGE —
 
 This nudge is **load-bearing**, not a backstop. Because sticky now engages every group follow-up (rule #2 is content-blind), the nudge is the **only** thing that keeps the bot from answering chatter in a busy room — the gate gets the bot into the turn; the model decides whether to speak. Removing the nudge would reintroduce group spam. `isMultiHumanGroup` is the single definition shared by `route()` (to set `live.multiHumanGroup`) and the nudge gate, so they never disagree.
 
+## Continuation promises while a child runs
+
+After a terminal `channel_reply` promises more work without `more_work_this_turn: true`, the router normally queues one willingness reminder. An explicit `NO_REPLY` on that reminder triggers empty-turn recovery. Both decisions check for a running background child anywhere in the session, including one started before a later queued user message: the child's completion reminder owns the deferred result, so the router neither re-nudges its status reply nor posts a false stuck-reply warning.
+
+This exception uses the existing stuck-child backstop. Once it expires, willingness recovery resumes. Ordinary empty-turn recovery remains scoped to the logical turn that started the child; unrelated later turns still recover, and real prose is still delivered while a child runs.
+
 ## Rules of thumb
 
 - **`decideEngagement` is pure.** Inputs in, `engage`/`observe` out. No I/O, no side effects — the router owns buffering, broadcasting, and membership warming.
