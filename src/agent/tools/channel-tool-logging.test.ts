@@ -100,7 +100,6 @@ function fakeRouter(overrides: RouterOverrides = {}): ChannelRouter {
     stop: async () => {},
     tearDownAllLive: async () => {},
     markRestartAbortForAllLive: async () => {},
-    writeInterruptedSubagentHandoff: async () => false,
     liveCount: () => 0,
     executeCommand: async () => ({ kind: 'no-live-session' }),
     injectSubagentCompletionReminder: () => ({ kind: 'no-live-session' }),

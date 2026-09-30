@@ -114,6 +114,22 @@ Adapters own canonical target, emoji, authenticated identity, and own-actor remo
 
 If intent storage fails, the waiting add is skipped. JSON replacement synchronizes the file and parent directory on POSIX. Windows development compatibility keeps file synchronization but explicitly skips unsupported directory synchronization; it does not promise power-loss durability. Other synchronization errors propagate. This assumes one runtime writing an agent directory, not concurrent runtimes or remote-call fencing.
 
+## Background work across runtime death
+
+`src/channels/background-handoff.ts` records direct background launches of channel-origin parents before child execution. `LiveSubagentRegistry` removes each task after its winning canonical terminal transition; all per-parent additions and removals serialize. Empty inventories disappear. TUI, cron, foreground children and nested descendants do not get separate inventory rows.
+
+`src/run/background-handoff-boot.ts` claims prior-process inventories by rename, reads the owned claim, and merges them with the accepted ordinary channel restart handoff **before reserving each channel key once**. The explicit handoff retains its author and origin. Inventory has no age TTL: only an unconfigured adapter or a changed/missing exact parent mapping makes it stale, not elapsed time or newer inbound traffic. The ordinary restart greeting still has its existing 60-second TTL, and TUI consumption stays separate.
+
+Reservations precede adapter startup. After startup, boot retires each exact claim before resuming the parent with the existing lost-work directive; failures are isolated and gates are released even when adapter startup fails. A racing observed inbound does not discard the directive. Recovery never launches the child again. Persisted trigger targets are not reaction-instance refs: without adapter-owned lookup of the bot's eyes by target, boot skips reaction cleanup entirely. It does not pass those targets to `removeReaction`, restore reaction ownership, or promise to remove all stale eyes.
+
+### Recovery boundary
+
+- This is an unfinished-launch inventory, **not durable result delivery**. Child termination ends recovery coverage even if the parent is absent, its provider fails, or it has not answered yet. No completion hydration, settlement tracking, cancellation tombstones or replay scheduler is added.
+- Intent publication before execution and asynchronous removal after terminal CAS can leave conservative false positives: a notice may describe a launch that never executed or a child that already ended. Removal errors are logged without suppressing live completion.
+- Claim ownership provides **at-most-once recovery-directive attempts**, not guaranteed exactly-once visible delivery. A second crash after claiming but before notice delivery can lose the notice; claimed inventories are not replayed.
+- One active runtime per agent directory is supported. Boot claim contention does not make concurrent runtime writers safe.
+- `/stop` still stops the parent, not its running children. Physical `subagent_cancel` alone does not retire inventory; canonical child termination does. Healthy engagement, completion delivery and live eyes cleanup remain router-owned.
+
 ## Rules of thumb
 
 - **`decideEngagement` is pure.** Inputs in, `engage`/`observe` out. No I/O, no side effects — the router owns buffering, broadcasting, and membership warming.

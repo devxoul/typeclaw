@@ -1,3 +1,5 @@
+import type { BackgroundHandoffInventory, BackgroundLaunchIdentity } from '@/channels/background-handoff'
+
 import type { AgentSession } from './index'
 
 export type SubagentProgressEvent =
@@ -20,6 +22,7 @@ export type LiveSubagent = {
   subagentName: string
   parentSessionId?: string
   workKey?: string
+  backgroundLaunch?: BackgroundLaunchIdentity
   // Role that resolved at spawn time, captured for the provenance cap on
   // subagent_output/subagent_cancel. Absent when no permission service was
   // active at spawn, in which case the cap fails closed.
@@ -120,6 +123,16 @@ export class LiveSubagentRegistry {
   private readonly capturedFinalMessages = new Map<string, string>()
   private readonly pendingWorkKeyRegistrations = new Map<string, Set<PendingWorkKeyRegistration>>()
 
+  constructor(readonly backgroundInventory?: BackgroundHandoffInventory) {}
+
+  // Storage failure is conservative evidence for the next boot, never a reason
+  // to suppress completion delivery or delay physical cancellation.
+  retireBackgroundLaunch(identity: BackgroundLaunchIdentity): void {
+    void this.backgroundInventory?.remove(identity).catch((error: unknown) => {
+      console.error('[subagent] failed to retire background launch', error)
+    })
+  }
+
   register(live: LiveSubagent): void {
     if (this.entries.has(live.taskId)) {
       throw new Error(`task ${live.taskId} already registered`)
@@ -151,6 +164,7 @@ export class LiveSubagentRegistry {
   }
 
   unregister(taskId: string): void {
+    // Disposal is not a terminal transition: preserve still-running inventory.
     this.entries.delete(taskId)
     this.events.delete(taskId)
     this.capturedFinalMessages.delete(taskId)
@@ -215,6 +229,7 @@ export class LiveSubagentRegistry {
     if (entry === undefined || entry.status !== 'running') return false
     entry.completion = completion
     entry.status = completion.ok ? 'completed' : 'failed'
+    if (entry.backgroundLaunch !== undefined) this.retireBackgroundLaunch(entry.backgroundLaunch)
     return true
   }
 
@@ -287,6 +302,7 @@ export class LiveSubagentRegistry {
   }
 
   clear(): void {
+    // Shutdown must not erase evidence of children that have not terminated.
     this.entries.clear()
     this.events.clear()
     this.capturedFinalMessages.clear()
