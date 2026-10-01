@@ -56,6 +56,7 @@ function runtime(
   const remaining = [...nonces]
   return {
     capture,
+    inspectLogConfig: async () => ({ exitCode: 1, stdout: '', stderr: '' }),
     nonce: () => remaining.shift() ?? FIRST_NONCE,
     now: () => new Date(NOW),
     resolveDockerBinary: () => '/usr/bin/docker',
@@ -248,6 +249,62 @@ describe('archiveContainerLogs', () => {
     }
   })
 
+  test('archives logs above 64 MiB when the container uses bounded Docker log rotation', async () => {
+    const archiveRuntime = runtime(async (input) => {
+      expect(input.maxBytes).toBe(100_000_000)
+      return await streamProcessOutput({
+        ...input,
+        binary: process.execPath,
+        args: ['-e', "const chunk = 'x'.repeat(1024 * 1024); for (let i = 0; i < 68; i++) process.stdout.write(chunk)"],
+      })
+    })
+    archiveRuntime.inspectLogConfig = async (args, options) => {
+      expect(args).toEqual(['inspect', '--format', '{{json .HostConfig.LogConfig}}', CONTAINER_ID])
+      expect(options.cwd).toBe(agentDir)
+      return {
+        exitCode: 0,
+        stdout: '{"Type":"json-file","Config":{"max-size":"20m","max-file":"5"}}',
+        stderr: '',
+      }
+    }
+
+    const result = await archiveContainerLogs({ agentDir, containerId: CONTAINER_ID }, archiveRuntime)
+    expect(result.ok).toBe(true)
+    if (result.ok) expect((await stat(result.path)).size).toBe(68 * 1024 * 1024)
+  })
+
+  test.each([
+    { label: 'unbounded driver', config: '{"Type":"json-file","Config":{}}', limit: MAX_DOCKER_LOG_ARCHIVE_BYTES },
+    {
+      label: 'oversized rotation',
+      config: '{"Type":"json-file","Config":{"max-size":"200m","max-file":"5"}}',
+      limit: 512 * 1024 * 1024,
+    },
+    {
+      label: 'compressed local driver',
+      config: '{"Type":"local","Config":{"max-size":"20m","max-file":"5"}}',
+      limit: MAX_DOCKER_LOG_ARCHIVE_BYTES,
+    },
+  ])('keeps the container on $label archive overflow and explains manual recovery', async ({ config, limit }) => {
+    const archiveRuntime = runtime(async ({ maxBytes, output }) => {
+      expect(maxBytes).toBe(limit)
+      await output.write('partial')
+      return { exitCode: -1, overflowed: true, stderrExcerpt: '', timedOut: false }
+    })
+    archiveRuntime.inspectLogConfig = async () => ({ exitCode: 0, stdout: config, stderr: '' })
+
+    const result = await archiveContainerLogs({ agentDir, containerId: CONTAINER_ID }, archiveRuntime)
+    expect(result).toMatchObject({ ok: false, kind: 'failed' })
+    if (!result.ok) {
+      expect(result.reason).toContain(`docker logs exceeded the ${limit}-byte archive limit`)
+      expect(result.reason).toContain(`docker logs --timestamps ${CONTAINER_ID}`)
+      expect(result.reason).toContain(`docker logs --timestamps ${CONTAINER_ID} > private-log-file 2>&1`)
+      expect(result.reason).toContain('confirm the export succeeded before')
+      expect(result.reason).toContain(`docker rm ${CONTAINER_ID}`)
+    }
+    expect(await readdir(join(agentDir, '.typeclaw', 'logs'))).toEqual([])
+  })
+
   test.each(['abc', 'A'.repeat(64), 'a'.repeat(63), `${'a'.repeat(64)}.log`, '../escape'])(
     'rejects invalid container ID %s without touching the agent folder',
     async (containerId) => {
@@ -342,7 +399,8 @@ describe('archiveContainerLogs', () => {
       }
       const result = await archiveContainerLogs({ agentDir, containerId: CONTAINER_ID }, runtime(capture))
 
-      expect(result).toEqual({ ok: false, kind: 'failed', reason: expected })
+      expect(result).toMatchObject({ ok: false, kind: 'failed' })
+      if (!result.ok) expect(result.reason).toContain(expected)
       expect(await readdir(join(agentDir, '.typeclaw', 'logs'))).toEqual([])
     },
   )
@@ -359,6 +417,79 @@ describe('archiveContainerLogs', () => {
     expect((await archiveContainerLogs({ agentDir, containerId: CONTAINER_ID }, runtime(capture))).ok).toBe(false)
     expect((await readdir(logsDir)).filter((name) => name.endsWith('.partial'))).toEqual([])
     expect((await lstat(finalPath)).isDirectory()).toBe(true)
+  })
+
+  test('preserves prior archives when an enlarged capture cannot be published', async () => {
+    const logsDir = join(agentDir, '.typeclaw', 'logs')
+    await mkdir(logsDir, { recursive: true })
+    const priorPath = join(logsDir, archiveFilename(new Date(NOW.getTime() - 1_000), SECOND_NONCE, 'b'.repeat(64)))
+    await writeFile(priorPath, 'prior archive')
+    await truncate(priorPath, 200 * 1024 * 1024)
+    const archiveRuntime = runtime(async ({ output }) => {
+      await output.truncate(400 * 1024 * 1024)
+      await mkdir(join(logsDir, archiveFilename(NOW)))
+      return { exitCode: 0, overflowed: false, stderrExcerpt: '', timedOut: false }
+    })
+    archiveRuntime.inspectLogConfig = async () => ({
+      exitCode: 0,
+      stdout: '{"Type":"json-file","Config":{"max-size":"100m","max-file":"5"}}',
+      stderr: '',
+    })
+
+    const result = await archiveContainerLogs({ agentDir, containerId: CONTAINER_ID }, archiveRuntime)
+    expect(result.ok).toBe(false)
+    expect((await stat(priorPath)).size).toBe(200 * 1024 * 1024)
+    expect(await readdir(logsDir)).not.toContain(`.${archiveFilename(NOW).replace(/\.log$/, '.partial')}`)
+  })
+
+  test.each([
+    { label: 'decimal suffix', size: '20m', files: '5', expected: 100_000_000 },
+    { label: 'leading-zero file count', size: '20m', files: '05', expected: 100_000_000 },
+    { label: 'fractional size', size: '20.0m', files: '5', expected: 100_000_000 },
+    { label: 'MiB spelling', size: '20MiB', files: '5', expected: 100_000_000 },
+    { label: 'binary-looking mixed case', size: '100MiB', files: undefined, expected: 100_000_000 },
+    { label: 'fractional bytes', size: '99.5 MB', files: undefined, expected: 99_500_000 },
+  ])('uses Docker go-units and implicit max-file=1 for $label', async ({ size, files, expected }) => {
+    const archiveRuntime = runtime(async (input) => {
+      expect(input.maxBytes).toBe(expected)
+      if (files) return { exitCode: 0, overflowed: false, stderrExcerpt: '', timedOut: false }
+      return await streamProcessOutput({
+        ...input,
+        binary: process.execPath,
+        args: ['-e', "const chunk = 'x'.repeat(1024 * 1024); for (let i = 0; i < 68; i++) process.stdout.write(chunk)"],
+      })
+    })
+    archiveRuntime.inspectLogConfig = async () => ({
+      exitCode: 0,
+      stdout: JSON.stringify({
+        Type: 'json-file',
+        Config: { 'max-size': size, ...(files ? { 'max-file': files } : {}) },
+      }),
+      stderr: '',
+    })
+    const result = await archiveContainerLogs({ agentDir, containerId: CONTAINER_ID }, archiveRuntime)
+    expect(result.ok).toBe(true)
+    if (result.ok && !files) expect((await stat(result.path)).size).toBe(68 * 1024 * 1024)
+  })
+
+  test.each([
+    { size: '0', files: '5' },
+    { size: '-20m', files: '5' },
+    { size: '20m', files: '1.5' },
+    { size: '20m', files: '0' },
+    { size: 20, files: '5' },
+    { size: '9007199254740993m', files: '5' },
+  ])('does not raise the limit for invalid Docker rotation options: %j', async ({ size, files }) => {
+    const archiveRuntime = runtime(async ({ maxBytes }) => {
+      expect(maxBytes).toBe(MAX_DOCKER_LOG_ARCHIVE_BYTES)
+      return { exitCode: 0, overflowed: false, stderrExcerpt: '', timedOut: false }
+    })
+    archiveRuntime.inspectLogConfig = async () => ({
+      exitCode: 0,
+      stdout: JSON.stringify({ Type: 'json-file', Config: { 'max-size': size, 'max-file': files } }),
+      stderr: '',
+    })
+    expect((await archiveContainerLogs({ agentDir, containerId: CONTAINER_ID }, archiveRuntime)).ok).toBe(true)
   })
 
   test.each([
