@@ -554,7 +554,8 @@ export async function createSessionWithDispose(options: CreateSessionOptions = {
   // while typeclaw has already latched the failure, reporting a recovered turn as
   // failed (and burning an unnecessary failover). Disabling it makes a soft error
   // a deterministic, typeclaw-owned signal. Compaction/context-overflow recovery
-  // is independent (gated on compaction settings), so this does not disable those.
+  // is independent (gated on compaction settings), so this does not disable those;
+  // marked local failures are kept out of overflow recovery at the marker below.
   session.setAutoRetryEnabled(false)
   const getAbortReason = () => abortHolder.reason
   const sessionWithAbortReason = Object.assign(session, { getAbortReason })
@@ -583,7 +584,13 @@ export async function createSessionWithDispose(options: CreateSessionOptions = {
   // outermost layer over pi's extension `context` pass (which clones the
   // messages) and its forced-prompt projection. getApiKey and streamFunction
   // stay unwrapped: their failures can be genuine provider/auth failures.
-  session.agent.transformContext = wrapTransformContextWithLocalFailureMarker(session.agent.transformContext)
+  // Overflow recovery stays enabled; a local failure whose text would read as a
+  // provider overflow is stamped with fixed text and its raw text is logged here.
+  session.agent.transformContext = wrapTransformContextWithLocalFailureMarker(session.agent.transformContext, {
+    getProvider: () => session.agent.state.model?.provider,
+    logWithheld: (line) =>
+      console.error(`[agent] ${options.plugins?.sessionId ?? sessionManager.getSessionId()}: ${line}`),
+  })
 
   abortHolder.abort = (reason?: string) => {
     if (reason !== undefined) abortHolder.reason = reason

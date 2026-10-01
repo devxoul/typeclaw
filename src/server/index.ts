@@ -144,6 +144,12 @@ export type ServerOptions = {
   // registry is fine — `/inspect` will report "session not live, replay
   // from JSONL only" when it can't resolve the id.
   liveSessionRegistry?: LiveSessionRegistry
+  // Test seam for holding an outcome write open and asserting drain ordering.
+  // Production always uses the real persistence function.
+  recordTurnOutcome?: typeof recordTurnOutcome
+  // Test seam: the idle/todo continuation driver invoked by the drain loop.
+  // Production always uses the real runIdleContinuation.
+  runIdleContinuation?: typeof runIdleContinuation
 }
 
 const consoleLogger: ServerLogger = {
@@ -215,6 +221,12 @@ type SessionState = {
   // not re-target this session's lifecycle hooks.
   runtimeSnapshot: PluginRuntimeState | null
   unsubTurnOutcome: Unsubscribe | null
+  // Serializes outcome persistence and the idle continuation decision. The
+  // tail always fulfills so one disk failure cannot poison every later turn;
+  // its value separately reports whether the latest write succeeded before
+  // continuation reads state.
+  todoOutcomeWrite: Promise<boolean>
+  todoContinuation: { recordTurnOutcome: typeof recordTurnOutcome; runIdleContinuation: typeof runIdleContinuation }
   // Latest turn's usage, captured from `message_end` by forwardSessionEvents and
   // read at the `done` send site (which lives outside that subscriber). Reset at
   // each turn start so a turn with no usage event sends a plain `done`.
@@ -297,6 +309,8 @@ export function createServer({
   subagentCoalescer,
   createSessionForSubagent,
   liveSessionRegistry,
+  recordTurnOutcome: todoOutcomeWriter = recordTurnOutcome,
+  runIdleContinuation: todoIdleContinuation = runIdleContinuation,
 }: ServerOptions) {
   const sessionStates = new WeakMap<Ws, SessionState>()
   const callIdToWs = new Map<string, AnyOwnerWs>()
@@ -563,6 +577,8 @@ export function createServer({
               activeClaimCode: null,
               runtimeSnapshot: runtimeSnapshot ?? null,
               unsubTurnOutcome: null,
+              todoOutcomeWrite: Promise.resolve(true),
+              todoContinuation: { recordTurnOutcome: todoOutcomeWriter, runIdleContinuation: todoIdleContinuation },
               lastUsage: null,
               dispose,
             }
@@ -573,7 +589,7 @@ export function createServer({
             }
 
             if (agentDir !== undefined) {
-              state.unsubTurnOutcome = subscribeTurnOutcome(session, agentDir, origin, sessionFileId, logger)
+              state.unsubTurnOutcome = subscribeTurnOutcome(state, agentDir, logger)
             }
 
             liveSessionRegistry?.register({
@@ -976,28 +992,56 @@ function forwardSessionEvents(ws: Ws, state: SessionState, logger: ServerLogger,
 }
 
 // Record each completed turn's stopReason for the todo-continuation guard.
-// Ordering-independent by design: this writes the outcome from `message_end`,
-// and the idle path only reads the stored outcome — it never assumes the
-// event arrived before idle fired. An unrecognized stopReason classifies as
-// 'unknown', which the idle path treats as not-safe-to-continue (fail closed).
-function subscribeTurnOutcome(
-  session: AgentSession,
-  agentDir: string,
-  origin: SessionOrigin,
-  sessionFileId: string,
-  logger: ServerLogger,
-): Unsubscribe {
-  return session.subscribe((event) => {
+// Writes are serialized per session on `state.todoOutcomeWrite`, so an older
+// outcome can never land after a newer one. Pi emits every assistant
+// `message_end` before `prompt()` resolves, so by idle the turn's writes are
+// all enqueued; the idle path awaits the latest tail before deciding. An
+// unrecognized stopReason classifies as 'unknown', which the idle path treats
+// as not-safe-to-continue (fail closed).
+function subscribeTurnOutcome(state: SessionState, agentDir: string, logger: ServerLogger): Unsubscribe {
+  return state.session.subscribe((event) => {
     const usage = extractTurnUsage(event)
     if (usage === null) return
-    void recordTurnOutcome({
-      agentDir,
-      origin,
-      turnId: sessionFileId,
-      stopReason: usage.stopReason,
-      ...(usage.tokens !== undefined ? { tokens: usage.tokens } : {}),
-    }).catch((err) => logger.error(`[server] ${sessionFileId}: todo outcome capture failed: ${describeErr(err)}`))
+    void enqueueTodoOutcomeWrite(
+      state,
+      {
+        agentDir,
+        origin: state.origin,
+        turnId: state.sessionFileId,
+        stopReason: usage.stopReason,
+        ...(usage.tokens !== undefined ? { tokens: usage.tokens } : {}),
+      },
+      logger,
+    )
   })
+}
+
+function enqueueTodoOutcomeWrite(
+  state: SessionState,
+  args: Parameters<typeof recordTurnOutcome>[0],
+  logger: ServerLogger,
+): Promise<boolean> {
+  const write = state.todoOutcomeWrite.then(async () => {
+    try {
+      await state.todoContinuation.recordTurnOutcome(args)
+      return true
+    } catch (err) {
+      logger.error(`[server] ${state.sessionFileId}: todo outcome capture failed: ${describeErr(err)}`)
+      return false
+    }
+  })
+  state.todoOutcomeWrite = write
+  return write
+}
+
+// Resolves once the tail observed is still the latest, i.e. no write was
+// chained while awaiting. Returns whether that latest write succeeded.
+async function awaitLatestTodoOutcomeWrite(state: SessionState): Promise<boolean> {
+  while (true) {
+    const write = state.todoOutcomeWrite
+    const succeeded = await write
+    if (write === state.todoOutcomeWrite) return succeeded
+  }
 }
 
 function forwardAssistantError(ws: Ws, message: unknown, logger: ServerLogger, sessionFileId: string): void {
@@ -1118,6 +1162,9 @@ async function drain(
       send(ws, { type: 'prompt_started', messageId: item.streamMessageId, text: item.text })
 
       if (agentDir !== undefined) {
+        // recordTurnStart is a read-modify-write of the same state file; let
+        // pending outcome writes land first so neither overwrites the other.
+        await awaitLatestTodoOutcomeWrite(state)
         await recordTurnStart({
           agentDir,
           origin: state.origin,
@@ -1174,9 +1221,16 @@ async function drain(
       // the nested call would no-op and the continuation would stall until some
       // unrelated event woke the loop again. Enqueuing here lets the same `while`
       // consume it on the next iteration. Only fires when the queue is otherwise
-      // empty so a real user turn is never preempted by a continuation.
+      // empty so a real user turn is never preempted by a continuation; the
+      // queue is re-checked after awaiting this turn's outcome writes because a
+      // user prompt can arrive meanwhile. A failed latest outcome write fails
+      // closed: the stored outcome may be a stale earlier turn's.
       if (state.drainQueue.length === 0) {
-        await maybeContinueTodos(state, agentDir, logger)
+        if (!(await awaitLatestTodoOutcomeWrite(state))) {
+          logger.warn(`[server] ${state.sessionFileId}: skipping todo continuation after failed outcome write`)
+        } else if (state.drainQueue.length === 0) {
+          await maybeContinueTodos(state, agentDir, logger)
+        }
       }
     }
   } finally {
@@ -1188,30 +1242,37 @@ async function drain(
 // prompt directly onto this session's drainQueue, tagged TODO_CONTINUATION_SOURCE
 // so the next drain iteration treats it as an injected (non-user) turn that does
 // not reset the episode budget. The enclosing drain loop consumes it; this never
-// calls drain() itself.
+// calls drain() itself. The decision joins the outcome-write chain so a
+// concurrent abort's outcome write is ordered after the decision's own state
+// write instead of racing it.
 async function maybeContinueTodos(
   state: SessionState,
   agentDir: string | undefined,
   logger: ServerLogger,
 ): Promise<void> {
   if (agentDir === undefined) return
-  try {
-    await runIdleContinuation({
-      agentDir,
-      origin: state.origin,
-      deliver: (text) => {
-        state.drainQueue.push({
-          streamMessageId: `todo-continuation-${crypto.randomUUID()}` as StreamMessageId,
-          text,
-          delivery: 'queue',
-          ts: Date.now(),
-          source: TODO_CONTINUATION_SOURCE,
-        })
-      },
-    })
-  } catch (err) {
-    logger.error(`[server] ${state.sessionFileId}: todo continuation failed: ${describeErr(err)}`)
-  }
+  const decision = state.todoOutcomeWrite.then(async () => {
+    try {
+      await state.todoContinuation.runIdleContinuation({
+        agentDir,
+        origin: state.origin,
+        deliver: (text) => {
+          state.drainQueue.push({
+            streamMessageId: `todo-continuation-${crypto.randomUUID()}` as StreamMessageId,
+            text,
+            delivery: 'queue',
+            ts: Date.now(),
+            source: TODO_CONTINUATION_SOURCE,
+          })
+        },
+      })
+    } catch (err) {
+      logger.error(`[server] ${state.sessionFileId}: todo continuation failed: ${describeErr(err)}`)
+    }
+    return true
+  })
+  state.todoOutcomeWrite = decision
+  await decision
 }
 
 function describeErr(err: unknown): string {

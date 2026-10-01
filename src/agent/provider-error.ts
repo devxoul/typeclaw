@@ -1,3 +1,5 @@
+import { isContextOverflow, type AssistantMessage } from '@earendil-works/pi-ai'
+
 import type { AgentSession } from './index'
 
 // pi-coding-agent encodes upstream LLM failures (billing, rate limit, network,
@@ -52,32 +54,91 @@ function readOr<T>(read: () => T, fallback: T): T {
   }
 }
 
+export type LocalFailureMarkerOptions = {
+  // Provider of the model pi stamps on the failure message. Pi's overflow
+  // check has a provider-specific branch, so the same text can trip it for one
+  // provider and not another.
+  getProvider?: () => string | undefined
+  // Receives the raw text when it is withheld from the transcript (see
+  // markLocalPreRequestFailure). Defaults to console.error.
+  logWithheld?: (line: string) => void
+}
+
+const WITHHELD_LOCAL_TEXT =
+  'local error text withheld from the transcript; it resembled provider context-overflow wording and is in typeclaw logs'
+
+const NO_USAGE: AssistantMessage['usage'] = {
+  input: 0,
+  output: 0,
+  cacheRead: 0,
+  cacheWrite: 0,
+  totalTokens: 0,
+  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+}
+
+// Pi's auto-compaction takes any `stopReason:'error'` message its public
+// `isContextOverflow` accepts as a provider context overflow, then compacts and
+// retries the turn (AgentSession._checkCompaction `explicitOverflow`). Called
+// without a context window, this is that exact check, so pattern updates in Pi
+// apply here too.
+function wouldTripPiOverflow(errorMessage: string, provider: string | undefined): boolean {
+  return isContextOverflow({
+    role: 'assistant',
+    content: [],
+    api: '',
+    provider: provider ?? '',
+    model: '',
+    usage: NO_USAGE,
+    stopReason: 'error',
+    errorMessage,
+    timestamp: 0,
+  })
+}
+
 // Only an identifier-shaped `Error.name` is embedded, so a hostile or odd name
-// can't inject parentheses/newlines into the marker. The raw text stays on the
-// message for logs and operator surfaces; channels only ever see the fixed
-// LOCAL sentence, never this text. Reading a throwing getter/`toString` must
-// not replace the original failure with a new one.
-function markLocalPreRequestFailure(err: unknown): Error {
+// can't inject parentheses/newlines into the marker. The raw text normally
+// stays on the message for logs and operator surfaces; channels only ever see
+// the fixed LOCAL sentence, never this text. One exception: when the marked
+// text (raw text or name) would trip Pi's overflow check, pi would compact the
+// session and replay a turn that never reached the provider. Then the
+// transcript gets a fixed placeholder and the raw text moves to one
+// `logWithheld` line instead. Reading a throwing getter/`toString`, or a
+// throwing log sink, must not replace the original failure with a new one.
+function markLocalPreRequestFailure(err: unknown, options: LocalFailureMarkerOptions): Error {
+  const provider = readOr(() => options.getProvider?.(), undefined)
   const isError = readOr(() => err instanceof Error, false)
   const text = readOr(() => String(isError ? (err as Error).message : err), 'unprintable thrown value')
-  if (isError && LOCAL_PRE_REQUEST_FAILURE.test(text)) return err as Error
+  if (isError && LOCAL_PRE_REQUEST_FAILURE.test(text) && !wouldTripPiOverflow(text, provider)) return err as Error
   const rawName = readOr(() => (isError ? (err as Error).name : undefined), undefined)
   const name = typeof rawName === 'string' && LOCAL_FAILURE_NAME.test(rawName) ? rawName : 'Error'
-  return new Error(`${text} (typeclaw local failure before provider request: ${name})`, { cause: err })
+  const marked = `${text} (typeclaw local failure before provider request: ${name})`
+  if (!wouldTripPiOverflow(marked, provider)) return new Error(marked, { cause: err })
+  try {
+    ;(options.logWithheld ?? console.error)(`local failure text withheld from the transcript (${name}): ${text}`)
+  } catch {
+    // The failure being reported matters more than its log line.
+  }
+  const withheld = `${WITHHELD_LOCAL_TEXT} (typeclaw local failure before provider request: ${name})`
+  if (!wouldTripPiOverflow(withheld, provider)) return new Error(withheld, { cause: err })
+  // The name itself trips the check (e.g. `request_too_large`).
+  return new Error(`${WITHHELD_LOCAL_TEXT} (typeclaw local failure before provider request: Error)`, { cause: err })
 }
 
 // Wraps an agent's `transformContext` (the step pi runs right before
 // `convertToLlm`/`getApiKey`/`streamFunction` on every request) so a throw from
 // it — sync or async — is re-thrown with the local-origin marker. An abort is
 // re-thrown untouched: it's a cancellation, and pi reports it as `aborted`.
-export function wrapTransformContextWithLocalFailureMarker(inner: TransformContext | undefined): TransformContext {
+export function wrapTransformContextWithLocalFailureMarker(
+  inner: TransformContext | undefined,
+  options: LocalFailureMarkerOptions = {},
+): TransformContext {
   return async (messages, signal) => {
     if (!inner) return messages
     try {
       return await inner(messages, signal)
     } catch (err) {
       if (signal?.aborted) throw err
-      throw markLocalPreRequestFailure(err)
+      throw markLocalPreRequestFailure(err, options)
     }
   }
 }

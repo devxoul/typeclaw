@@ -8,6 +8,10 @@ import { SessionManager } from '@earendil-works/pi-coding-agent'
 import type { AgentSession, CreateSessionOptions } from '@/agent'
 import { LiveSubagentRegistry } from '@/agent/live-subagents'
 import type { CreateSessionForSubagent, SubagentRegistry } from '@/agent/subagents'
+import { readContinuationState } from '@/agent/todo/continuation-state'
+import { recordTurnOutcome, runIdleContinuation } from '@/agent/todo/continuation-wiring'
+import { resolveTodoScope } from '@/agent/todo/scope'
+import { writeTodos } from '@/agent/todo/store'
 import { renderShard } from '@/bundled-plugins/memory/frontmatter'
 import { topicShardPath, topicsDir } from '@/bundled-plugins/memory/paths'
 import { createMemorySearchTool } from '@/bundled-plugins/memory/search-tool'
@@ -134,6 +138,8 @@ async function startWithSession(
     tunnelManager?: TunnelManager
     runtimeVersion?: string
     containerName?: string
+    recordTurnOutcome?: typeof recordTurnOutcome
+    runIdleContinuation?: typeof runIdleContinuation
   } = {},
 ): Promise<{ url: string }> {
   const pluginRuntime =
@@ -152,6 +158,8 @@ async function startWithSession(
     ...(extra.tunnelManager ? { tunnelManager: extra.tunnelManager } : {}),
     ...(extra.runtimeVersion !== undefined ? { runtimeVersion: extra.runtimeVersion } : {}),
     ...(extra.containerName !== undefined ? { containerName: extra.containerName } : {}),
+    ...(extra.recordTurnOutcome ? { recordTurnOutcome: extra.recordTurnOutcome } : {}),
+    ...(extra.runIdleContinuation ? { runIdleContinuation: extra.runIdleContinuation } : {}),
   }).start()
   server = built
   return { url: `ws://localhost:${built.port}` }
@@ -416,9 +424,6 @@ describe('createServer tool event forwarding', () => {
 describe('createServer todo continuation (drain re-entrancy)', () => {
   test('consumes an idle continuation in the same drain pass instead of stalling', async () => {
     const agentDir = await mkdtemp(join(tmpdir(), 'server-todo-cont-'))
-    const { writeTodos } = await import('@/agent/todo/store')
-    const { resolveTodoScope } = await import('@/agent/todo/scope')
-    const { recordTurnOutcome } = await import('@/agent/todo/continuation-wiring')
     const origin = { kind: 'tui', sessionId: 'x' } as const
     const scope = resolveTodoScope(origin)!
     // Pre-seed an incomplete todo AND a safe (stop) turn outcome so the idle
@@ -453,6 +458,148 @@ describe('createServer todo continuation (drain re-entrancy)', () => {
     expect(session.promptCalls[1]).toContain('Incomplete todo items remain')
     session.resolvePrompt()
     ws.close()
+  })
+})
+
+describe('createServer todo continuation (outcome-write ordering)', () => {
+  const origin = { kind: 'tui', sessionId: 'seed' } as const
+  const scope = resolveTodoScope(origin)!
+
+  function emitAssistantEnd(session: ReturnType<typeof createFakeSession>, stopReason: 'stop' | 'error'): void {
+    session.emit({
+      type: 'message_end',
+      message: { role: 'assistant', content: [], stopReason },
+    } as unknown as SessionEvent)
+  }
+
+  // Seeds an incomplete todo plus a persisted SAFE (stop) outcome from a prior
+  // turn — the stale state a premature idle decision would wrongly act on — and
+  // starts one real user turn. Every idle decision's injected/not result is
+  // recorded so tests can await the decision instead of sleeping.
+  async function startTodoTurn(seams: { recordTurnOutcome?: typeof recordTurnOutcome } = {}) {
+    const agentDir = await mkdtemp(join(tmpdir(), 'server-todo-order-'))
+    await writeTodos(agentDir, scope, [{ content: 'finish the work', status: 'pending' }])
+    await recordTurnOutcome({ agentDir, origin, turnId: 'prior', stopReason: 'stop' })
+    const decisions: boolean[] = []
+    const warnings: string[] = []
+    const session = createFakeSession()
+    const { url } = await startWithSession(session, {
+      agentDir,
+      stream: createStream(),
+      sessionFactory: createSessionFactory({ agentDir }),
+      logger: { info: () => {}, warn: (m) => warnings.push(m), error: () => {} },
+      ...seams,
+      runIdleContinuation: async (args) => {
+        const injected = await runIdleContinuation(args)
+        decisions.push(injected)
+        return injected
+      },
+    })
+    const conn = await connect(url)
+    await conn.waitFor((m) => m.type === 'connected')
+    conn.ws.send(JSON.stringify({ type: 'prompt', text: 'do thing' }))
+    await waitForState(() => session.promptCalls.length === 1)
+    const lastStopReason = async () =>
+      (await readContinuationState(agentDir, scope)).lastTurnOutcome?.stopReason ?? null
+    return { ...conn, session, decisions, warnings, lastStopReason }
+  }
+
+  test('idle decision waits for a pending error write instead of continuing on the prior stop', async () => {
+    const gate = Promise.withResolvers<void>()
+    const t = await startTodoTurn({
+      recordTurnOutcome: async (args) => {
+        await gate.promise
+        await recordTurnOutcome(args)
+      },
+    })
+    emitAssistantEnd(t.session, 'error')
+    t.session.resolvePrompt()
+    await t.waitFor((m) => m.type === 'done')
+    gate.resolve()
+
+    await waitForState(() => t.decisions.length === 1)
+    expect(t.decisions).toEqual([false])
+    expect(t.session.promptCalls).toHaveLength(1)
+    expect(await t.lastStopReason()).toBe('error')
+    t.ws.close()
+  })
+
+  test('a slow earlier stop write cannot land after the later error write', async () => {
+    const gate = Promise.withResolvers<void>()
+    const landed: string[] = []
+    const t = await startTodoTurn({
+      recordTurnOutcome: async (args) => {
+        if (args.stopReason === 'stop') await gate.promise
+        await recordTurnOutcome(args)
+        landed.push(args.stopReason)
+      },
+    })
+    emitAssistantEnd(t.session, 'stop')
+    emitAssistantEnd(t.session, 'error')
+    t.session.resolvePrompt()
+    await t.waitFor((m) => m.type === 'done')
+    gate.resolve()
+
+    await waitForState(() => t.decisions.length === 1)
+    expect(landed).toEqual(['stop', 'error'])
+    expect(t.decisions).toEqual([false])
+    expect(t.session.promptCalls).toHaveLength(1)
+    expect(await t.lastStopReason()).toBe('error')
+    t.ws.close()
+  })
+
+  test('a failed latest outcome write fails closed, and the next successful turn continues again', async () => {
+    let failNext = true
+    const t = await startTodoTurn({
+      recordTurnOutcome: async (args) => {
+        if (failNext) {
+          failNext = false
+          throw new Error('synthetic disk failure')
+        }
+        await recordTurnOutcome(args)
+      },
+    })
+    emitAssistantEnd(t.session, 'error')
+    t.session.resolvePrompt()
+    await waitForState(() => t.warnings.some((w) => w.includes('failed outcome write')))
+    expect(t.decisions).toEqual([])
+    expect(t.session.promptCalls).toHaveLength(1)
+    // The prior persisted stop is still on disk; only the fail-closed check kept
+    // the idle path from acting on it.
+    expect(await t.lastStopReason()).toBe('stop')
+
+    // One failure must not poison the chain: a later safe turn continues.
+    t.ws.send(JSON.stringify({ type: 'prompt', text: 'try again' }))
+    await waitForState(() => t.session.promptCalls.length === 2)
+    emitAssistantEnd(t.session, 'stop')
+    t.session.resolvePrompt()
+    await waitForState(() => t.session.promptCalls.length === 3)
+    expect(t.decisions).toEqual([true])
+    expect(t.session.promptCalls[2]).toContain('Incomplete todo items remain')
+    t.session.resolvePrompt()
+    t.ws.close()
+  })
+
+  test('a real user prompt that arrives while the outcome write is pending runs before any continuation', async () => {
+    const gate = Promise.withResolvers<void>()
+    const t = await startTodoTurn({
+      recordTurnOutcome: async (args) => {
+        await gate.promise
+        await recordTurnOutcome(args)
+      },
+    })
+    emitAssistantEnd(t.session, 'stop')
+    t.session.resolvePrompt()
+    await t.waitFor((m) => m.type === 'done')
+    t.ws.send(JSON.stringify({ type: 'prompt', text: 'user follow-up' }))
+    await t.waitFor((m) => m.type === 'queue_state' && m.pending.some((p) => p.text === 'user follow-up'))
+    gate.resolve()
+
+    await waitForState(() => t.session.promptCalls.length === 2)
+    expect(t.session.promptCalls[1]).toContain('user follow-up')
+    expect(t.decisions).toEqual([])
+    t.session.resolvePrompt()
+    t.ws.close()
   })
 })
 
@@ -666,9 +813,14 @@ describe('createServer restart handling', () => {
 
       // when
       ws.send(JSON.stringify({ type: 'restart' }))
-      await waitFor((m) => m.type === 'restart_result')
+      const result = await waitFor((m) => m.type === 'restart_result')
 
-      // then: the broadcast names the originating session so its
+      // then: the broadcast is published synchronously before an ACCEPTED
+      // restart_result is sent, so only a failed restart can arrive with no
+      // broadcast. Assert acceptance first so such a failure reports the
+      // hostd error instead of a bare empty-array mismatch.
+      expect(result).toMatchObject({ type: 'restart_result', status: 'accepted' })
+      // The broadcast names the originating session so its
       // subscribeRestartNotice (covered in agent/index.test.ts) appends
       // restart-self rather than the sibling notice
       expect(broadcasts).toHaveLength(1)

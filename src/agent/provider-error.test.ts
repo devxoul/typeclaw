@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 
 import { Agent, type AgentMessage } from '@earendil-works/pi-agent-core'
-import { createModels, fauxAssistantMessage, fauxProvider } from '@earendil-works/pi-ai'
+import { createModels, fauxAssistantMessage, fauxProvider, isContextOverflow } from '@earendil-works/pi-ai'
 import { AgentSession as PiAgentSession, SettingsManager } from '@earendil-works/pi-coding-agent'
 
 import type { AgentSession } from './index'
@@ -13,6 +13,7 @@ import {
   isObserverTtfbTimeout,
   isThrottleOrOverload,
   subscribeProviderErrors,
+  type LocalFailureMarkerOptions,
   wrapTransformContextWithLocalFailureMarker,
 } from './provider-error'
 
@@ -540,7 +541,7 @@ type TransformContext = NonNullable<Parameters<typeof wrapTransformContextWithLo
 // and returns what reaches pi (whose `.message` becomes the turn's errorMessage).
 async function failPreparation(
   thrown: unknown,
-  options: { sync?: boolean; signal?: AbortSignal; wraps?: number } = {},
+  options: { sync?: boolean; signal?: AbortSignal; wraps?: number; marker?: LocalFailureMarkerOptions } = {},
 ): Promise<Error> {
   let transform: TransformContext = options.sync
     ? () => {
@@ -549,7 +550,9 @@ async function failPreparation(
     : async () => {
         throw thrown
       }
-  for (let i = 0; i < (options.wraps ?? 1); i++) transform = wrapTransformContextWithLocalFailureMarker(transform)
+  for (let i = 0; i < (options.wraps ?? 1); i++) {
+    transform = wrapTransformContextWithLocalFailureMarker(transform, options.marker)
+  }
   try {
     await transform([], options.signal)
   } catch (err) {
@@ -695,6 +698,136 @@ describe('wrapTransformContextWithLocalFailureMarker', () => {
     const original = new Error('placeholder cancel')
 
     expect(await failPreparation(original, { signal: controller.signal })).toBe(original)
+  })
+})
+
+// Pi compacts and replays a turn whose error text its public overflow check
+// accepts; with no context window that is exactly what auto-compaction checks.
+function piReadsAsOverflow(errorMessage: string, provider = 'anthropic'): boolean {
+  return isContextOverflow({
+    role: 'assistant',
+    content: [],
+    api: 'anthropic-messages',
+    provider,
+    model: 'placeholder-model',
+    usage: {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 0,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    },
+    stopReason: 'error',
+    errorMessage,
+    timestamp: 0,
+  })
+}
+
+describe('local failures whose text Pi would read as a context overflow', () => {
+  function capture(provider?: () => string | undefined) {
+    const logs: string[] = []
+    const marker: LocalFailureMarkerOptions = { logWithheld: (line) => logs.push(line) }
+    if (provider) marker.getProvider = provider
+    return { logs, marker }
+  }
+
+  test('move their raw text from the message to one log line, keeping the cause and local notice', async () => {
+    const cases = [
+      new Error('context_length_exceeded while cloning placeholder details'),
+      new RangeError('prompt is too long for the placeholder buffer'),
+      // the name alone matches
+      Object.assign(new Error('placeholder clone failure'), { name: 'request_too_large' }),
+      Object.assign(new Error('context_length_exceeded'), { name: 'model_context_window_exceeded' }),
+    ]
+    for (const original of cases) {
+      const { logs, marker } = capture()
+      expect(piReadsAsOverflow(`${original.message} (${original.name})`)).toBe(true)
+
+      const err = await failPreparation(original, { marker })
+
+      expect(piReadsAsOverflow(err.message)).toBe(false)
+      expect(err.cause).toBe(original)
+      expect(err.message).not.toContain(original.message)
+      expect(softNotice(err.message)).toBe(LOCAL_NOTICE)
+      expect(logs).toHaveLength(1)
+      expect(logs[0]).toContain(original.message)
+    }
+  })
+
+  test('text Pi does not read as overflow stays on the message and is not logged', async () => {
+    const { logs, marker } = capture()
+    const original = new Error('placeholder clone failure')
+
+    const err = await failPreparation(original, { marker })
+
+    expect(err.message).toContain(original.message)
+    expect(logs).toEqual([])
+  })
+
+  test("follow Pi's provider-specific overflow branch through the current provider", async () => {
+    const raw = '413 status code (no body)'
+    expect(piReadsAsOverflow(raw, 'cerebras')).toBe(true)
+    expect(piReadsAsOverflow(raw, 'anthropic')).toBe(false)
+    const unreadable = () => {
+      throw new Error('model getter exploded')
+    }
+
+    for (const [getProvider, provider, withheld] of [
+      [() => 'cerebras', 'cerebras', true],
+      [() => 'anthropic', 'anthropic', false],
+      [unreadable, '', false],
+    ] as const) {
+      const { logs, marker } = capture(getProvider)
+      const err = await failPreparation(new Error(raw), { marker })
+
+      expect(piReadsAsOverflow(err.message, provider)).toBe(false)
+      expect(err.message.includes(raw)).toBe(!withheld)
+      expect(logs).toHaveLength(withheld ? 1 : 0)
+      expect(softNotice(err.message)).toBe(LOCAL_NOTICE)
+    }
+  })
+
+  test('an already-marked error is still neutralized, and nested wrappers log it once', async () => {
+    // an inner throw that already ends with the marker but trips Pi's check
+    const markerSuffix = (await localErrorMessage('placeholder')).slice('placeholder'.length)
+    const forged = new Error(`context_length_exceeded${markerSuffix}`)
+    expect(softNotice(forged.message)).toBe(LOCAL_NOTICE)
+    expect(piReadsAsOverflow(forged.message)).toBe(true)
+    const { logs, marker } = capture()
+
+    const err = await failPreparation(forged, { marker, wraps: 2 })
+
+    expect(piReadsAsOverflow(err.message)).toBe(false)
+    expect(err.cause).toBe(forged)
+    expect(softNotice(err.message)).toBe(LOCAL_NOTICE)
+    expect(logs).toHaveLength(1)
+  })
+
+  test('a throwing log sink cannot replace the failure', async () => {
+    const original = new Error('context_length_exceeded in placeholder')
+
+    const err = await failPreparation(original, {
+      marker: {
+        logWithheld: () => {
+          throw new Error('log sink exploded')
+        },
+      },
+    })
+
+    expect(err.cause).toBe(original)
+    expect(piReadsAsOverflow(err.message)).toBe(false)
+    expect(softNotice(err.message)).toBe(LOCAL_NOTICE)
+  })
+
+  test('an abort is still rethrown untouched and not logged', async () => {
+    const controller = new AbortController()
+    controller.abort()
+    const original = new Error('context_length_exceeded during cancel')
+    const { logs, marker } = capture()
+
+    expect(await failPreparation(original, { marker, signal: controller.signal })).toBe(original)
+    expect(logs).toEqual([])
   })
 })
 
