@@ -47,6 +47,8 @@ CLI: `typeclaw channel add slack-bot` (interactive), `typeclaw channel set slack
 
 Replies in the same Slack thread route to the same session. New top-level messages start fresh sessions. The `app_mention` event is required for the bot to hear mentions in channels where it is not a member.
 
+Outbound `thread` must be the parent message's exact Slack `ts` string (for example, `1700000000.000100`), including all six digits after the decimal. Malformed IDs are rejected before a text post or file upload. Slack timestamps are message IDs, not decimals: do not round or pad a truncated ID.
+
 ## Slash commands
 
 `/help`, `/stop`, `/reload`, `/restart`. Thread `!cmd` syntax also works.

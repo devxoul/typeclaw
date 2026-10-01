@@ -1716,7 +1716,7 @@ describe('slack-bot createOutboundCallback', () => {
     options?: { thread_ts?: string; title?: string; initial_comment?: string }
   }
 
-  function makeFakeClient(behavior: { postMessage?: 'ok' | 'reject'; uploadFile?: 'ok' | 'reject' } = {}): {
+  function makeFakeClient(behavior: { postMessage?: 'ok' | 'reject' | 'root'; uploadFile?: 'ok' | 'reject' } = {}): {
     client: Pick<SlackBotClient, 'postMessage' | 'uploadFile'>
     posts: PostCall[]
     uploads: UploadCall[]
@@ -1730,7 +1730,14 @@ describe('slack-bot createOutboundCallback', () => {
         postMessage: async (channel, text, options) => {
           posts.push({ channel, text, options })
           if (behavior.postMessage === 'reject') throw new Error('slack_post_failed')
-          return { ts: `ts${posts.length}`, text, type: 'message' } as SlackMessage
+          return {
+            ts: `ts${posts.length}`,
+            text,
+            type: 'message',
+            ...(options?.thread_ts !== undefined && behavior.postMessage !== 'root'
+              ? { thread_ts: options.thread_ts }
+              : {}),
+          } as SlackMessage
         },
         uploadFile: async (channel, file, filename, options) => {
           uploads.push({ channel, bytes: file.length, filename, options })
@@ -1816,6 +1823,34 @@ describe('slack-bot createOutboundCallback', () => {
     expect(post.options?.blocks).toEqual([{ type: 'markdown', text: gfm }])
   })
 
+  test('rejects truncated or numeric Slack thread ids before posting text or files', async () => {
+    const { client, posts, uploads } = makeFakeClient()
+    const cb = createOutboundCallback({
+      client,
+      logger: silentLogger(),
+      formatChannelTag: tag,
+      readFile: fakeRead,
+    })
+    for (const thread of [
+      '1700000000.0001',
+      '1700000000',
+      '1700000000.0001000',
+      '1e9.000100',
+      1700000000.0001 as unknown as string,
+    ]) {
+      expect(await cb(makeMsg({ text: 'hello', thread }))).toMatchObject({
+        ok: false,
+        error: expect.stringContaining('Slack thread'),
+      })
+      expect(await cb(makeMsg({ attachments: [{ path: '/agent/a.png' }], thread }))).toMatchObject({
+        ok: false,
+        error: expect.stringContaining('Slack thread'),
+      })
+    }
+    expect(posts).toHaveLength(0)
+    expect(uploads).toHaveLength(0)
+  })
+
   test('threaded text-only post forwards thread_ts alongside the markdown block', async () => {
     const { client, posts } = makeFakeClient()
     const cb = createOutboundCallback({
@@ -1835,6 +1870,22 @@ describe('slack-bot createOutboundCallback', () => {
         },
       },
     ])
+  })
+
+  test('a missing placement receipt does not discard already-posted chunks or invite a retry', async () => {
+    const { client, posts } = makeFakeClient({ postMessage: 'root' })
+    const cb = createOutboundCallback({ client, logger: silentLogger(), formatChannelTag: tag, readFile: fakeRead })
+    const paragraph = 'word '.repeat(2400).trim()
+    const result = await cb(
+      makeMsg({ text: `${paragraph}\n\n${paragraph}\n\n${paragraph}`, thread: '1700000000.000100' }),
+    )
+    expect(posts.length).toBeGreaterThan(1)
+    expect(posts.every((post) => post.options?.thread_ts === '1700000000.000100')).toBe(true)
+    expect(result).toMatchObject({
+      ok: true,
+      messageId: 'ts1',
+      messageIds: posts.map((_, index) => `ts${index + 1}`),
+    })
   })
 
   test('oversize text splits into multiple posts; subsequent chunks thread under the first', async () => {

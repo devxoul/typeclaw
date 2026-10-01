@@ -41,6 +41,7 @@ import { createSlackChannelResolver } from './slack-channel-resolver'
 import { classifyInbound, type InboundDropReason, type SlackConversationType, splitSlackFiles } from './slack-classify'
 import { createSlackUserEditMessageCallback } from './slack-edit'
 import { createSlackReactionCallback, createSlackRemoveReactionCallback } from './slack-reactions'
+import { invalidSlackThreadTs } from './slack-thread-ts'
 
 export type SlackAdapterLogger = {
   info: (msg: string) => void
@@ -93,6 +94,8 @@ export function createSlackOutboundCallback(deps: {
     if (text === '' && attachments.length === 0) return { ok: false, error: 'message has neither text nor attachments' }
     const tag = await deps.formatChannelTag(msg.chat)
     const threadTs = msg.replyTo?.externalMessageId ?? msg.thread ?? undefined
+    const invalidThread = invalidSlackThreadTs(threadTs)
+    if (invalidThread !== null) return { ok: false, error: invalidThread }
     deps.logger.info(
       `[slack] outbound ${tag} text_len=${text.length} attachments=${attachments.length}${threadTs !== undefined ? ` thread=${threadTs}` : ''}`,
     )
