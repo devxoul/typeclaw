@@ -1,5 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 
+import { Agent, type AgentMessage } from '@earendil-works/pi-agent-core'
+import { createModels, fauxAssistantMessage, fauxProvider, isContextOverflow } from '@earendil-works/pi-ai'
 import { AgentSession as PiAgentSession, SettingsManager } from '@earendil-works/pi-coding-agent'
 
 import type { AgentSession } from './index'
@@ -8,9 +10,20 @@ import {
   detectProviderError,
   isFailoverWorthy,
   isRetryableSameRef,
+  isObserverTtfbTimeout,
   isThrottleOrOverload,
   subscribeProviderErrors,
+  type LocalFailureMarkerOptions,
+  wrapTransformContextWithLocalFailureMarker,
 } from './provider-error'
+
+function softNotice(errorMessage: string): string {
+  return detectProviderError({ role: 'assistant', stopReason: 'error', errorMessage })!.safeMessage
+}
+
+// The notice for text no class recognizes. Tests compare against it by class
+// rather than pinning its wording.
+const GENERIC_NOTICE = softNotice('an unclassified failure')
 
 describe('detectProviderError', () => {
   test('preserves the raw errorMessage on `message` for operator surfaces (logs/TUI)', () => {
@@ -86,9 +99,7 @@ describe('detectProviderError safeMessage redaction', () => {
     const result = detectProviderError({ role: 'assistant', stopReason: 'error', errorMessage: '401 Unauthorized' })
 
     expect(result?.safeMessage).toMatch(/unauthorized/i)
-    expect(result?.safeMessage).not.toBe(
-      'The upstream LLM provider failed. Operators can check `typeclaw logs` for details.',
-    )
+    expect(result?.safeMessage).not.toBe(GENERIC_NOTICE)
   })
 
   test('maps rate/usage-limit errors to a canonical channel-safe sentence', () => {
@@ -117,9 +128,7 @@ describe('detectProviderError safeMessage redaction', () => {
 
     expect(result?.safeMessage).toMatch(/content policy/i)
     expect(result?.safeMessage).toContain('https://chatgpt.com/cyber')
-    expect(result?.safeMessage).not.toBe(
-      'The upstream LLM provider failed. Operators can check `typeclaw logs` for details.',
-    )
+    expect(result?.safeMessage).not.toBe(GENERIC_NOTICE)
   })
 
   test('maps a Codex unsupported/misspelled-model 400 to an actionable model-config notice, not the generic one', () => {
@@ -130,9 +139,7 @@ describe('detectProviderError safeMessage redaction', () => {
     const result = detectProviderError({ role: 'assistant', stopReason: 'error', errorMessage: raw })
     // then: the operator sees a model-config hint instead of the generic notice, and the raw model id is not echoed to the channel
     expect(result?.safeMessage).toMatch(/unsupported or misspelled/i)
-    expect(result?.safeMessage).not.toBe(
-      'The upstream LLM provider failed. Operators can check `typeclaw logs` for details.',
-    )
+    expect(result?.safeMessage).not.toBe(GENERIC_NOTICE)
     expect(result?.safeMessage).not.toContain('gpt-5.6')
   })
 
@@ -156,20 +163,25 @@ describe('detectProviderError safeMessage redaction', () => {
     expect(result?.safeMessage).toMatch(/session\/transport failure|dropped/i)
     expect(result?.safeMessage).not.toContain('wss://')
     expect(result?.safeMessage).not.toContain('chatgpt.com')
-    expect(result?.safeMessage).not.toBe(
-      'The upstream LLM provider failed. Operators can check `typeclaw logs` for details.',
-    )
+    expect(result?.safeMessage).not.toBe(GENERIC_NOTICE)
   })
 
   test('collapses unknown / malformed-response failures to a generic notice (no raw leak)', () => {
     const raw = 'malformed response: {"id":"resp_abc","debug":"Bearer sk-live-LEAK","body":"<html>500</html>"}'
     const result = detectProviderError({ role: 'assistant', stopReason: 'error', errorMessage: raw })
 
-    expect(result?.safeMessage).toBe(
-      'The upstream LLM provider failed. Operators can check `typeclaw logs` for details.',
-    )
+    expect(result?.safeMessage).toBe(GENERIC_NOTICE)
     expect(result?.safeMessage).not.toContain('sk-live-LEAK')
     expect(result?.safeMessage).not.toContain('resp_abc')
+  })
+
+  test('the generic notice does not blame the provider (an unclassified failure may be local)', () => {
+    // given: unclassified text that could come from TypeClaw, the network or the provider
+    for (const raw of ['The object can not be cloned.', 'Cannot read properties of undefined', '대화 준비 실패']) {
+      // then: it collapses to the generic class, which names no origin
+      expect(softNotice(raw)).toBe(GENERIC_NOTICE)
+    }
+    expect(GENERIC_NOTICE).not.toMatch(/upstream|provider/i)
   })
 
   test('still exposes the raw text on `message` even when `safeMessage` is redacted', () => {
@@ -187,9 +199,7 @@ describe('detectHardProviderError', () => {
     const result = detectHardProviderError(new Error(raw))
 
     expect(result?.safeMessage).toMatch(/stopped responding|timed out/i)
-    expect(result?.safeMessage).not.toBe(
-      'The upstream LLM provider failed. Operators can check `typeclaw logs` for details.',
-    )
+    expect(result?.safeMessage).not.toBe(GENERIC_NOTICE)
     expect(result?.message).toBe(raw)
   })
 
@@ -522,5 +532,366 @@ describe('subscribeProviderErrors', () => {
     })
 
     expect(abortRetryCalls).toEqual([])
+  })
+})
+
+type TransformContext = NonNullable<Parameters<typeof wrapTransformContextWithLocalFailureMarker>[0]>
+
+// Throws `thrown` from a transformContext wrapped the way sessions wrap theirs
+// and returns what reaches pi (whose `.message` becomes the turn's errorMessage).
+async function failPreparation(
+  thrown: unknown,
+  options: { sync?: boolean; signal?: AbortSignal; wraps?: number; marker?: LocalFailureMarkerOptions } = {},
+): Promise<Error> {
+  let transform: TransformContext = options.sync
+    ? () => {
+        throw thrown
+      }
+    : async () => {
+        throw thrown
+      }
+  for (let i = 0; i < (options.wraps ?? 1); i++) {
+    transform = wrapTransformContextWithLocalFailureMarker(transform, options.marker)
+  }
+  try {
+    await transform([], options.signal)
+  } catch (err) {
+    return err as Error
+  }
+  throw new Error('expected the wrapped transformContext to reject')
+}
+
+async function localErrorMessage(raw: string): Promise<string> {
+  return (await failPreparation(new Error(raw))).message
+}
+
+const LOCAL_NOTICE = softNotice(await localErrorMessage('placeholder preparation failure'))
+
+describe('local pre-request failures', () => {
+  test('get their own notice, ahead of provider-looking text the local error carries', async () => {
+    expect(LOCAL_NOTICE).not.toBe(GENERIC_NOTICE)
+    // given: local errors whose text alone would land in a provider class
+    const raws = [
+      '401 Unauthorized (Authorization: Bearer sk-live-LEAK)',
+      'HTTP 429 Too Many Requests',
+      'Error code: 429 - insufficient_quota',
+      'see billing details at https://x.test/acct/secret-123',
+      '도구 결과에 401 인증 오류가 있음',
+    ]
+    for (const raw of raws) {
+      const notice = softNotice(await localErrorMessage(raw))
+      // then: the local class wins and none of the raw text reaches the notice
+      expect(softNotice(raw)).not.toBe(LOCAL_NOTICE)
+      expect(notice).toBe(LOCAL_NOTICE)
+      for (const leak of ['sk-live-LEAK', 'Bearer', 'secret-123', 'https://', '도구']) {
+        expect(notice).not.toContain(leak)
+      }
+    }
+  })
+
+  test('are never retried on the same ref, failed over, or treated as throttling or a TTFB stall', async () => {
+    // given: local errors whose text alone would retry, fail over, throttle or count as a stall
+    const raws = [
+      '500 Internal Server Error',
+      'socket hang up',
+      '503 overloaded',
+      '429 rate limit exceeded',
+      'provider_transport_failure',
+      'idle for 120000ms (typeclaw observer timeout)',
+      'codex fetch timed out before response headers after 15000ms (typeclaw observer timeout)',
+    ]
+    for (const raw of raws) {
+      expect(isFailoverWorthy(raw) || isRetryableSameRef(raw)).toBe(true)
+      const marked = await localErrorMessage(raw)
+      expect(isFailoverWorthy(marked)).toBe(false)
+      expect(isRetryableSameRef(marked)).toBe(false)
+      expect(isThrottleOrOverload(marked)).toBe(false)
+      expect(isObserverTtfbTimeout(marked)).toBe(false)
+    }
+    expect(
+      isObserverTtfbTimeout('codex fetch timed out before response headers after 15000ms (typeclaw observer timeout)'),
+    ).toBe(true)
+  })
+
+  test('do not abort the SDK retry loop the way a throttle does', async () => {
+    const { session, emit, abortRetryCalls } = fakeSession()
+    const notices: string[] = []
+    subscribeProviderErrors(session, (err) => notices.push(err.safeMessage))
+
+    emit({
+      type: 'message_end',
+      message: { role: 'assistant', stopReason: 'error', errorMessage: await localErrorMessage('503 overloaded') },
+    })
+
+    expect(notices).toEqual([LOCAL_NOTICE])
+    expect(abortRetryCalls).toEqual([])
+  })
+
+  test('a marked hard throw surfaces the local notice; an unmarked internal throw stays silent', async () => {
+    const marked = await failPreparation(new TypeError('The object can not be cloned.'))
+    const hard = detectHardProviderError(marked)
+
+    expect(hard?.safeMessage).toBe(LOCAL_NOTICE)
+    expect(hard?.message).toBe(marked.message)
+    expect(detectHardProviderError(new TypeError('The object can not be cloned.'))).toBeNull()
+    expect(detectHardProviderError(new Error('Cannot read properties of undefined'))).toBeNull()
+  })
+
+  test('unmarked failures are not attributed to TypeClaw, whatever their text', () => {
+    for (const raw of ['The object can not be cloned.', 'Cannot read properties of undefined', '503 overloaded']) {
+      expect(softNotice(raw)).not.toBe(LOCAL_NOTICE)
+    }
+  })
+
+  test('only a marker ending the message counts, so echoed text cannot claim local origin', async () => {
+    const spoofed = `${await localErrorMessage('placeholder')} then 503 overloaded`
+
+    expect(softNotice(spoofed)).not.toBe(LOCAL_NOTICE)
+    expect(isThrottleOrOverload(spoofed)).toBe(true)
+  })
+})
+
+describe('wrapTransformContextWithLocalFailureMarker', () => {
+  test('marks sync and async throws, keeping the original as cause and its text for operators', async () => {
+    for (const sync of [false, true]) {
+      const original = new RangeError('cannot prepare /private/placeholder/path')
+      const err = await failPreparation(original, { sync })
+
+      expect(err).toBeInstanceOf(Error)
+      expect(err.cause).toBe(original)
+      expect(err.message).toContain('cannot prepare /private/placeholder/path')
+      expect(softNotice(err.message)).toBe(LOCAL_NOTICE)
+      expect(softNotice(err.message)).not.toContain('/private/')
+    }
+  })
+
+  test('non-Error throws and hostile names cannot break or leak through the marker', async () => {
+    const badName = Object.assign(new Error('boom'), { name: 'Bad)\n(name' })
+    const unprintable = {
+      toString() {
+        throw new Error('toString exploded')
+      },
+    }
+
+    for (const thrown of [badName, unprintable, 'Bearer sk-live-LEAK', 42, null]) {
+      const err = await failPreparation(thrown)
+
+      expect(err).toBeInstanceOf(Error)
+      expect(err.cause).toBe(thrown)
+      expect(err.message).not.toContain('\n')
+      expect(softNotice(err.message)).toBe(LOCAL_NOTICE)
+      expect(softNotice(err.message)).not.toContain('sk-live-LEAK')
+    }
+  })
+
+  test('an already-marked failure is not marked again by an outer wrapper', async () => {
+    const original = new Error('placeholder')
+    const err = await failPreparation(original, { wraps: 2 })
+
+    expect(err.cause).toBe(original)
+    expect(softNotice(err.message)).toBe(LOCAL_NOTICE)
+  })
+
+  test('a throw after the signal aborted is rethrown untouched (a cancellation, not a failure)', async () => {
+    const controller = new AbortController()
+    controller.abort()
+    const original = new Error('placeholder cancel')
+
+    expect(await failPreparation(original, { signal: controller.signal })).toBe(original)
+  })
+})
+
+// Pi compacts and replays a turn whose error text its public overflow check
+// accepts; with no context window that is exactly what auto-compaction checks.
+function piReadsAsOverflow(errorMessage: string, provider = 'anthropic'): boolean {
+  return isContextOverflow({
+    role: 'assistant',
+    content: [],
+    api: 'anthropic-messages',
+    provider,
+    model: 'placeholder-model',
+    usage: {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 0,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    },
+    stopReason: 'error',
+    errorMessage,
+    timestamp: 0,
+  })
+}
+
+describe('local failures whose text Pi would read as a context overflow', () => {
+  function capture(provider?: () => string | undefined) {
+    const logs: string[] = []
+    const marker: LocalFailureMarkerOptions = { logWithheld: (line) => logs.push(line) }
+    if (provider) marker.getProvider = provider
+    return { logs, marker }
+  }
+
+  test('move their raw text from the message to one log line, keeping the cause and local notice', async () => {
+    const cases = [
+      new Error('context_length_exceeded while cloning placeholder details'),
+      new RangeError('prompt is too long for the placeholder buffer'),
+      // the name alone matches
+      Object.assign(new Error('placeholder clone failure'), { name: 'request_too_large' }),
+      Object.assign(new Error('context_length_exceeded'), { name: 'model_context_window_exceeded' }),
+    ]
+    for (const original of cases) {
+      const { logs, marker } = capture()
+      expect(piReadsAsOverflow(`${original.message} (${original.name})`)).toBe(true)
+
+      const err = await failPreparation(original, { marker })
+
+      expect(piReadsAsOverflow(err.message)).toBe(false)
+      expect(err.cause).toBe(original)
+      expect(err.message).not.toContain(original.message)
+      expect(softNotice(err.message)).toBe(LOCAL_NOTICE)
+      expect(logs).toHaveLength(1)
+      expect(logs[0]).toContain(original.message)
+    }
+  })
+
+  test('text Pi does not read as overflow stays on the message and is not logged', async () => {
+    const { logs, marker } = capture()
+    const original = new Error('placeholder clone failure')
+
+    const err = await failPreparation(original, { marker })
+
+    expect(err.message).toContain(original.message)
+    expect(logs).toEqual([])
+  })
+
+  test("follow Pi's provider-specific overflow branch through the current provider", async () => {
+    const raw = '413 status code (no body)'
+    expect(piReadsAsOverflow(raw, 'cerebras')).toBe(true)
+    expect(piReadsAsOverflow(raw, 'anthropic')).toBe(false)
+    const unreadable = () => {
+      throw new Error('model getter exploded')
+    }
+
+    for (const [getProvider, provider, withheld] of [
+      [() => 'cerebras', 'cerebras', true],
+      [() => 'anthropic', 'anthropic', false],
+      [unreadable, '', false],
+    ] as const) {
+      const { logs, marker } = capture(getProvider)
+      const err = await failPreparation(new Error(raw), { marker })
+
+      expect(piReadsAsOverflow(err.message, provider)).toBe(false)
+      expect(err.message.includes(raw)).toBe(!withheld)
+      expect(logs).toHaveLength(withheld ? 1 : 0)
+      expect(softNotice(err.message)).toBe(LOCAL_NOTICE)
+    }
+  })
+
+  test('an already-marked error is still neutralized, and nested wrappers log it once', async () => {
+    // an inner throw that already ends with the marker but trips Pi's check
+    const markerSuffix = (await localErrorMessage('placeholder')).slice('placeholder'.length)
+    const forged = new Error(`context_length_exceeded${markerSuffix}`)
+    expect(softNotice(forged.message)).toBe(LOCAL_NOTICE)
+    expect(piReadsAsOverflow(forged.message)).toBe(true)
+    const { logs, marker } = capture()
+
+    const err = await failPreparation(forged, { marker, wraps: 2 })
+
+    expect(piReadsAsOverflow(err.message)).toBe(false)
+    expect(err.cause).toBe(forged)
+    expect(softNotice(err.message)).toBe(LOCAL_NOTICE)
+    expect(logs).toHaveLength(1)
+  })
+
+  test('a throwing log sink cannot replace the failure', async () => {
+    const original = new Error('context_length_exceeded in placeholder')
+
+    const err = await failPreparation(original, {
+      marker: {
+        logWithheld: () => {
+          throw new Error('log sink exploded')
+        },
+      },
+    })
+
+    expect(err.cause).toBe(original)
+    expect(piReadsAsOverflow(err.message)).toBe(false)
+    expect(softNotice(err.message)).toBe(LOCAL_NOTICE)
+  })
+
+  test('an abort is still rethrown untouched and not logged', async () => {
+    const controller = new AbortController()
+    controller.abort()
+    const original = new Error('context_length_exceeded during cancel')
+    const { logs, marker } = capture()
+
+    expect(await failPreparation(original, { marker, signal: controller.signal })).toBe(original)
+    expect(logs).toEqual([])
+  })
+})
+
+describe('local pre-request failures through a real pi Agent', () => {
+  function agentWithFauxProvider(transformContext: TransformContext) {
+    const faux = fauxProvider({ provider: 'provider-error-local-test' })
+    const models = createModels()
+    models.setProvider(faux.provider)
+    const agent = new Agent({
+      initialState: { model: faux.getModel() },
+      streamFn: models.streamSimple.bind(models),
+      transformContext: wrapTransformContextWithLocalFailureMarker(transformContext),
+    })
+    const ended: unknown[] = []
+    agent.subscribe((event) => {
+      if (event.type === 'message_end' && event.message.role === 'assistant') ended.push(event.message)
+    })
+    return { agent, faux, ended }
+  }
+
+  test('a context-preparation throw ends the turn with the local notice before any provider call', async () => {
+    // given: preparation clones a message whose details hold a function (DataCloneError)
+    const handlerDetail = { role: 'custom', details: { handler: async () => {} } } as unknown as AgentMessage
+    const { agent, faux, ended } = agentWithFauxProvider(async (messages) =>
+      structuredClone([...messages, handlerDetail]),
+    )
+
+    await agent.prompt('hi')
+
+    expect(faux.state.callCount).toBe(0)
+    expect(ended).toHaveLength(1)
+    expect(ended[0]).toMatchObject({ stopReason: 'error' })
+    expect(detectProviderError(ended[0])?.safeMessage).toBe(LOCAL_NOTICE)
+  })
+
+  test('aborting during preparation stays an unmarked abort with no notice', async () => {
+    const started = Promise.withResolvers<void>()
+    const { agent, faux, ended } = agentWithFauxProvider((_messages, signal) => {
+      const prepared = Promise.withResolvers<AgentMessage[]>()
+      signal?.addEventListener('abort', () => prepared.reject(new Error('preparation cancelled')), { once: true })
+      started.resolve()
+      return prepared.promise
+    })
+
+    const run = agent.prompt('hi')
+    await started.promise
+    agent.abort()
+    await run
+
+    expect(faux.state.callCount).toBe(0)
+    expect(ended).toHaveLength(1)
+    expect(ended[0]).toMatchObject({ stopReason: 'aborted', errorMessage: 'preparation cancelled' })
+    expect(detectProviderError(ended[0])).toBeNull()
+  })
+
+  test('a real provider error after preparation keeps its provider class', async () => {
+    const { agent, faux, ended } = agentWithFauxProvider(async (messages) => messages)
+    faux.setResponses([fauxAssistantMessage('', { stopReason: 'error', errorMessage: '401 Unauthorized' })])
+
+    await agent.prompt('hi')
+
+    expect(faux.state.callCount).toBe(1)
+    expect(ended[0]).toMatchObject({ stopReason: 'error', errorMessage: '401 Unauthorized' })
+    expect(detectProviderError(ended[0])?.safeMessage).toBe(softNotice('401 Unauthorized'))
+    expect(detectProviderError(ended[0])?.safeMessage).not.toBe(LOCAL_NOTICE)
   })
 })

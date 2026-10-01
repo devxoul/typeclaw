@@ -57,6 +57,7 @@ import {
   zodToToolParameters,
 } from './plugin-tools'
 import { PROACTIVE_NEXT_STEP_NUDGE } from './proactive-next-step-nudge'
+import { wrapTransformContextWithLocalFailureMarker } from './provider-error'
 import { createReloadTool } from './reload-tool'
 import type { RestartHandoffOrigin } from './restart-handoff'
 import type { SubagentBashPolicy } from './reviewer-bash-policy'
@@ -553,7 +554,8 @@ export async function createSessionWithDispose(options: CreateSessionOptions = {
   // while typeclaw has already latched the failure, reporting a recovered turn as
   // failed (and burning an unnecessary failover). Disabling it makes a soft error
   // a deterministic, typeclaw-owned signal. Compaction/context-overflow recovery
-  // is independent (gated on compaction settings), so this does not disable those.
+  // is independent (gated on compaction settings), so this does not disable those;
+  // marked local failures are kept out of overflow recovery at the marker below.
   session.setAutoRetryEnabled(false)
   const getAbortReason = () => abortHolder.reason
   const sessionWithAbortReason = Object.assign(session, { getAbortReason })
@@ -575,6 +577,20 @@ export async function createSessionWithDispose(options: CreateSessionOptions = {
       return converted
     }
   }
+
+  // pi turns a throw from context preparation into the same `stopReason:'error'`
+  // message a provider failure produces, with only the error text kept, so the
+  // origin has to be stamped where it is thrown. Installed last so it is the
+  // outermost layer over pi's extension `context` pass (which clones the
+  // messages) and its forced-prompt projection. getApiKey and streamFunction
+  // stay unwrapped: their failures can be genuine provider/auth failures.
+  // Overflow recovery stays enabled; a local failure whose text would read as a
+  // provider overflow is stamped with fixed text and its raw text is logged here.
+  session.agent.transformContext = wrapTransformContextWithLocalFailureMarker(session.agent.transformContext, {
+    getProvider: () => session.agent.state.model?.provider,
+    logWithheld: (line) =>
+      console.error(`[agent] ${options.plugins?.sessionId ?? sessionManager.getSessionId()}: ${line}`),
+  })
 
   abortHolder.abort = (reason?: string) => {
     if (reason !== undefined) abortHolder.reason = reason

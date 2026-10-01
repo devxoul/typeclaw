@@ -3,7 +3,7 @@ import { describe, expect, test } from 'bun:test'
 import type { ModelRef } from '@/config/providers'
 
 import type { AgentSession } from './index'
-import { isFailoverWorthy } from './provider-error'
+import { isFailoverWorthy, wrapTransformContextWithLocalFailureMarker } from './provider-error'
 import {
   PATIENT_OVERLOAD_RETRIES,
   PATIENT_OVERLOAD_WINDOW_MS,
@@ -20,6 +20,15 @@ const CODEX_SOL_REF = 'openai-codex/gpt-5.4' as ModelRef
 const CODEX_LUNA_REF = 'openai-codex/gpt-5.4-mini' as ModelRef
 const ANTHROPIC_REF = 'anthropic/claude-sonnet-5' as ModelRef
 
+// A context-preparation failure whose text merely echoes a codex TTFB timeout,
+// marked by the same wrapper sessions install around transformContext.
+const LOCAL_TTFB_LOOKALIKE = await wrapTransformContextWithLocalFailureMarker(async () => {
+  throw new Error('openai-codex timed out before response headers after 30000ms (typeclaw observer timeout)')
+})([]).then(
+  () => '',
+  (err: unknown) => (err as Error).message,
+)
+
 type FakeEvent = { type: string; message?: unknown; assistantMessageEvent?: { type: string; delta?: string } }
 
 function fakeSession(
@@ -32,6 +41,7 @@ function fakeSession(
     | 'hard-observer-timeout'
     | 'hard-observer-ttfb-timeout'
     | 'soft-observer-ttfb-timeout'
+    | 'soft-local-ttfb-lookalike'
     | 'text-then-success'
     | 'success'
   >,
@@ -70,7 +80,9 @@ function fakeSession(
               ? '503 Service Unavailable'
               : behavior === 'soft-observer-ttfb-timeout'
                 ? 'openai-codex timed out before response headers after 30000ms (typeclaw observer timeout)'
-                : 'server_is_overloaded'
+                : behavior === 'soft-local-ttfb-lookalike'
+                  ? LOCAL_TTFB_LOOKALIKE
+                  : 'server_is_overloaded'
         for (const cb of events) {
           cb({ type: 'message_end', message: { role: 'assistant', stopReason: 'error', errorMessage: message } })
         }
@@ -322,6 +334,34 @@ describe('promptPersistentTurnWithFallback', () => {
     expect(circuit.isProviderOpen({ profile: 'default', ref: CODEX_LUNA_REF })).toBe(true)
     expect(circuit.isOpen({ profile: 'default', ref: CODEX_TERRA_REF })).toBe(false)
     expect(circuit.isOpen({ profile: 'default', ref: CODEX_SOL_REF })).toBe(false)
+  })
+
+  test('a local preparation failure echoing a codex TTFB timeout neither retries, fails over, nor trips the provider circuit', async () => {
+    const circuit = new ThrottleCircuit()
+
+    for (const ref of [CODEX_TERRA_REF, CODEX_SOL_REF]) {
+      const fake = fakeSession(['soft-local-ttfb-lookalike', 'success'])
+      const result = await promptPersistentTurnWithFallback({
+        refs: [ref, ANTHROPIC_REF],
+        currentModelRef: ref,
+        profile: 'default',
+        session: fake.session,
+        text: 'hello',
+        circuit,
+        shouldFailover: (err) => isFailoverWorthy(err.message),
+        setModelForRef: async (nextRef) => {
+          fake.setModels.push(nextRef)
+        },
+      })
+      // then: surfaced on the one attempt, with no same-ref replay or failover
+      expect(result).toMatchObject({ success: false, refUsed: ref })
+      expect(fake.prompted).toEqual(['hello'])
+      expect(fake.setModels).toEqual([])
+    }
+
+    // then: unlike the real codex TTFB timeouts above, two of these leave codex usable
+    expect(circuit.isProviderOpen({ profile: 'default', ref: CODEX_LUNA_REF })).toBe(false)
+    expect(circuit.isOpen({ profile: 'default', ref: CODEX_TERRA_REF })).toBe(false)
   })
 
   test('attempts terra, sol, then routes to anthropic in one turn as the codex provider breaker opens mid-chain', async () => {

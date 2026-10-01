@@ -70,11 +70,21 @@ The just-completed turn's token spend (`lastTurnOutcome.tokens`, from the assist
 1. **`no-incomplete-todos`** — nothing left to do.
 2. **`restart-kick-suppressed`** — the one-shot restart suppressor is armed (below).
 3. **`user-abort-blocked`** — the durable user-abort suppressor is set (policy D1).
-4. **`turn-not-safe`** — the last outcome is missing, `unknown`, or an unproven `aborted`. The sole safe abort is a successful terminal `channel_reply` carrying runtime-owned `termination: 'terminal-after-channel-reply'` provenance; the raw stop reason remains `aborted`. `unknown`, missing, stale, and malformed provenance all fail closed.
+4. **`turn-not-safe`** — the last outcome is missing, `error`, `unknown`, or an unproven `aborted`. The sole safe abort is a successful terminal `channel_reply` carrying runtime-owned `termination: 'terminal-after-channel-reply'` provenance; the raw stop reason remains `aborted`. `unknown`, missing, stale, and malformed provenance all fail closed. `error` has no exception, even with terminal-reply provenance (see below).
 5. **`max-auto-turns` / `max-tokens` / `max-wall-clock`** — a budget ceiling tripped.
 6. **`stagnation`** — `stagnationCount` hit the limit.
 
 Only after all six pass does it return `inject` with `autoTurnCount + 1`.
+
+### Failed turns do not auto-continue
+
+When the last recorded outcome is `stopReason: 'error'` — the turn's final assistant message failed, whether from the provider or from the runtime while preparing the request — the idle path skips with `turn-not-safe`. Injecting a continuation would send the same conversation straight back into the request that just failed, and each failed nudge would spend an auto-turn on nothing. `length` stays continuation-eligible and `stop` is unchanged; only the final failure blocks.
+
+The scope is deliberately narrow:
+
+- **TUI and channel sessions alike.** These are the two idle paths that call `runIdleContinuation`; both record outcomes through `recordTurnOutcome` and decide through the same `decideContinuation`. Cron has no idle continuation driver, and subagent/system sessions own no todo scope.
+- **Retries inside the turn still run.** Same-model retries and fallbacks the turn already attempts are untouched. Outcomes are recorded from each assistant `message_end`, so when a retry lands a successful message its outcome replaces the `error` and the idle continues normally.
+- **Not durable.** There is no failure counter and no suppressor; the skip is decided from the latest outcome alone and does not touch the episode. The next real user turn resets the episode as usual, records a fresh outcome, and can drive the remaining todos again.
 
 ### Suppressors
 
@@ -92,7 +102,7 @@ Two suppressors live in `ContinuationState` and gate injection independent of bu
 `src/agent/todo/continuation-wiring.ts` is the seam between the engine and the per-origin drain loop:
 
 - **`recordTurnStart`** resets the episode at the start of a **real** user turn. Injected continuation turns pass `isRealUserTurn=false` so the budget keeps counting down. No-op for scopeless origins.
-- **`recordTurnOutcome`** persists the just-completed turn's `stopReason` + `tokens` from a pi `message_end` event. Channel sessions also attach one-shot terminal-reply provenance only when the raw outcome is `aborted` and the router's abort stamp matches the current turn. Per-session writes are serialized on a recoverable tail, while each tail value separately reports whether its write succeeded. The drain waits for the latest tail and skips continuation when that latest write failed instead of consulting stale eligible state. `classifyStopReason` maps anything unrecognized to `unknown` so the idle path fails closed; `extractTurnUsage` only reads assistant `message_end` events.
+- **`recordTurnOutcome`** persists the just-completed turn's `stopReason` + `tokens` from a pi `message_end` event. Channel sessions also attach one-shot terminal-reply provenance only when the raw outcome is `aborted` and the router's abort stamp matches the current turn. In both TUI and channel sessions, per-session writes are serialized on a recoverable tail, so an older outcome can never land after a newer one, while each tail value separately reports whether its write succeeded. The drain waits for the latest tail before `recordTurnStart` and again before the idle decision, and skips continuation when that latest write failed instead of consulting stale eligible state. The TUI drain re-checks its queue after that wait, so a real user prompt that arrived meanwhile runs first. The idle decision itself is chained onto the same tail, so an outcome write that starts during the decision (an abort) lands after the decision's own state write. `classifyStopReason` maps anything unrecognized to `unknown` so the idle path fails closed; `extractTurnUsage` only reads assistant `message_end` events.
 - **`armRestartKickForOrigin`** arms the one-shot before a restart kick.
 - **`runIdleContinuation`** is the idle-path entry: it calls `maybeInjectContinuation` (decide + persist) and, on `injected`, delivers the `CONTINUATION_PROMPT` via the origin-appropriate mechanism the caller supplies (TUI `stream.publish`; channel `pendingSystemReminders` + drain).
 

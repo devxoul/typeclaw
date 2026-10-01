@@ -207,6 +207,56 @@ describe('decideContinuation', () => {
     expect(d.kind).toBe('inject')
   })
 
+  test('skips after a failed final turn even with incomplete todos and budget left', () => {
+    const episode = {
+      episodeId: 'e',
+      startedAt: 1500,
+      autoTurnCount: 1,
+      cumulativeTokens: 0,
+      failureCount: 0,
+      stagnationCount: 0,
+      lastIncompleteHash: 'prev',
+    }
+    const d = decide(baseState({ lastTurnOutcome: { turnId: 't', stopReason: 'error', endedAt: 1 }, episode }))
+    expect(d).toEqual({ kind: 'skip', reason: 'turn-not-safe' })
+  })
+
+  test('terminal channel-reply provenance does not authorize continuing a failed turn', () => {
+    const d = decide(
+      baseState({
+        lastTurnOutcome: {
+          turnId: 't',
+          stopReason: 'error',
+          termination: 'terminal-after-channel-reply',
+          endedAt: 1,
+        },
+      }),
+    )
+    expect(d).toEqual({ kind: 'skip', reason: 'turn-not-safe' })
+  })
+
+  test('a failed turn blocks only that idle: a later successful outcome continues the same episode', () => {
+    const episode = {
+      episodeId: 'e',
+      startedAt: 1500,
+      autoTurnCount: 1,
+      cumulativeTokens: 0,
+      failureCount: 0,
+      stagnationCount: 0,
+      lastIncompleteHash: 'prev',
+    }
+    const failed = baseState({ lastTurnOutcome: { turnId: 't1', stopReason: 'error', endedAt: 1 }, episode })
+    expect(decide(failed)).toEqual({ kind: 'skip', reason: 'turn-not-safe' })
+
+    const recovered = { ...failed, lastTurnOutcome: { turnId: 't2', stopReason: 'stop', endedAt: 2 } as TurnOutcome }
+    const d = decide(recovered)
+    expect(d.kind).toBe('inject')
+    if (d.kind === 'inject') {
+      expect(d.episode.episodeId).toBe('e')
+      expect(d.episode.autoTurnCount).toBe(2)
+    }
+  })
+
   test('skips while the user-abort durable suppressor is set', () => {
     const d = decide(baseState({ autoResumeBlockedUntilRealUserTurn: true }))
     expect(d).toEqual({ kind: 'skip', reason: 'user-abort-blocked' })

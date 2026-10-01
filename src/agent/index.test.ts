@@ -4,6 +4,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
+import type { AssistantMessage, ToolResultMessage } from '@earendil-works/pi-ai'
 import { defineTool as definePiTool, SessionManager } from '@earendil-works/pi-coding-agent'
 import { Type } from 'typebox'
 
@@ -37,6 +38,7 @@ import {
 } from './index'
 import { LiveSubagentRegistry } from './live-subagents'
 import { PROACTIVE_NEXT_STEP_NUDGE } from './proactive-next-step-nudge'
+import { detectProviderError, wrapTransformContextWithLocalFailureMarker } from './provider-error'
 import type { SessionOrigin } from './session-origin'
 import type { CreateSessionForSubagent, SubagentRegistry } from './subagents'
 import { DEFAULT_SYSTEM_PROMPT, SLIM_SYSTEM_PROMPT } from './system-prompt'
@@ -1822,5 +1824,247 @@ describe('default stream output budget', () => {
       __resetConfigForTesting()
       process.chdir(previousCwd)
     }
+  })
+})
+
+describe('local context-preparation failures', () => {
+  test('a session whose context cannot be prepared ends the turn with the local notice and never calls the provider', async () => {
+    const previousCwd = process.cwd()
+    const previousFetch = globalThis.fetch
+    const previousApiKey = process.env.ANTHROPIC_API_KEY
+    let fetchCalls = 0
+    process.chdir(agentDir)
+    process.env.ANTHROPIC_API_KEY = 'test-anthropic-key'
+    await writeFile(
+      join(agentDir, 'typeclaw.json'),
+      JSON.stringify({ models: { default: 'anthropic/claude-sonnet-4-6' } }),
+    )
+    reloadConfig(agentDir)
+    invalidateProviderAuthCache()
+    globalThis.fetch = (async () => {
+      fetchCalls++
+      return new Response('{"error":{"message":"must not be reached"}}', { status: 500 })
+    }) as unknown as typeof fetch
+    // given: a tool result whose details hold a live function, which pi's
+    // extension `context` pass cannot structuredClone
+    const sessionManager = SessionManager.inMemory(agentDir)
+    sessionManager.appendMessage({ role: 'user', content: [{ type: 'text', text: 'run it' }], timestamp: 1 })
+    // The type only admits JSON details; live sessions still end up holding
+    // non-JSON values here, which is what this test reproduces.
+    sessionManager.appendMessage({
+      role: 'toolResult',
+      toolCallId: 'call_1',
+      toolName: 'placeholder_tool',
+      content: [{ type: 'text', text: 'ok' }],
+      details: { job: { handler: async () => {} } },
+      isError: false,
+      timestamp: 2,
+    } as unknown as ToolResultMessage)
+    // The notice for a marked local failure, derived rather than pinned.
+    const markedLocal: unknown = await wrapTransformContextWithLocalFailureMarker(async () => {
+      throw new Error('placeholder')
+    })([]).catch((err: unknown) => err)
+    const localNotice = detectProviderError({
+      role: 'assistant',
+      stopReason: 'error',
+      errorMessage: (markedLocal as Error).message,
+    })?.safeMessage
+
+    try {
+      const { session, dispose } = await createSessionWithDispose({
+        sessionManager,
+        systemPromptOverride: 'test local failure',
+        tools: [],
+      })
+      const ended: unknown[] = []
+      session.subscribe((event) => {
+        if (event.type === 'message_end' && event.message.role === 'assistant') ended.push(event.message)
+      })
+      try {
+        // when
+        await session.prompt('next')
+
+        // then
+        expect(fetchCalls).toBe(0)
+        expect(ended).toHaveLength(1)
+        expect(ended[0]).toMatchObject({ stopReason: 'error' })
+        expect(detectProviderError(ended[0])?.safeMessage).toBe(localNotice!)
+      } finally {
+        await dispose()
+      }
+    } finally {
+      globalThis.fetch = previousFetch
+      if (previousApiKey === undefined) delete process.env.ANTHROPIC_API_KEY
+      else process.env.ANTHROPIC_API_KEY = previousApiKey
+      invalidateProviderAuthCache()
+      __resetConfigForTesting()
+      process.chdir(previousCwd)
+    }
+  })
+
+  // Pi compacts and replays a failed turn whose error text reads as a provider
+  // context overflow. These run a real session against a stubbed provider and
+  // record what the session did over two prompts.
+  type SessionRun = { fetchCalls: number; compactions: string[]; errors: string[]; logs: string[] }
+
+  async function runTwoPrompts(seed: (sm: SessionManager) => void, providerError: string): Promise<SessionRun> {
+    const previousCwd = process.cwd()
+    const previousFetch = globalThis.fetch
+    const previousApiKey = process.env.ANTHROPIC_API_KEY
+    const previousConsoleError = console.error
+    const run: SessionRun = { fetchCalls: 0, compactions: [], errors: [], logs: [] }
+    process.chdir(agentDir)
+    process.env.ANTHROPIC_API_KEY = 'test-anthropic-key'
+    await writeFile(
+      join(agentDir, 'typeclaw.json'),
+      JSON.stringify({ models: { default: 'anthropic/claude-sonnet-4-6' } }),
+    )
+    reloadConfig(agentDir)
+    invalidateProviderAuthCache()
+    globalThis.fetch = (async () => {
+      run.fetchCalls++
+      return new Response(
+        JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: providerError } }),
+        {
+          status: 400,
+          headers: { 'content-type': 'application/json' },
+        },
+      )
+    }) as unknown as typeof fetch
+    console.error = (...args: unknown[]) => {
+      run.logs.push(args.map(String).join(' '))
+    }
+    const sessionManager = SessionManager.inMemory(agentDir)
+    seed(sessionManager)
+    try {
+      const { session, dispose } = await createSessionWithDispose({
+        sessionManager,
+        systemPromptOverride: 'test local failure',
+        tools: [],
+      })
+      session.subscribe((event) => {
+        if (event.type === 'compaction_start') run.compactions.push(event.reason)
+        if (
+          event.type === 'message_end' &&
+          event.message.role === 'assistant' &&
+          event.message.stopReason === 'error'
+        ) {
+          run.errors.push(event.message.errorMessage ?? '')
+        }
+      })
+      try {
+        await session.prompt('next')
+        await session.prompt('again')
+      } finally {
+        await dispose()
+      }
+    } finally {
+      console.error = previousConsoleError
+      globalThis.fetch = previousFetch
+      if (previousApiKey === undefined) delete process.env.ANTHROPIC_API_KEY
+      else process.env.ANTHROPIC_API_KEY = previousApiKey
+      invalidateProviderAuthCache()
+      __resetConfigForTesting()
+      process.chdir(previousCwd)
+    }
+    return run
+  }
+
+  // `pairs` exchanges of `chars` characters per message, all from the session's
+  // own model so Pi treats their errors as same-model.
+  function seedHistory(sessionManager: SessionManager, pairs: number, chars: number): void {
+    for (let i = 0; i < pairs; i++) {
+      sessionManager.appendMessage({
+        role: 'user',
+        content: [{ type: 'text', text: 'u'.repeat(chars) }],
+        timestamp: 2 * i + 1,
+      })
+      const reply: AssistantMessage = {
+        role: 'assistant',
+        content: [{ type: 'text', text: 'r'.repeat(chars) }],
+        api: 'anthropic-messages',
+        provider: 'anthropic',
+        model: 'claude-sonnet-4-6',
+        usage: {
+          input: 0,
+          output: 0,
+          cacheRead: 0,
+          cacheWrite: 0,
+          totalTokens: 0,
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+        },
+        stopReason: 'stop',
+        timestamp: 2 * i + 2,
+      }
+      sessionManager.appendMessage(reply)
+    }
+  }
+
+  // Above pi's 20K keep-recent window, so there is history to summarize, but
+  // below TypeClaw's 64K compaction trigger.
+  const compactableBelowTrigger = (sessionManager: SessionManager) => seedHistory(sessionManager, 6, 10_000)
+
+  test('a local failure whose text reads as a provider overflow neither compacts nor replays the session', async () => {
+    const raw = 'context_length_exceeded while cloning placeholder details'
+    // given: preparation reads a tool result whose details getter throws
+    const details = {}
+    Object.defineProperty(details, 'job', {
+      enumerable: true,
+      get() {
+        throw new Error(raw)
+      },
+    })
+
+    // when
+    const run = await runTwoPrompts((sessionManager) => {
+      compactableBelowTrigger(sessionManager)
+      sessionManager.appendMessage({ role: 'user', content: [{ type: 'text', text: 'run it' }], timestamp: 100 })
+      sessionManager.appendMessage({
+        role: 'toolResult',
+        toolCallId: 'call_1',
+        toolName: 'placeholder_tool',
+        content: [{ type: 'text', text: 'ok' }],
+        details,
+        isError: false,
+        timestamp: 101,
+      } as unknown as ToolResultMessage)
+    }, 'must not be reached')
+
+    // then: no compaction, no summarization or replayed request, and the raw
+    // text is in the logs rather than the transcript
+    expect(run.fetchCalls).toBe(0)
+    expect(run.compactions).toEqual([])
+    expect(run.errors).toHaveLength(2)
+    const localNotice = detectProviderError({
+      role: 'assistant',
+      stopReason: 'error',
+      errorMessage: (
+        (await wrapTransformContextWithLocalFailureMarker(async () => {
+          throw new Error('placeholder')
+        })([]).catch((err: unknown) => err)) as Error
+      ).message,
+    })?.safeMessage
+    for (const errorMessage of run.errors) {
+      expect(errorMessage).not.toContain(raw)
+      expect(detectProviderError({ role: 'assistant', stopReason: 'error', errorMessage })?.safeMessage).toBe(
+        localNotice!,
+      )
+    }
+    expect(run.logs.filter((line) => line.includes(raw))).toHaveLength(2)
+  })
+
+  test('a provider overflow on the same history still compacts for recovery', async () => {
+    const run = await runTwoPrompts(compactableBelowTrigger, 'prompt is too long: 213462 tokens > 200000 maximum')
+
+    expect(run.compactions).toContain('overflow')
+  })
+
+  test('history over the compaction trigger still compacts on threshold after a non-overflow error', async () => {
+    const run = await runTwoPrompts(
+      (sessionManager) => seedHistory(sessionManager, 6, 24_000),
+      'placeholder bad request',
+    )
+
+    expect(run.compactions).toContain('threshold')
   })
 })
