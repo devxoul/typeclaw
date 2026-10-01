@@ -70,6 +70,12 @@ export function createChannelReplyTool({
           minLength: 1,
         }),
       ),
+      link_previews: Type.Optional(
+        Type.Boolean({
+          description:
+            'Set false to suppress link/media previews on Slack bot and Telegram bot text replies. True or omitted preserves platform defaults. Ignored on other adapters. Slack file-upload captions are not covered.',
+        }),
+      ),
       attachments: Type.Optional(
         Type.Array(
           Type.Object({
@@ -297,6 +303,7 @@ export function createChannelReplyTool({
         chat: origin.chat,
         thread: origin.thread,
         ...(text !== undefined ? { text } : {}),
+        ...(params.link_previews !== undefined ? { link_previews: params.link_previews } : {}),
         ...(attachments !== undefined ? { attachments } : {}),
       })
 

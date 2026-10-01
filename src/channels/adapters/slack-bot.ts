@@ -1002,8 +1002,14 @@ export function createOutboundCallback(deps: {
       try {
         for (let i = 0; i < chunks.length; i++) {
           const chunk = chunks[i]!
-          const options: { thread_ts?: string; blocks?: unknown[] } = { blocks: [buildMarkdownBlock(chunk)] }
+          const options: { thread_ts?: string; blocks?: unknown[]; unfurl_links?: boolean; unfurl_media?: boolean } = {
+            blocks: [buildMarkdownBlock(chunk)],
+          }
           if (threadTs !== null) options.thread_ts = threadTs
+          if (msg.link_previews === false) {
+            options.unfurl_links = false
+            options.unfurl_media = false
+          }
           const sent = await client.postMessage(msg.chat, chunk, options)
           sentTs.push(sent.ts)
           logger.info(

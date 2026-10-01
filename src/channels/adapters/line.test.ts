@@ -86,6 +86,29 @@ describe('createOutboundCallback', () => {
     expect(sent).toEqual([{ chat: 'C1', text: 'hi' }])
   })
 
+  test('accepts a preview preference without changing unsupported platform sends', async () => {
+    const sent: string[] = []
+    const cb = createOutboundCallback({
+      client: {
+        sendMessage: async (_chat, text) => {
+          sent.push(text)
+          return { success: true, chat_id: 'C1', message_id: 'M', sent_at: '' }
+        },
+      },
+      logger: SILENT,
+      formatChannelTag: tag,
+    })
+    const res = await cb({
+      adapter: 'line',
+      workspace: '@line-dm',
+      chat: 'C1',
+      text: 'https://example.org',
+      link_previews: false,
+    })
+    expect(res.ok).toBe(true)
+    expect(sent).toEqual(['https://example.org'])
+  })
+
   test('rejects an outbound carrying attachments', async () => {
     const cb = createOutboundCallback({
       client: { sendMessage: async () => ({ success: true, chat_id: 'C1', message_id: 'M', sent_at: '' }) },

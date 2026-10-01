@@ -90,6 +90,12 @@ export function createChannelSendTool({
           minLength: 1,
         }),
       ),
+      link_previews: Type.Optional(
+        Type.Boolean({
+          description:
+            'Set false to suppress link/media previews on Slack bot and Telegram bot text posts. True or omitted preserves platform defaults. Ignored on other adapters. Slack file-upload captions are not covered.',
+        }),
+      ),
       attachments: Type.Optional(
         Type.Array(
           Type.Object({
@@ -310,6 +316,7 @@ export function createChannelSendTool({
         chat: params.chat,
         ...(params.thread !== undefined ? { thread: params.thread } : {}),
         ...(bodyText !== undefined ? { text: bodyText } : {}),
+        ...(params.link_previews !== undefined ? { link_previews: params.link_previews } : {}),
         ...(attachments !== undefined ? { attachments } : {}),
       })
 

@@ -119,6 +119,24 @@ describe('createChannelSendTool', () => {
     expect(result.details).toEqual({ ok: true })
   })
 
+  test('passes preview suppression to the router for an outbound post', async () => {
+    const calls: OutboundMessage[] = []
+    const tool = createChannelSendTool({
+      router: fakeRouter(async (msg) => {
+        calls.push(msg)
+        return { ok: true }
+      }),
+    })
+    await runTool(tool, {
+      adapter: 'slack-bot',
+      workspace: 'T0',
+      chat: 'C0',
+      text: 'https://example.org',
+      link_previews: false,
+    })
+    expect(calls[0]?.link_previews).toBe(false)
+  })
+
   test('strips a trailing tool-call leak from text, sending only the prose', async () => {
     const calls: OutboundMessage[] = []
     const tool = createChannelSendTool({

@@ -1804,6 +1804,13 @@ describe('slack-bot createOutboundCallback', () => {
     ])
   })
 
+  test('disables both link and media previews for a link-heavy message', async () => {
+    const { client, posts } = makeFakeClient()
+    const cb = createOutboundCallback({ client, logger: silentLogger(), formatChannelTag: tag })
+    await cb(makeMsg({ text: 'https://example.org', link_previews: false }))
+    expect(posts[0]?.options).toMatchObject({ unfurl_links: false, unfurl_media: false })
+  })
+
   test('text-only path preserves GitHub-flavored markdown verbatim in the block payload', async () => {
     // given
     const { client, posts } = makeFakeClient()

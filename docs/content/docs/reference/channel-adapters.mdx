@@ -90,6 +90,8 @@ When a message arrives:
 
 The router never blocks on a slow adapter. Each adapter owns its own outbound queue.
 
+`channel_send` and `channel_reply` accept optional `link_previews: false` to suppress link/media previews on `slack-bot` and web-page previews on `telegram-bot`. Omit it or set `true` to keep the platform default (not force previews on). Other adapters, including `discord-bot`, ignore the option; it does not disable previews there. The pinned Discord SDK does not support message flags, and bypassing it would lose rate-limit and retry handling. Slack file-upload captions do not expose preview controls in the upstream upload API, so use a text-only post when preview suppression is required.
+
 When the agent's first send of a turn lands later than `quotedReply.queueDelayMs` after the inbound was received, OR the channel had observed messages between the inbound and the reply, the router prepends a single-line `> @author: excerpt` markdown blockquote referencing the inbound so the user can see which message the reply is anchored to even after the channel has scrolled. Slack and Discord get platform-native `<@authorId>` mentions inside the quote; Telegram, LINE, KakaoTalk, and GitHub fall back to plain author names because they have no reliable id-only mention syntax inside markdown. Anchoring is first-send-only per turn — multi-part replies don't repeat the quote on every chunk.
 
 ## Cross-channel reads

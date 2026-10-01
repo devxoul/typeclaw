@@ -112,6 +112,20 @@ describe('telegram-bot createOutboundCallback', () => {
     expect(fake.sendMessageCalls[0]?.options).toEqual({ parse_mode: 'MarkdownV2' })
   })
 
+  test('disables Telegram web-page previews for a link-heavy post', async () => {
+    const fake = fakeClient()
+    const cb = createOutboundCallback({
+      client: fake.client,
+      logger: silentLogger(),
+      formatChannelTag: async () => 'chat=-100123',
+    })
+    await cb(buildOutbound({ text: 'https://example.org', link_previews: false }))
+    expect(fake.sendMessageCalls[0]?.options).toEqual({
+      parse_mode: 'MarkdownV2',
+      link_preview_options: { is_disabled: true },
+    })
+  })
+
   test('surfaces the posted message_id (stringified) so the agent can thread follow-ups', async () => {
     const fake = fakeClient()
     fake.setSendMessageBehavior(async () => fakeMessage({ message_id: 4242 }))
