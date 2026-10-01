@@ -38,13 +38,13 @@ If a new prompt arrives while the runner is in flight, the runner finishes its c
 
 ## What it commits
 
-The runner stages an explicit snapshot from NUL-delimited porcelain status:
+The runner builds an explicit snapshot from NUL-delimited porcelain status:
 
-- **Tracked changes**, including deletions and both rename/copy endpoints, are staged even when an endpoint is no longer present on disk.
+- **Tracked changes**, including deletions and both rename/copy endpoints, remain selected even when an endpoint is no longer present on disk. A selected index entry absent from both HEAD and the worktree (including a removed intent-to-add) is cleared from the index instead of committed; excluded `memory/` paths are never touched.
 - **Ordinary untracked paths** are staged only while still present. If one disappears between snapshot and `git add`, the runner re-reads status and retries that same snapshot once without the vanished path; paths discovered during that re-read are never added.
-- **`memory/`** remains excluded. Present **`sessions/` and `todo/`** paths remain force-added; tracked deletions under those prefixes stay in the ordinary snapshot. The post-message pass re-stages only `sessions/` paths that appeared while the message was selected.
+- **`memory/`** remains excluded. Present **`sessions/` and `todo/`** paths reported by porcelain remain force-added; tracked deletions under those prefixes stay in the ordinary snapshot. The post-message pass selects only porcelain-visible late `sessions/` paths.
 
-Commit message comes from the `backup-message` subagent, which sees a truncated `git status` and `git diff --cached --stat` and writes a single conventional-ish commit message to a tmp file. On any failure the runner falls back to `chore: backup`.
+The runner stages the selected paths in a temporary private Git index for its diffstat, without exposing backup entries in the shared index while `backup-message` selects a message. Git then commits **only** selected paths against its current HEAD; unrelated staged files and intervening commits stay intact. A post-message status drops deletion paths already committed by another writer, and an already-clean selection returns clean rather than a false failure. Discovery of force-added paths is unchanged: gitignored untracked files omitted by porcelain status are not discovered here, while explicitly staged ignored files remain eligible. The `backup-message` subagent sees a truncated status and private-index diffstat and writes a single conventional-ish commit message to a tmp file; on any failure it falls back to `chore: backup`.
 
 ## What it pushes
 

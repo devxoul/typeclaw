@@ -99,6 +99,389 @@ describe('runBackup', () => {
     }
   })
 
+  test('commits only backup paths while preserving a foreign staged change', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'autobackup-foreign-index-'))
+    const gitSpawn = makeDefaultGitSpawn()
+    const git = async (...args: string[]) => {
+      const result = await gitSpawn(args, { cwd, timeoutMs: 30_000 })
+      expect(result.exitCode).toBe(0)
+      return result.stdout
+    }
+    try {
+      await git('init', '-q', '-b', 'main')
+      await git('config', 'user.name', 'Test')
+      await git('config', 'user.email', 'test@example.com')
+      await writeFile(join(cwd, 'backup.txt'), 'initial\n')
+      await git('add', 'backup.txt')
+      await git('commit', '-qm', 'initial')
+      await writeFile(join(cwd, 'backup.txt'), 'backup\n')
+      expect(
+        await runBackup(
+          { cwd, pushToOrigin: false },
+          {
+            gitSpawn,
+            pickCommitMessage: async () => {
+              await writeFile(join(cwd, 'foreign.txt'), 'foreign\n')
+              await git('add', 'foreign.txt')
+              return 'chore: backup'
+            },
+          },
+        ),
+      ).toEqual({ ok: true, kind: 'committed' })
+      expect(await git('show', '--format=', '--name-only', 'HEAD')).toBe('backup.txt\n')
+      expect(await git('diff', '--cached', '--name-only')).toBe('foreign.txt\n')
+    } finally {
+      await rm(cwd, { recursive: true, force: true })
+    }
+  })
+
+  test('returns clean when a foreign commit absorbs the same paths during message selection', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'autobackup-foreign-commit-'))
+    const gitSpawn = makeDefaultGitSpawn()
+    const git = async (...args: string[]) => {
+      const result = await gitSpawn(args, { cwd, timeoutMs: 30_000 })
+      expect(result.exitCode).toBe(0)
+      return result.stdout
+    }
+    try {
+      await git('init', '-q', '-b', 'main')
+      await git('config', 'user.name', 'Test')
+      await git('config', 'user.email', 'test@example.com')
+      await writeFile(join(cwd, 'backup.txt'), 'initial\n')
+      await git('add', 'backup.txt')
+      await git('commit', '-qm', 'initial')
+      await writeFile(join(cwd, 'backup.txt'), 'backup\n')
+      expect(
+        await runBackup(
+          { cwd, pushToOrigin: false },
+          {
+            gitSpawn,
+            pickCommitMessage: async () => {
+              await writeFile(join(cwd, 'foreign.txt'), 'foreign\n')
+              await git('add', 'foreign.txt')
+              await git('add', 'backup.txt')
+              await git('commit', '-qm', 'foreign change')
+              return 'chore: backup'
+            },
+          },
+        ),
+      ).toEqual({ ok: true, kind: 'clean' })
+      expect(await git('log', '-1', '--format=%s')).toBe('foreign change\n')
+      expect(await git('show', 'HEAD:backup.txt')).toBe('backup\n')
+      expect(await git('show', 'HEAD:foreign.txt')).toBe('foreign\n')
+    } finally {
+      await rm(cwd, { recursive: true, force: true })
+    }
+  })
+
+  test('preserves intervening commits and commits deleted and force-added snapshot paths', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'autobackup-snapshot-paths-'))
+    const gitSpawn = makeDefaultGitSpawn()
+    const git = async (...args: string[]) => {
+      const result = await gitSpawn(args, { cwd, timeoutMs: 30_000 })
+      expect(result.exitCode).toBe(0)
+      return result.stdout
+    }
+    try {
+      await git('init', '-q', '-b', 'main')
+      await git('config', 'user.name', 'Test')
+      await git('config', 'user.email', 'test@example.com')
+      await writeFile(join(cwd, 'removed.txt'), 'remove\n')
+      await git('add', 'removed.txt')
+      await git('commit', '-qm', 'initial')
+      await rm(join(cwd, 'removed.txt'))
+      await mkdir(join(cwd, 'sessions'))
+      await mkdir(join(cwd, 'todo'))
+      await writeFile(join(cwd, 'sessions', 'early.jsonl'), 'early\n')
+      await writeFile(join(cwd, 'todo', 'state.json'), 'state\n')
+      expect(
+        await runBackup(
+          { cwd, pushToOrigin: false },
+          {
+            gitSpawn,
+            pickCommitMessage: async () => {
+              await writeFile(join(cwd, 'foreign.txt'), 'foreign\n')
+              await git('add', 'foreign.txt')
+              await git('commit', '-qm', 'foreign change')
+              await writeFile(join(cwd, 'sessions', 'late.jsonl'), 'late\n')
+              return 'chore: backup'
+            },
+          },
+        ),
+      ).toEqual({ ok: true, kind: 'committed' })
+      expect((await git('show', '--format=', '--name-only', 'HEAD')).trim().split('\n').sort()).toEqual([
+        'removed.txt',
+        'sessions/early.jsonl',
+        'sessions/late.jsonl',
+        'todo/state.json',
+      ])
+      expect(await git('show', 'HEAD:foreign.txt')).toBe('foreign\n')
+      expect(await git('status', '--porcelain')).toBe('')
+    } finally {
+      await rm(cwd, { recursive: true, force: true })
+    }
+  })
+
+  test('commits surviving changes when an untracked force path vanishes during message selection', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'autobackup-vanished-force-'))
+    const gitSpawn = makeDefaultGitSpawn()
+    const git = async (...args: string[]) => {
+      const result = await gitSpawn(args, { cwd, timeoutMs: 30_000 })
+      expect(result.exitCode).toBe(0)
+      return result.stdout
+    }
+    try {
+      await git('init', '-q', '-b', 'main')
+      await git('config', 'user.name', 'Test')
+      await git('config', 'user.email', 'test@example.com')
+      await writeFile(join(cwd, 'other.txt'), 'initial\n')
+      await git('add', 'other.txt')
+      await git('commit', '-qm', 'initial')
+      await writeFile(join(cwd, 'other.txt'), 'changed\n')
+      await mkdir(join(cwd, 'sessions'))
+      await writeFile(join(cwd, 'sessions', 'transient.jsonl'), 'temporary\n')
+      expect(
+        await runBackup(
+          { cwd, pushToOrigin: false },
+          {
+            gitSpawn,
+            pickCommitMessage: async () => {
+              await rm(join(cwd, 'sessions', 'transient.jsonl'))
+              return 'chore: backup'
+            },
+          },
+        ),
+      ).toEqual({ ok: true, kind: 'committed' })
+      expect(await git('show', '--format=', '--name-only', 'HEAD')).toBe('other.txt\n')
+      expect(await git('show', 'HEAD:other.txt')).toBe('changed\n')
+      expect(await git('status', '--porcelain')).toBe('')
+    } finally {
+      await rm(cwd, { recursive: true, force: true })
+    }
+  })
+
+  test('commits an initial snapshot on an unborn branch', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'autobackup-unborn-'))
+    const gitSpawn = makeDefaultGitSpawn()
+    const git = async (...args: string[]) => {
+      const result = await gitSpawn(args, { cwd, timeoutMs: 30_000 })
+      expect(result.exitCode).toBe(0)
+      return result.stdout
+    }
+    try {
+      await git('init', '-q', '-b', 'main')
+      await git('config', 'user.name', 'Test')
+      await git('config', 'user.email', 'test@example.com')
+      await writeFile(join(cwd, 'first.txt'), 'first\n')
+      expect(await runBackup({ cwd, pushToOrigin: false }, baseDeps(gitSpawn))).toEqual({
+        ok: true,
+        kind: 'committed',
+      })
+      expect(await git('show', 'HEAD:first.txt')).toBe('first\n')
+    } finally {
+      await rm(cwd, { recursive: true, force: true })
+    }
+  })
+
+  test('commits remaining paths when another writer commits a selected deletion', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'autobackup-deletion-race-'))
+    const gitSpawn = makeDefaultGitSpawn()
+    const git = async (...args: string[]) => {
+      const result = await gitSpawn(args, { cwd, timeoutMs: 30_000 })
+      expect(result.exitCode).toBe(0)
+      return result.stdout
+    }
+    try {
+      await git('init', '-q', '-b', 'main')
+      await git('config', 'user.name', 'Test')
+      await git('config', 'user.email', 'test@example.com')
+      await writeFile(join(cwd, 'deleted.txt'), 'original\n')
+      await writeFile(join(cwd, 'other.txt'), 'original\n')
+      await git('add', 'deleted.txt', 'other.txt')
+      await git('commit', '-qm', 'initial')
+      await rm(join(cwd, 'deleted.txt'))
+      await writeFile(join(cwd, 'other.txt'), 'changed\n')
+      expect(
+        await runBackup(
+          { cwd, pushToOrigin: false },
+          {
+            gitSpawn,
+            pickCommitMessage: async () => {
+              await git('add', '--', 'deleted.txt')
+              await git('commit', '-qm', 'foreign deletion')
+              return 'chore: backup'
+            },
+          },
+        ),
+      ).toEqual({ ok: true, kind: 'committed' })
+      expect(await git('show', '--format=', '--name-only', 'HEAD')).toBe('other.txt\n')
+      expect(await git('show', 'HEAD:other.txt')).toBe('changed\n')
+      expect(await git('status', '--porcelain')).toBe('')
+    } finally {
+      await rm(cwd, { recursive: true, force: true })
+    }
+  })
+
+  test('returns clean when a foreign commit consumes the only deletion', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'autobackup-only-deletion-'))
+    const gitSpawn = makeDefaultGitSpawn()
+    const git = async (...args: string[]) => {
+      const result = await gitSpawn(args, { cwd, timeoutMs: 30_000 })
+      expect(result.exitCode).toBe(0)
+      return result.stdout
+    }
+    try {
+      await git('init', '-q', '-b', 'main')
+      await git('config', 'user.name', 'Test')
+      await git('config', 'user.email', 'test@example.com')
+      await writeFile(join(cwd, 'deleted.txt'), 'original\n')
+      await git('add', 'deleted.txt')
+      await git('commit', '-qm', 'initial')
+      await rm(join(cwd, 'deleted.txt'))
+      expect(
+        await runBackup(
+          { cwd, pushToOrigin: false },
+          {
+            gitSpawn,
+            pickCommitMessage: async () => {
+              await git('add', '--', 'deleted.txt')
+              await git('commit', '-qm', 'foreign deletion')
+              return 'chore: backup'
+            },
+          },
+        ),
+      ).toEqual({ ok: true, kind: 'clean' })
+      expect(await git('log', '-1', '--format=%s')).toBe('foreign deletion\n')
+    } finally {
+      await rm(cwd, { recursive: true, force: true })
+    }
+  })
+
+  test('commits an ignored path already staged by another writer', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'autobackup-index-ignored-'))
+    const gitSpawn = makeDefaultGitSpawn()
+    const git = async (...args: string[]) => {
+      const result = await gitSpawn(args, { cwd, timeoutMs: 30_000 })
+      expect(result.exitCode).toBe(0)
+      return result.stdout
+    }
+    try {
+      await git('init', '-q', '-b', 'main')
+      await git('config', 'user.name', 'Test')
+      await git('config', 'user.email', 'test@example.com')
+      await writeFile(join(cwd, '.gitignore'), '*.txt\nsessions/\n')
+      await git('add', '.gitignore')
+      await git('commit', '-qm', 'initial')
+      await writeFile(join(cwd, 'new.txt'), 'selected\n')
+      await mkdir(join(cwd, 'sessions'))
+      await writeFile(join(cwd, 'sessions', 'selected.jsonl'), 'session\n')
+      await git('add', '-f', '--', 'new.txt', 'sessions/selected.jsonl')
+      expect(await runBackup({ cwd, pushToOrigin: false }, baseDeps(gitSpawn))).toEqual({
+        ok: true,
+        kind: 'committed',
+      })
+      expect((await git('show', '--format=', '--name-only', 'HEAD')).trim().split('\n')).toEqual([
+        'new.txt',
+        'sessions/selected.jsonl',
+      ])
+      expect(await git('status', '--porcelain')).toBe('')
+    } finally {
+      await rm(cwd, { recursive: true, force: true })
+    }
+  })
+
+  test('clears a removed index-only addition while committing another change', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'autobackup-index-only-'))
+    const gitSpawn = makeDefaultGitSpawn()
+    const git = async (...args: string[]) => {
+      const result = await gitSpawn(args, { cwd, timeoutMs: 30_000 })
+      expect(result.exitCode).toBe(0)
+      return result.stdout
+    }
+    try {
+      await git('init', '-q', '-b', 'main')
+      await git('config', 'user.name', 'Test')
+      await git('config', 'user.email', 'test@example.com')
+      await writeFile(join(cwd, 'other.txt'), 'original\n')
+      await git('add', 'other.txt')
+      await git('commit', '-qm', 'initial')
+      await writeFile(join(cwd, 'gone.txt'), 'temporary\n')
+      await git('add', 'gone.txt')
+      await rm(join(cwd, 'gone.txt'))
+      await writeFile(join(cwd, 'other.txt'), 'changed\n')
+      expect(await runBackup({ cwd, pushToOrigin: false }, baseDeps(gitSpawn))).toEqual({
+        ok: true,
+        kind: 'committed',
+      })
+      expect(await git('show', '--format=', '--name-only', 'HEAD')).toBe('other.txt\n')
+      expect(await git('status', '--porcelain')).toBe('')
+    } finally {
+      await rm(cwd, { recursive: true, force: true })
+    }
+  })
+
+  test('leaves a vanished memory addition and its staged blob untouched', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'autobackup-owned-index-'))
+    const gitSpawn = makeDefaultGitSpawn()
+    const git = async (...args: string[]) => {
+      const result = await gitSpawn(args, { cwd, timeoutMs: 30_000 })
+      expect(result.exitCode).toBe(0)
+      return result.stdout
+    }
+    try {
+      await git('init', '-q', '-b', 'main')
+      await git('config', 'user.name', 'Test')
+      await git('config', 'user.email', 'test@example.com')
+      await writeFile(join(cwd, 'initial'), 'initial\n')
+      await git('add', 'initial')
+      await git('commit', '-qm', 'initial')
+      await mkdir(join(cwd, 'memory'))
+      await writeFile(join(cwd, 'memory', 'gone'), 'keep staged\n')
+      await git('add', 'memory/gone')
+      await rm(join(cwd, 'memory', 'gone'))
+      const staged = await git('ls-files', '--stage', '--', 'memory/gone')
+      expect(staged).toContain('memory/gone')
+      expect(await runBackup({ cwd, pushToOrigin: false }, baseDeps(gitSpawn))).toEqual({
+        ok: true,
+        kind: 'clean',
+      })
+      expect(await git('ls-files', '--stage', '--', 'memory/gone')).toBe(staged)
+      expect(await git('show', ':memory/gone')).toBe('keep staged\n')
+    } finally {
+      await rm(cwd, { recursive: true, force: true })
+    }
+  })
+
+  test('clears a removed intent-to-add while committing another change', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'autobackup-intent-only-'))
+    const gitSpawn = makeDefaultGitSpawn()
+    const git = async (...args: string[]) => {
+      const result = await gitSpawn(args, { cwd, timeoutMs: 30_000 })
+      expect(result.exitCode).toBe(0)
+      return result.stdout
+    }
+    try {
+      await git('init', '-q', '-b', 'main')
+      await git('config', 'user.name', 'Test')
+      await git('config', 'user.email', 'test@example.com')
+      await writeFile(join(cwd, 'other.txt'), 'original\n')
+      await git('add', 'other.txt')
+      await git('commit', '-qm', 'initial')
+      await writeFile(join(cwd, 'gone.txt'), 'temporary\n')
+      await git('add', '-N', 'gone.txt')
+      await rm(join(cwd, 'gone.txt'))
+      await writeFile(join(cwd, 'other.txt'), 'changed\n')
+      expect(await runBackup({ cwd, pushToOrigin: false }, baseDeps(gitSpawn))).toEqual({
+        ok: true,
+        kind: 'committed',
+      })
+      expect(await git('show', '--format=', '--name-only', 'HEAD')).toBe('other.txt\n')
+      expect(await git('status', '--porcelain')).toBe('')
+    } finally {
+      await rm(cwd, { recursive: true, force: true })
+    }
+  })
+
   test('returns no-repo when .git is missing', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'autobackup-norepo-'))
     const { spawn, calls } = makeSpawn(() => okResult())
@@ -150,126 +533,9 @@ describe('runBackup', () => {
     const result = await runBackup({ cwd, pushToOrigin: true }, deps)
 
     expect(result).toEqual({ ok: true, kind: 'committed' })
-    const addCall = calls.find((c) => c.args[0] === 'add' && c.args[1] === '--')
-    expect(addCall?.args).toEqual(['add', '--', 'src/foo.ts'])
-    const forceAdd = calls.find((c) => c.args[0] === 'add' && c.args[1] === '-f')
-    expect(forceAdd).toBeUndefined()
-  })
-
-  test('force-adds sessions/ paths alongside normal staging', async () => {
-    const cwd = await makeRepo()
-    await mkdir(join(cwd, 'sessions'))
-    await writeFile(join(cwd, 'sessions', 'a.jsonl'), '{}')
-    const status = '?? sessions/a.jsonl\n M src/foo.ts\n'
-    const { spawn, calls } = makeSpawn((args) => {
-      if (args[0] === 'status') return okResult(status)
-      if (args[0] === 'add' && args[1] === '--') return okResult()
-      if (args[0] === 'add' && args[1] === '-f') return okResult()
-      if (args[0] === 'diff' && args[2] === '--quiet') return failResult('', 1)
-      if (args[0] === 'diff' && args[2] === '--stat') return okResult('foo.ts | 1 +')
-      if (args[0] === 'commit') return okResult()
-      if (args[0] === 'rev-parse') return failResult('no upstream', 128)
-      return okResult()
-    })
-    const result = await runBackup({ cwd, pushToOrigin: true }, baseDeps(spawn))
-    expect(result).toEqual({ ok: true, kind: 'committed' })
-    const addF = calls.find((c) => c.args[0] === 'add' && c.args[1] === '-f')
-    expect(addF?.args).toEqual(['add', '-f', '--', 'sessions/a.jsonl'])
-  })
-
-  test('force-adds todo/ paths so continuation state survives across restarts', async () => {
-    const cwd = await makeRepo()
-    await mkdir(join(cwd, 'todo'))
-    await writeFile(join(cwd, 'todo', 'tui.json'), '{}')
-    const status = '?? todo/tui.json\n M src/foo.ts\n'
-    const { spawn, calls } = makeSpawn((args) => {
-      if (args[0] === 'status') return okResult(status)
-      if (args[0] === 'add' && args[1] === '--') return okResult()
-      if (args[0] === 'add' && args[1] === '-f') return okResult()
-      if (args[0] === 'diff' && args[2] === '--quiet') return failResult('', 1)
-      if (args[0] === 'diff' && args[2] === '--stat') return okResult('foo.ts | 1 +')
-      if (args[0] === 'commit') return okResult()
-      if (args[0] === 'rev-parse') return failResult('no upstream', 128)
-      return okResult()
-    })
-    const result = await runBackup({ cwd, pushToOrigin: true }, baseDeps(spawn))
-    expect(result).toEqual({ ok: true, kind: 'committed' })
-    const addF = calls.find((c) => c.args[0] === 'add' && c.args[1] === '-f')
-    expect(addF?.args).toEqual(['add', '-f', '--', 'todo/tui.json'])
-  })
-
-  test('re-stages sessions/ paths that appeared during pickCommitMessage', async () => {
-    // given: pickCommitMessage simulates spawning a `backup-message` subagent
-    // that writes a NEW session JSONL into sessions/ after the initial status.
-    // The runner must capture that file with a second force-add pass; otherwise
-    // it sits dirty until the next backup cycle and creates a steady-state of
-    // one-cycle-behind orphan commits.
-    const cwd = await makeRepo()
-    await mkdir(join(cwd, 'sessions'))
-    await writeFile(join(cwd, 'sessions', 'pre.jsonl'), '{}')
-    await mkdir(join(cwd, 'todo'))
-
-    const firstStatus = '?? sessions/pre.jsonl\n M src/foo.ts\n'
-    const secondStatus = '?? sessions/pre.jsonl\n?? sessions/late.jsonl\n?? todo/late.json\n M src/foo.ts\n'
-    let statusCalls = 0
-    let messagePicked = false
-
-    const { spawn, calls } = makeSpawn((args) => {
-      if (args[0] === 'status') {
-        statusCalls += 1
-        return okResult(statusCalls === 1 ? firstStatus : secondStatus)
-      }
-      if (args[0] === 'add' && args[1] === '--') return okResult()
-      if (args[0] === 'add' && args[1] === '-f') return okResult()
-      if (args[0] === 'diff' && args[2] === '--quiet') return failResult('', 1)
-      if (args[0] === 'diff' && args[2] === '--stat') return okResult('foo.ts | 1 +')
-      if (args[0] === 'commit') return okResult()
-      if (args[0] === 'rev-parse') return failResult('no upstream', 128)
-      return okResult()
-    })
-
-    const deps: BackupRunnerDeps = {
-      gitSpawn: spawn,
-      pickCommitMessage: async () => {
-        // when: simulate the late file appearing during message synthesis
-        await writeFile(join(cwd, 'sessions', 'late.jsonl'), '{}')
-        await writeFile(join(cwd, 'todo', 'late.json'), '{}')
-        messagePicked = true
-        return 'chore: backup'
-      },
-    }
-
-    // when
-    const result = await runBackup({ cwd, pushToOrigin: true }, deps)
-
-    // then: backup completes, AND the late sessions/ file was force-added
-    expect(messagePicked).toBe(true)
-    expect(result).toEqual({ ok: true, kind: 'committed' })
-
-    const addFCalls = calls.filter((c) => c.args[0] === 'add' && c.args[1] === '-f')
-    expect(addFCalls).toHaveLength(2)
-    // first add-f stages the pre-existing file (from the initial status)
-    expect(addFCalls[0]?.args).toEqual(['add', '-f', '--', 'sessions/pre.jsonl'])
-    // second add-f (post-message) captures BOTH the pre-existing file and the
-    // late one. We don't care about ordering, only that both paths are present.
-    const lateAddPaths = addFCalls[1]?.args.slice(3) ?? []
-    expect(lateAddPaths).toContain('sessions/late.jsonl')
-    expect(lateAddPaths).toContain('sessions/pre.jsonl')
-    expect(lateAddPaths).not.toContain('todo/late.json')
-
-    // and: there are exactly TWO status calls — one before staging, one after
-    // pickCommitMessage returns. Asserting the count keeps a future "optimize"
-    // pass from collapsing them back into one and reintroducing the bug.
-    expect(statusCalls).toBe(2)
-
-    // and: the second status happened AFTER pickCommitMessage returned.
-    // The relative ordering of git calls captures the load-bearing sequence.
-    const statusIndices = calls.flatMap((c, i) => (c.args[0] === 'status' ? [i] : []))
-    const addFIndices = calls.flatMap((c, i) => (c.args[0] === 'add' && c.args[1] === '-f' ? [i] : []))
-    const commitIdx = calls.findIndex((c) => c.args[0] === 'commit')
-    expect(statusIndices[1]).toBeGreaterThan(addFIndices[0]!)
-    expect(addFIndices[1]).toBeGreaterThan(statusIndices[1]!)
-    expect(commitIdx).toBeGreaterThan(addFIndices[1]!)
+    const addCall = calls.find((c) => c.args[0] === 'add')
+    expect(addCall?.args).toEqual(['add', '-f', '--', 'src/foo.ts'])
+    expect(calls.some((c) => c.args.includes('memory/2026-04-27.md'))).toBe(false)
   })
 
   test('no upstream but origin exists and HEAD is a branch: pushes with -u and sets tracking', async () => {
@@ -392,7 +658,7 @@ describe('runBackup', () => {
       if (networkCmds.has(c.args[0] as string)) {
         expect(c.env).toEqual(pushEnv)
       } else {
-        expect(c.env).toBeUndefined()
+        expect(c.env?.TYPECLAW_GIT_TOKEN).toBeUndefined()
       }
     }
     // sanity: the hook-executing commands actually ran in this scenario
@@ -508,7 +774,7 @@ describe('runBackup', () => {
       if (args[0] === 'status') return okResult(' M foo\n')
       if (args[0] === 'diff' && args[2] === '--quiet') return failResult('', 1)
       if (args[0] === 'commit') {
-        captured = args[2] ?? ''
+        captured = args[args.indexOf('-m') + 1] ?? ''
         return okResult()
       }
       if (args[0] === 'rev-parse') return failResult('no upstream', 128)
@@ -526,7 +792,7 @@ describe('runBackup', () => {
       if (args[0] === 'status') return okResult(' M foo\n')
       if (args[0] === 'diff' && args[2] === '--quiet') return failResult('', 1)
       if (args[0] === 'commit') {
-        captured = args[2] ?? ''
+        captured = args[args.indexOf('-m') + 1] ?? ''
         return okResult()
       }
       if (args[0] === 'rev-parse') return failResult('no upstream', 128)
@@ -546,52 +812,6 @@ describe('runBackup', () => {
 
     expect(result).toEqual({ ok: true, kind: 'clean' })
     expect(calls.some((call) => call.args[0] === 'add')).toBe(false)
-  })
-
-  test('retries a failed explicit add once after an initial untracked path vanishes without widening scope', async () => {
-    const cwd = await makeRepo()
-    await writeFile(join(cwd, 'transient.txt'), 'temporary')
-    let statuses = 0
-    let adds = 0
-    let promptStatus = ''
-    const { spawn, calls } = makeSpawn((args) => {
-      if (args[0] === 'status') {
-        statuses += 1
-        return okResult(statuses === 1 ? '?? transient.txt\0 M tracked.txt\0' : ' M tracked.txt\0?? later.txt\0')
-      }
-
-      if (args[0] === 'add' && args[1] === '--') {
-        adds += 1
-        if (adds === 1) {
-          rmSync(join(cwd, 'transient.txt'))
-          return failResult('pathspec did not match')
-        }
-        return okResult()
-      }
-      if (args[0] === 'diff' && args[2] === '--quiet') return failResult('', 1)
-      if (args[0] === 'diff' && args[2] === '--stat') return okResult()
-      if (args[0] === 'commit') return okResult()
-      return okResult()
-    })
-
-    const result = await runBackup(
-      { cwd, pushToOrigin: false },
-      {
-        gitSpawn: spawn,
-        pickCommitMessage: async ({ status }) => {
-          promptStatus = status
-          return 'chore: test'
-        },
-      },
-    )
-
-    expect(result).toEqual({ ok: true, kind: 'committed' })
-    const ordinaryAdds = calls.filter((call) => call.args[0] === 'add' && call.args[1] === '--')
-    expect(ordinaryAdds).toHaveLength(2)
-    expect(ordinaryAdds[1]?.args).toEqual(['add', '--', 'tracked.txt'])
-    expect(ordinaryAdds[1]?.args).not.toContain('later.txt')
-    expect(calls.filter((call) => call.args[0] === 'status').every((call) => call.args.includes('-z'))).toBe(true)
-    expect(promptStatus).not.toContain('\0')
   })
 
   test('keeps a dangling untracked symlink stageable while dropping a path that vanishes after the status snapshot', async () => {
@@ -618,9 +838,10 @@ describe('runBackup', () => {
         { cwd, pushToOrigin: false },
         {
           gitSpawn: async (args, opts) => {
-            if (removeBeforeFirstAdd && args[0] === 'add' && args[1] === '--') {
+            if (removeBeforeFirstAdd && args[0] === 'add' && args[1] === '-f' && args.includes('transient.txt')) {
               removeBeforeFirstAdd = false
               await rm(join(cwd, 'transient.txt'))
+              await writeFile(join(cwd, 'later.txt'), 'later\n')
             }
             return realGit(args, opts)
           },
@@ -633,6 +854,7 @@ describe('runBackup', () => {
       expect(tree.stdout).toContain('120000 blob')
       expect(tree.stdout).toContain('\tdangling-link\n')
       expect(tree.stdout).not.toContain('transient.txt')
+      expect(tree.stdout).not.toContain('later.txt')
     } finally {
       await rm(cwd, { recursive: true, force: true })
     }
@@ -649,13 +871,20 @@ describe('runBackup', () => {
     })
 
     expect(await runBackup({ cwd, pushToOrigin: false }, baseDeps(spawn))).toEqual({ ok: true, kind: 'committed' })
-    expect(calls.find((call) => call.args[0] === 'add')?.args).toEqual(['add', '--', 'renamed.txt', 'original.txt'])
+    expect(calls.find((call) => call.args[0] === 'add')?.args).toEqual([
+      'add',
+      '-f',
+      '--',
+      'renamed.txt',
+      'original.txt',
+    ])
   })
 
   test('stages a tracked deletion even when its path is absent', async () => {
     const cwd = await makeRepo()
     const { spawn, calls } = makeSpawn((args) => {
       if (args[0] === 'status') return okResult(' D removed.txt\0')
+      if (args[0] === 'ls-tree') return okResult('removed.txt\0')
       if (args[0] === 'diff' && args[2] === '--quiet') return failResult('', 1)
       if (args[0] === 'diff' && args[2] === '--stat') return okResult()
       if (args[0] === 'commit') return okResult()
@@ -663,13 +892,14 @@ describe('runBackup', () => {
     })
 
     expect(await runBackup({ cwd, pushToOrigin: false }, baseDeps(spawn))).toEqual({ ok: true, kind: 'committed' })
-    expect(calls.find((call) => call.args[0] === 'add')?.args).toEqual(['add', '--', 'removed.txt'])
+    expect(calls.find((call) => call.args[0] === 'add')?.args).toEqual(['add', '-f', '--', 'removed.txt'])
   })
 
   test('stages a tracked force-path deletion through the ordinary snapshot', async () => {
     const cwd = await makeRepo()
     const { spawn, calls } = makeSpawn((args) => {
       if (args[0] === 'status') return okResult(' D sessions/removed.jsonl\0')
+      if (args[0] === 'ls-tree') return okResult('sessions/removed.jsonl\0')
       if (args[0] === 'diff' && args[2] === '--quiet') return failResult('', 1)
       if (args[0] === 'diff' && args[2] === '--stat') return okResult()
       if (args[0] === 'commit') return okResult()
@@ -677,15 +907,14 @@ describe('runBackup', () => {
     })
 
     expect(await runBackup({ cwd, pushToOrigin: false }, baseDeps(spawn))).toEqual({ ok: true, kind: 'committed' })
-    expect(calls.find((call) => call.args[0] === 'add')?.args).toEqual(['add', '--', 'sessions/removed.jsonl'])
-    expect(calls.some((call) => call.args[0] === 'add' && call.args[1] === '-f')).toBe(false)
+    expect(calls.find((call) => call.args[0] === 'add')?.args).toEqual(['add', '-f', '--', 'sessions/removed.jsonl'])
   })
 
-  test('surfaces an unchanged explicit-add failure without retrying', async () => {
+  test('reports a failed explicit add without masking its cause', async () => {
     const cwd = await makeRepo()
     await writeFile(join(cwd, 'still-here.txt'), 'present')
     let statuses = 0
-    const { spawn, calls } = makeSpawn((args) => {
+    const { spawn } = makeSpawn((args) => {
       if (args[0] === 'status') {
         statuses += 1
         return okResult('?? still-here.txt\0')
@@ -698,7 +927,6 @@ describe('runBackup', () => {
 
     expect(result).toEqual({ ok: false, kind: 'commit-failed', reason: 'git add failed: permission denied' })
     expect(statuses).toBe(2)
-    expect(calls.filter((call) => call.args[0] === 'add')).toHaveLength(1)
   })
 
   test('surfaces the retry failure after one reconciliation attempt', async () => {
@@ -706,7 +934,7 @@ describe('runBackup', () => {
     await writeFile(join(cwd, 'vanishing.txt'), 'present')
     let statuses = 0
     let adds = 0
-    const { spawn, calls } = makeSpawn((args) => {
+    const { spawn } = makeSpawn((args) => {
       if (args[0] === 'status') {
         statuses += 1
         return okResult(statuses === 1 ? '?? vanishing.txt\0 M tracked.txt\0' : ' M tracked.txt\0')
@@ -727,7 +955,6 @@ describe('runBackup', () => {
       kind: 'commit-failed',
       reason: 'git add failed: retry failure',
     })
-    expect(calls.filter((call) => call.args[0] === 'add')).toHaveLength(2)
   })
 })
 

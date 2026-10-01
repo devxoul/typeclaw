@@ -1,4 +1,6 @@
 import { lstatSync } from 'node:fs'
+import { mkdtemp, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { hooklessGitArgs } from '@/git/hookless'
@@ -100,78 +102,147 @@ export async function runBackup(options: BackupRunnerOptions, deps: BackupRunner
     timeoutMs: COMMIT_TIMEOUT_MS,
   })
   if (status.exitCode !== 0) return { ok: false, kind: 'aborted', reason: `git status failed: ${shortErr(status)}` }
-  const snapshot = selectStagingSnapshot(parsePorcelain(status.stdout), cwd)
+  const entries = parsePorcelain(status.stdout)
+  // Only index-known, absent worktree paths that were NEVER in HEAD are
+  // stale additions (including removed intent-to-add entries). A tracked
+  // deletion still in HEAD is backup work; memory/ belongs to another writer.
+  const missing = uniquePaths(
+    entries
+      .filter((entry) => entry.kind === 'tracked' && (entry.status[0] === 'A' || entry.status[1] === 'D'))
+      .flatMap((entry) => entry.paths)
+      .filter((path) => !isAgentOwned(path) && !hasDirectoryEntry(join(cwd, path))),
+  )
+  const head =
+    missing.length > 0
+      ? await deps.gitSpawn([...repo.gitArgs, 'ls-tree', '-r', '--name-only', '-z', 'HEAD', '--', ...missing], {
+          cwd,
+          timeoutMs: COMMIT_TIMEOUT_MS,
+        })
+      : { exitCode: 0, stdout: '', stderr: '', timedOut: false }
+  if (head.exitCode !== 0) {
+    const exists = await deps.gitSpawn([...repo.gitArgs, 'rev-parse', '--verify', 'HEAD'], {
+      cwd,
+      timeoutMs: COMMIT_TIMEOUT_MS,
+    })
+    if (exists.exitCode === 0)
+      return { ok: false, kind: 'commit-failed', reason: `git ls-tree failed: ${shortErr(head)}` }
+  }
+  const headPaths = new Set(head.stdout.split('\0'))
+  const missingAdds = missing.filter((path) => !headPaths.has(path))
+  if (missingAdds.length > 0) {
+    const removed = await deps.gitSpawn([...repo.gitArgs, 'add', '-u', '--', ...missingAdds], {
+      cwd,
+      timeoutMs: COMMIT_TIMEOUT_MS,
+    })
+    if (removed.exitCode !== 0)
+      return { ok: false, kind: 'commit-failed', reason: `git add -u failed: ${shortErr(removed)}` }
+  }
+  const removedPaths = new Set(missingAdds)
+  const snapshot = selectStagingSnapshot(
+    entries.filter((entry) => !entry.paths.every((path) => removedPaths.has(path))),
+    cwd,
+  )
   if (snapshot.paths.length === 0 && snapshot.forcePaths.length === 0) return { ok: true, kind: 'clean' }
 
-  if (snapshot.paths.length > 0) {
-    const add = await deps.gitSpawn([...repo.gitArgs, 'add', '--', ...snapshot.paths], {
-      cwd,
-      timeoutMs: COMMIT_TIMEOUT_MS,
-    })
-    if (add.exitCode !== 0) {
-      const retry = await retryAfterVanishedUntracked(cwd, deps, repo, snapshot)
-      if (!retry || retry.exitCode !== 0) {
-        return { ok: false, kind: 'commit-failed', reason: `git add failed: ${shortErr(retry ?? add)}` }
+  // Keep the staged snapshot out of the shared index while the message subagent
+  // runs. Other writers may commit the entire shared index during that window.
+  const indexDir = await mkdtemp(join(tmpdir(), 'typeclaw-backup-index-'))
+  const indexEnv = { GIT_INDEX_FILE: join(indexDir, 'index') }
+  const privateGit = (args: string[]) =>
+    deps.gitSpawn([...repo.gitArgs, ...args], { cwd, timeoutMs: COMMIT_TIMEOUT_MS, env: indexEnv })
+  const readHead = async (): Promise<GitSpawnResult> => {
+    const result = await privateGit(['read-tree', 'HEAD'])
+    if (result.exitCode === 0) return result
+    const head = await privateGit(['rev-parse', '--verify', 'HEAD'])
+    return head.exitCode === 0 ? result : privateGit(['read-tree', '--empty'])
+  }
+  const stageSnapshot = async (paths: string[], forcePaths: string[]): Promise<GitSpawnResult | undefined> => {
+    if (paths.length > 0) {
+      const add = await privateGit(['add', '-f', '--', ...paths])
+      if (add.exitCode !== 0) {
+        const retry = await retryAfterVanishedUntracked(cwd, deps, repo, snapshot, indexEnv, true)
+        if (!retry || retry.exitCode !== 0) return retry ?? add
       }
     }
+    if (forcePaths.length > 0) {
+      const add = await privateGit(['add', '-f', '--', ...forcePaths])
+      if (add.exitCode !== 0) return add
+    }
+    return undefined
   }
-  if (snapshot.forcePaths.length > 0) {
-    const addF = await deps.gitSpawn([...repo.gitArgs, 'add', '-f', '--', ...snapshot.forcePaths], {
+  try {
+    const init = await readHead()
+    if (init.exitCode !== 0)
+      return { ok: false, kind: 'commit-failed', reason: `git read-tree failed: ${shortErr(init)}` }
+    const staged = await stageSnapshot(snapshot.paths, snapshot.forcePaths)
+    if (staged) return { ok: false, kind: 'commit-failed', reason: `git add failed: ${shortErr(staged)}` }
+
+    const stagedCheck = await privateGit(['diff', '--cached', '--quiet'])
+    if (stagedCheck.exitCode === 0) return { ok: true, kind: 'clean' }
+    if (stagedCheck.exitCode !== 1)
+      return { ok: false, kind: 'commit-failed', reason: `git diff failed: ${shortErr(stagedCheck)}` }
+
+    const diffstat = await privateGit(['diff', '--cached', '--stat'])
+    const message = await deps.pickCommitMessage({
+      status: status.stdout.replaceAll('\0', '\n').slice(0, 4096),
+      diffstat: diffstat.stdout.slice(0, 4096),
+    })
+
+    // The message subagent may create a sessions/ path after the first snapshot.
+    // Re-read only for those paths; other new work must wait for the next pass.
+    const reStatus = await deps.gitSpawn([...repo.gitArgs, 'status', '--porcelain=v1', '-z', '--untracked-files=all'], {
       cwd,
       timeoutMs: COMMIT_TIMEOUT_MS,
     })
-    if (addF.exitCode !== 0) {
-      return { ok: false, kind: 'commit-failed', reason: `git add -f failed: ${shortErr(addF)}` }
-    }
-  }
+    const lateEntries = reStatus.exitCode === 0 ? parsePorcelain(reStatus.stdout) : []
+    const lateForce = selectForcePaths(lateEntries, cwd, ['sessions/'])
+    const selected = uniquePaths([...snapshot.paths, ...snapshot.forcePaths, ...lateForce]).filter(
+      (path) => !snapshot.untrackedPaths.has(path) || hasDirectoryEntry(join(cwd, path)),
+    )
+    const selectedSet = new Set(selected)
+    // Porcelain still reports tracked deletions not yet committed by another
+    // writer; absent paths no longer reported after the message window were
+    // already committed and cannot be passed to git commit --only.
+    const reported = new Set((reStatus.exitCode === 0 ? lateEntries : entries).flatMap((entry) => entry.paths))
+    const paths = selected.filter((path) => hasDirectoryEntry(join(cwd, path)) || reported.has(path))
+    if (paths.length === 0) return { ok: true, kind: 'clean' }
 
-  const stagedCheck = await deps.gitSpawn([...repo.gitArgs, 'diff', '--cached', '--quiet'], {
-    cwd,
-    timeoutMs: COMMIT_TIMEOUT_MS,
-  })
-  if (stagedCheck.exitCode === 0) return { ok: true, kind: 'clean' }
-
-  const diffstat = await deps.gitSpawn([...repo.gitArgs, 'diff', '--cached', '--stat'], {
-    cwd,
-    timeoutMs: COMMIT_TIMEOUT_MS,
-  })
-  const message = await deps.pickCommitMessage({
-    status: status.stdout.replaceAll('\0', '\n').slice(0, 4096),
-    diffstat: diffstat.stdout.slice(0, 4096),
-  })
-
-  // `pickCommitMessage` may spawn a subagent (the backup plugin's
-  // `backup-message`) whose session JSONL lands under `sessions/` after we
-  // already staged. Without this second pass that file would sit dirty in
-  // the worktree until the NEXT backup cycle, which would then commit it
-  // and create another orphan via the same path — a steady-state of
-  // one-cycle-behind churn. Re-status, filter to `sessions/` additions
-  // only (don't accidentally stage user work that arrived during the
-  // window), and force-add anything new.
-  const reStatus = await deps.gitSpawn([...repo.gitArgs, 'status', '--porcelain=v1', '-z', '--untracked-files=all'], {
-    cwd,
-    timeoutMs: COMMIT_TIMEOUT_MS,
-  })
-  if (reStatus.exitCode === 0) {
-    const lateForce = selectForcePaths(parsePorcelain(reStatus.stdout), cwd, ['sessions/'])
-    if (lateForce.length > 0) {
-      const lateAdd = await deps.gitSpawn([...repo.gitArgs, 'add', '-f', '--', ...lateForce], {
+    // --only constructs Git's own temporary index from the current HEAD and
+    // refreshes the real index for just these paths. Only previously untracked
+    // paths need intent-to-add entries in the real index for pathspec matching.
+    const candidates = uniquePaths(
+      [...entries, ...lateEntries]
+        .filter((entry) => entry.kind === 'untracked')
+        .flatMap((entry) => entry.paths)
+        .filter((path) => selectedSet.has(path) && hasDirectoryEntry(join(cwd, path))),
+    )
+    if (candidates.length > 0) {
+      const intent = await deps.gitSpawn([...repo.gitArgs, 'add', '-N', '-f', '--', ...candidates], {
         cwd,
         timeoutMs: COMMIT_TIMEOUT_MS,
       })
-      if (lateAdd.exitCode !== 0) {
-        return { ok: false, kind: 'commit-failed', reason: `git add -f (post-message) failed: ${shortErr(lateAdd)}` }
-      }
+      if (intent.exitCode !== 0)
+        return { ok: false, kind: 'commit-failed', reason: `git add -N failed: ${shortErr(intent)}` }
     }
+    const commit = await deps.gitSpawn(
+      [...repo.gitArgs, 'commit', '--only', '-m', sanitizeCommitMessage(message), '--', ...paths],
+      {
+        cwd,
+        timeoutMs: COMMIT_TIMEOUT_MS,
+      },
+    )
+    if (commit.exitCode !== 0) {
+      // A concurrent whole-index commit may have consumed the selected paths.
+      const pending = await deps.gitSpawn([...repo.gitArgs, 'status', '--porcelain=v1', '-z', '--', ...paths], {
+        cwd,
+        timeoutMs: COMMIT_TIMEOUT_MS,
+      })
+      if (pending.exitCode === 0 && pending.stdout === '') return { ok: true, kind: 'clean' }
+      return { ok: false, kind: 'commit-failed', reason: `git commit failed: ${shortErr(commit)}` }
+    }
+  } finally {
+    await rm(indexDir, { recursive: true, force: true })
   }
-
-  const safeMessage = sanitizeCommitMessage(message)
-  const commit = await deps.gitSpawn([...repo.gitArgs, 'commit', '-m', safeMessage], {
-    cwd,
-    timeoutMs: COMMIT_TIMEOUT_MS,
-  })
-  if (commit.exitCode !== 0)
-    return { ok: false, kind: 'commit-failed', reason: `git commit failed: ${shortErr(commit)}` }
 
   if (!pushToOrigin) return { ok: true, kind: 'committed' }
 
@@ -436,6 +507,8 @@ async function retryAfterVanishedUntracked(
   deps: BackupRunnerDeps,
   repo: AgentGit,
   snapshot: StagingSnapshot,
+  env?: Record<string, string>,
+  force = false,
 ): Promise<GitSpawnResult | undefined> {
   const reread = await deps.gitSpawn([...repo.gitArgs, 'status', '--porcelain=v1', '-z', '--untracked-files=all'], {
     cwd,
@@ -455,7 +528,11 @@ async function retryAfterVanishedUntracked(
 
   const retryPaths = snapshot.paths.filter((path) => !vanished.has(path))
   if (retryPaths.length === 0) return { exitCode: 0, stdout: '', stderr: '', timedOut: false }
-  return deps.gitSpawn([...repo.gitArgs, 'add', '--', ...retryPaths], { cwd, timeoutMs: COMMIT_TIMEOUT_MS })
+  return deps.gitSpawn([...repo.gitArgs, 'add', ...(force ? ['-f'] : []), '--', ...retryPaths], {
+    cwd,
+    timeoutMs: COMMIT_TIMEOUT_MS,
+    env,
+  })
 }
 
 function selectForcePaths(
