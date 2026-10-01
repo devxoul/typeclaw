@@ -3,7 +3,7 @@
 // testable with a hand-rolled fake and does not drag in the full session type.
 export type NudgeableSession = {
   subscribe: (listener: (event: unknown) => void) => () => void
-  steer: (text: string) => Promise<void>
+  steer: (text: string) => Promise<unknown>
 }
 
 const NOT_FOUND_RE = /^Tool (.+?) not found$/

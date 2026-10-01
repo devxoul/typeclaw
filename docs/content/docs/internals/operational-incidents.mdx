@@ -8,7 +8,7 @@ The operational incident subsystem keeps mechanically reproducible TypeClaw envi
 
 ## Outcome pipeline
 
-The observation point is the existing `tool.after` path in `src/agent/plugin-tools.ts`. Pi's bash tool throws on non-zero exit, and TypeClaw already turns thrown errors into an after-hook result; the incident path extends that funnel rather than creating a second tool stack.
+The observation point is the existing `tool.after` path in `src/agent/plugin-tools.ts`. Since Pi 0.99, Pi's bash tool reports a non-zero exit as an `isError` result instead of throwing. `wrapBuiltinToolDefinition` rethrows that result as an error with the same text (`…Command exited with code N`), and TypeClaw already turns thrown errors into an after-hook result; the incident path extends that funnel rather than creating a second tool stack.
 
 1. `src/operations/classify-tool-outcome.ts` applies exact classifiers. Initial classes are bash exit 127 with an anchored `command not found` line (including bounded positive `bash: line N:` prefixes), a typed declared-skill-bin resolution error, and the permanent degraded `/proc` sandbox error. Near matches and credential-shaped executable tokens remain ordinary tool failures.
 2. `src/operations/incidents.ts` records the normalized fingerprint in `<agentDir>/.typeclaw/incidents.json`, increments the occurrence count, and maintains first/last timestamps, status, and the last session identity. An incident becomes recurrent only after the same fingerprint appears in a different session; retries in one session do not escalate it.

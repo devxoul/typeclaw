@@ -690,9 +690,17 @@ export function wrapBuiltinToolDefinition<TParams extends TSchema, TDetails = un
                     : {}),
                 }
               : undefined
-          rawResult = await bashEnvStore.run(spawnEnvContext, () =>
+          const executed = await bashEnvStore.run(spawnEnvContext, () =>
             tool.execute(toolCallId, attemptArgs as Static<TParams>, signal, onUpdate, ctx),
           )
+          // Pi 0.99 bash returns a nonzero exit as an `isError` result whose text
+          // is the message 0.87 threw (tools/bash.js). This wrapper returns only
+          // content/details, so rethrow to keep the failure on the error path
+          // (remediation, incident repair, sandbox note, model-facing isError).
+          if (executed.isError === true) {
+            throw new Error(executed.content.map((part) => (part.type === 'text' ? part.text : '')).join('\n'))
+          }
+          rawResult = executed
           const originalCommand = originalArgs.command
           sandboxedRealProcSucceeded =
             preparedSandboxRuntime !== undefined &&

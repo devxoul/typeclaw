@@ -5,8 +5,8 @@ export type LiveAgentSession = {
   sessionId: string
   session: Pick<AgentSession, 'subscribe'>
   // Surfaced by the inspect picker for sessions not yet on disk: pi-coding-agent
-  // defers the first .jsonl write until the first assistant message, so without
-  // these a mid-reply session is invisible. Optional so subscribe-only test
+  // defers the first .jsonl write until the first user message, so without
+  // these a session that has not been prompted yet is invisible. Optional so subscribe-only test
   // harnesses can still register `{ sessionId, session }`; live-listing skips
   // entries lacking an origin.
   origin?: MinimalSessionOrigin
