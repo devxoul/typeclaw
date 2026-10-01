@@ -57,6 +57,7 @@ import {
   zodToToolParameters,
 } from './plugin-tools'
 import { PROACTIVE_NEXT_STEP_NUDGE } from './proactive-next-step-nudge'
+import { wrapTransformContextWithLocalFailureMarker } from './provider-error'
 import { createReloadTool } from './reload-tool'
 import type { RestartHandoffOrigin } from './restart-handoff'
 import type { SubagentBashPolicy } from './reviewer-bash-policy'
@@ -575,6 +576,14 @@ export async function createSessionWithDispose(options: CreateSessionOptions = {
       return converted
     }
   }
+
+  // pi turns a throw from context preparation into the same `stopReason:'error'`
+  // message a provider failure produces, with only the error text kept, so the
+  // origin has to be stamped where it is thrown. Installed last so it is the
+  // outermost layer over pi's extension `context` pass (which clones the
+  // messages) and its forced-prompt projection. getApiKey and streamFunction
+  // stay unwrapped: their failures can be genuine provider/auth failures.
+  session.agent.transformContext = wrapTransformContextWithLocalFailureMarker(session.agent.transformContext)
 
   abortHolder.abort = (reason?: string) => {
     if (reason !== undefined) abortHolder.reason = reason

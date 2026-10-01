@@ -39,10 +39,12 @@ export type ContinuationEpisode = {
 // The outcome of the most recently completed turn, recorded from the
 // `message_end` subscription (authoritative) or a prompt `finally` fallback.
 // `stopReason: 'unknown'` is the fail-closed value: an idle that sees it does
-// not auto-inject. `'length'` is a budget truncation (the turn ran out of
-// output tokens, often mid-thinking) — a legitimate unfinished turn that the
-// continuation budget/stagnation guards are designed to bound, so it is
-// continuation-eligible, NOT fail-closed.
+// not auto-inject. `'error'` also fails closed: the turn's final assistant
+// message failed (provider error or runtime fault), and re-nudging it would
+// only repeat the failed request. `'length'` is a budget truncation (the turn
+// ran out of output tokens, often mid-thinking) — a legitimate unfinished turn
+// that the continuation budget/stagnation guards are designed to bound, so it
+// is continuation-eligible, NOT fail-closed.
 export type TurnOutcome = {
   turnId: string
   stopReason: 'stop' | 'length' | 'aborted' | 'error' | 'unknown'
@@ -214,8 +216,14 @@ export function decideContinuation(args: {
 
   const outcome = state.lastTurnOutcome
   const isSafeTerminalReply = outcome?.termination === 'terminal-after-channel-reply'
+  // A failed final turn never auto-continues, even with terminal-reply
+  // provenance: that exception only vouches for an intentional abort after a
+  // landed reply, not for a turn whose last LLM request failed. Retries the
+  // turn already ran replace this outcome if they succeed, and the next real
+  // user turn records a fresh outcome, so this only stops runtime self-nudges.
   if (
     outcome === null ||
+    outcome.stopReason === 'error' ||
     (outcome.stopReason === 'unknown' && !isSafeTerminalReply) ||
     (outcome.stopReason === 'aborted' && !isSafeTerminalReply)
   ) {

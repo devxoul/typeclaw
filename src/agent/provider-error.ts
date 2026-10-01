@@ -24,7 +24,63 @@ export type DetectedProviderError = {
   safeMessage: string
 }
 
-const GENERIC_SAFE_NOTICE = 'The upstream LLM provider failed. Operators can check `typeclaw logs` for details.'
+// Origin-neutral on purpose: an unclassified failure may come from the
+// provider, the network, or TypeClaw itself, and the raw text alone can't say
+// which. Naming the provider here blamed it for local bugs.
+const GENERIC_SAFE_NOTICE = 'The assistant turn failed. Operators can check `typeclaw logs` for details.'
+
+// pi-agent-core turns ANY throw inside its loop into the same
+// `stopReason: 'error'` assistant message a provider failure produces, keeping
+// only `errorMessage` (agent.js handleRunFailure) — the error's name, cause and
+// throw site are dropped. So origin must be stamped into the message at the
+// throw site: `wrapTransformContextWithLocalFailureMarker` appends this marker
+// when the context-preparation step that runs before the next provider request
+// throws. It covers only that request; earlier requests in the same run may
+// have reached the provider. Anchored at the end so provider text echoed
+// mid-message can't impersonate it. System token — English by design, like
+// OBSERVER_TIMEOUT.
+const LOCAL_FAILURE_NAME = /^[A-Za-z][A-Za-z0-9_]{0,63}$/
+const LOCAL_PRE_REQUEST_FAILURE = /\(typeclaw local failure before provider request: [A-Za-z][A-Za-z0-9_]{0,63}\)$/
+
+type TransformContext = NonNullable<AgentSession['agent']['transformContext']>
+
+function readOr<T>(read: () => T, fallback: T): T {
+  try {
+    return read()
+  } catch {
+    return fallback
+  }
+}
+
+// Only an identifier-shaped `Error.name` is embedded, so a hostile or odd name
+// can't inject parentheses/newlines into the marker. The raw text stays on the
+// message for logs and operator surfaces; channels only ever see the fixed
+// LOCAL sentence, never this text. Reading a throwing getter/`toString` must
+// not replace the original failure with a new one.
+function markLocalPreRequestFailure(err: unknown): Error {
+  const isError = readOr(() => err instanceof Error, false)
+  const text = readOr(() => String(isError ? (err as Error).message : err), 'unprintable thrown value')
+  if (isError && LOCAL_PRE_REQUEST_FAILURE.test(text)) return err as Error
+  const rawName = readOr(() => (isError ? (err as Error).name : undefined), undefined)
+  const name = typeof rawName === 'string' && LOCAL_FAILURE_NAME.test(rawName) ? rawName : 'Error'
+  return new Error(`${text} (typeclaw local failure before provider request: ${name})`, { cause: err })
+}
+
+// Wraps an agent's `transformContext` (the step pi runs right before
+// `convertToLlm`/`getApiKey`/`streamFunction` on every request) so a throw from
+// it — sync or async — is re-thrown with the local-origin marker. An abort is
+// re-thrown untouched: it's a cancellation, and pi reports it as `aborted`.
+export function wrapTransformContextWithLocalFailureMarker(inner: TransformContext | undefined): TransformContext {
+  return async (messages, signal) => {
+    if (!inner) return messages
+    try {
+      return await inner(messages, signal)
+    } catch (err) {
+      if (signal?.aborted) throw err
+      throw markLocalPreRequestFailure(err)
+    }
+  }
+}
 
 // The fetch observer (`llm-fetch-observer`) aborts a stalled provider stream
 // with a message ending in this marker (TTFB / idle / overall deadline). Such a
@@ -91,8 +147,14 @@ const INVALID_REQUEST = /\binvalid_request_error\b/i
 // text, so adding a new class is opt-in and never widens what we expose.
 const SAFE_CLASSES: ReadonlyArray<{ match: RegExp; safe: string }> = [
   {
-    // Matched first because a 401 body can also mention "account", which would
-    // otherwise fall into the billing class below.
+    // First, so provider-looking text inside a local error (a `401` or `429`
+    // echoed by a tool, a `quota` word) can't pull it into a provider class.
+    match: LOCAL_PRE_REQUEST_FAILURE,
+    safe: 'TypeClaw could not prepare the conversation for the LLM request. Operators can check `typeclaw logs` for details.',
+  },
+  {
+    // Matched before billing because a 401 body can also mention "account",
+    // which would otherwise fall into the billing class below.
     match: AUTH_FAULT,
     safe: 'The upstream LLM provider rejected the request as unauthorized. Operators should check the provider API key configuration and `typeclaw logs`.',
   },
@@ -162,8 +224,11 @@ const THROTTLE_OR_OVERLOAD =
 // status with a quota/billing/auth reason (e.g. `429 insufficient quota`) — the
 // status code alone must not force a pointless failover. The auth arm reuses the
 // shared `AUTH_FAULT` source so it stays in lockstep with the safe-message class.
+// A local pre-request failure is in the same bucket: preparing the context is
+// model-independent, so every ref (and a same-ref replay) would fail the same
+// way — and it must never count as provider throttling.
 const NON_FAILOVER_FAULT = new RegExp(
-  `${INVALID_MODEL.source}|${INVALID_REQUEST.source}|\\bcyber_policy\\b|insufficient.*(?:quota|credit|fund|balance)|\\bquota\\b|billing|payment|account is not active|${AUTH_FAULT.source}`,
+  `${LOCAL_PRE_REQUEST_FAILURE.source}|${INVALID_MODEL.source}|${INVALID_REQUEST.source}|\\bcyber_policy\\b|insufficient.*(?:quota|credit|fund|balance)|\\bquota\\b|billing|payment|account is not active|${AUTH_FAULT.source}`,
   'i',
 )
 
@@ -177,7 +242,11 @@ export function isThrottleOrOverload(raw: string): boolean {
   return THROTTLE_OR_OVERLOAD.test(raw)
 }
 
+// A local pre-request failure can carry observer text it merely echoes; the
+// request it was preparing was never sent, so it must not count toward the
+// no-progress envelope or trip the codex provider circuit.
 export function isObserverTtfbTimeout(raw: string): boolean {
+  if (LOCAL_PRE_REQUEST_FAILURE.test(raw)) return false
   return OBSERVER_TIMEOUT.test(raw) && OBSERVER_TTFB_TIMEOUT.test(raw)
 }
 
@@ -243,7 +312,9 @@ export function detectProviderError(message: unknown): DetectedProviderError | n
 // NOT an operator-actionable provider failure (internal bugs, network blips),
 // so the caller stays silent-with-log rather than spamming channels. The three
 // recognized classes are: failover-worthy throttle/overload, account-wide faults
-// (billing/quota/auth) that must surface, and observer stall timeouts.
+// (billing/quota/auth) that must surface, and observer stall timeouts. A throw
+// carrying the local pre-request marker surfaces too (via NON_FAILOVER_FAULT)
+// with the LOCAL notice; an unmarked internal error still returns `null`.
 export function detectHardProviderError(err: unknown): DetectedProviderError | null {
   const message = err instanceof Error ? err.message : String(err)
   const isProviderFailure =

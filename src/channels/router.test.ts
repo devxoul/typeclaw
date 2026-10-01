@@ -24,6 +24,7 @@ import type { SessionEntry } from '@earendil-works/pi-coding-agent'
 
 import type { AgentSession, SessionOriginRef } from '@/agent'
 import { LiveSubagentRegistry } from '@/agent/live-subagents'
+import { detectProviderError } from '@/agent/provider-error'
 import {
   consumeRestartHandoff,
   peekRestartHandoff,
@@ -10582,6 +10583,13 @@ describe('ChannelRouter typing indicator', () => {
   })
 })
 
+// The redacted channel notice the classifier picks for a soft error with this
+// raw text, so these router tests follow the classifier instead of pinning its
+// wording.
+function softErrorNotice(errorMessage: string): string {
+  return detectProviderError({ role: 'assistant', stopReason: 'error', errorMessage })!.safeMessage
+}
+
 describe('ChannelRouter plugin lifecycle hooks', () => {
   function makeRouterWithHooks(
     agentDir: string,
@@ -10889,12 +10897,13 @@ describe('ChannelRouter plugin lifecycle hooks', () => {
     // when: one user turn that retries 3 times
     await router.route(inbound({ text: 'hi bot' }))
     await router.__testing!.flushDebounce(KEY)
-    const noticesAfterFirstTurn = sent.filter((t) => /upstream LLM provider failed/i.test(t)).length
+    const notice = softErrorNotice('transient upstream blip 0')
+    const noticesAfterFirstTurn = sent.filter((t) => t.includes(notice)).length
 
     // when: a second, separate user turn that also fails
     await router.route(inbound({ text: 'still there?' }))
     await router.__testing!.flushDebounce(KEY)
-    const totalNotices = sent.filter((t) => /upstream LLM provider failed/i.test(t)).length
+    const totalNotices = sent.filter((t) => t.includes(notice)).length
 
     // then: one notice per turn, not one per retry
     expect(promptCount).toBe(2)
@@ -10933,7 +10942,15 @@ describe('ChannelRouter plugin lifecycle hooks', () => {
 
     // then: the real reply lands and NO failure notice is posted
     expect(sent.some((t) => /Review complete/.test(t))).toBe(true)
-    expect(sent.some((t) => /upstream LLM provider failed/i.test(t))).toBe(false)
+    expect(
+      sent.some((t) =>
+        t.includes(
+          softErrorNotice(
+            'Codex error: {"error":{"code":"server_is_overloaded","message":"Our servers are currently overloaded."}}',
+          ),
+        ),
+      ),
+    ).toBe(false)
   })
 
   test('carries the soft-error across an empty-turn retry: no notice when the RETRY recovers and replies', async () => {
@@ -10976,7 +10993,7 @@ describe('ChannelRouter plugin lifecycle hooks', () => {
     // then: only the real reply; the carried-forward error is suppressed
     expect(sessions[0]!.prompts).toHaveLength(2)
     expect(sent.some((t) => /here is your answer/.test(t))).toBe(true)
-    expect(sent.some((t) => /upstream LLM provider failed/i.test(t))).toBe(false)
+    expect(sent.some((t) => t.includes(softErrorNotice('transient server_is_overloaded')))).toBe(false)
   })
 
   test('does NOT misattribute a carried provider error to a fresh user turn that coalesces with the retry nudge', async () => {
@@ -11020,7 +11037,7 @@ describe('ChannelRouter plugin lifecycle hooks', () => {
 
     // then: A's stale provider notice is never posted against turn B
     expect(sessions[0]!.prompts.length).toBeGreaterThanOrEqual(2)
-    expect(sent.some((t) => /upstream LLM provider failed/i.test(t))).toBe(false)
+    expect(sent.some((t) => t.includes(softErrorNotice('transient server_is_overloaded')))).toBe(false)
   })
 
   test('an `error`-leaf turn surfaces the provider notice immediately — no empty-turn retries, no misleading "I got stuck" fallback', async () => {
@@ -11055,7 +11072,7 @@ describe('ChannelRouter plugin lifecycle hooks', () => {
     // generic redacted notice (never the raw text).
     expect(sessions[0]!.prompts).toHaveLength(1)
     expect(sent.some((t) => t === EMPTY_TURN_FALLBACK_TEXT)).toBe(false)
-    expect(sent.some((t) => /upstream LLM provider failed/i.test(t))).toBe(true)
+    expect(sent.some((t) => t.includes(softErrorNotice('transient server_is_overloaded')))).toBe(true)
     expect(sent.some((t) => /server_is_overloaded/.test(t))).toBe(false)
     expect(logs.some((m) => /empty_turn_retry/.test(m))).toBe(false)
     expect(logs.some((m) => /provider_error_turn/.test(m))).toBe(true)

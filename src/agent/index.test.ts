@@ -4,6 +4,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
+import type { ToolResultMessage } from '@earendil-works/pi-ai'
 import { defineTool as definePiTool, SessionManager } from '@earendil-works/pi-coding-agent'
 import { Type } from 'typebox'
 
@@ -37,6 +38,7 @@ import {
 } from './index'
 import { LiveSubagentRegistry } from './live-subagents'
 import { PROACTIVE_NEXT_STEP_NUDGE } from './proactive-next-step-nudge'
+import { detectProviderError, wrapTransformContextWithLocalFailureMarker } from './provider-error'
 import type { SessionOrigin } from './session-origin'
 import type { CreateSessionForSubagent, SubagentRegistry } from './subagents'
 import { DEFAULT_SYSTEM_PROMPT, SLIM_SYSTEM_PROMPT } from './system-prompt'
@@ -1811,6 +1813,82 @@ describe('default stream output budget', () => {
       try {
         await session.prompt('reply briefly')
         expect(requestMaxTokens).toBe(32_000)
+      } finally {
+        await dispose()
+      }
+    } finally {
+      globalThis.fetch = previousFetch
+      if (previousApiKey === undefined) delete process.env.ANTHROPIC_API_KEY
+      else process.env.ANTHROPIC_API_KEY = previousApiKey
+      invalidateProviderAuthCache()
+      __resetConfigForTesting()
+      process.chdir(previousCwd)
+    }
+  })
+})
+
+describe('local context-preparation failures', () => {
+  test('a session whose context cannot be prepared ends the turn with the local notice and never calls the provider', async () => {
+    const previousCwd = process.cwd()
+    const previousFetch = globalThis.fetch
+    const previousApiKey = process.env.ANTHROPIC_API_KEY
+    let fetchCalls = 0
+    process.chdir(agentDir)
+    process.env.ANTHROPIC_API_KEY = 'test-anthropic-key'
+    await writeFile(
+      join(agentDir, 'typeclaw.json'),
+      JSON.stringify({ models: { default: 'anthropic/claude-sonnet-4-6' } }),
+    )
+    reloadConfig(agentDir)
+    invalidateProviderAuthCache()
+    globalThis.fetch = (async () => {
+      fetchCalls++
+      return new Response('{"error":{"message":"must not be reached"}}', { status: 500 })
+    }) as unknown as typeof fetch
+    // given: a tool result whose details hold a live function, which pi's
+    // extension `context` pass cannot structuredClone
+    const sessionManager = SessionManager.inMemory(agentDir)
+    sessionManager.appendMessage({ role: 'user', content: [{ type: 'text', text: 'run it' }], timestamp: 1 })
+    // The type only admits JSON details; live sessions still end up holding
+    // non-JSON values here, which is what this test reproduces.
+    sessionManager.appendMessage({
+      role: 'toolResult',
+      toolCallId: 'call_1',
+      toolName: 'placeholder_tool',
+      content: [{ type: 'text', text: 'ok' }],
+      details: { job: { handler: async () => {} } },
+      isError: false,
+      timestamp: 2,
+    } as unknown as ToolResultMessage)
+    // The notice for a marked local failure, derived rather than pinned.
+    const markedLocal: unknown = await wrapTransformContextWithLocalFailureMarker(async () => {
+      throw new Error('placeholder')
+    })([]).catch((err: unknown) => err)
+    const localNotice = detectProviderError({
+      role: 'assistant',
+      stopReason: 'error',
+      errorMessage: (markedLocal as Error).message,
+    })?.safeMessage
+
+    try {
+      const { session, dispose } = await createSessionWithDispose({
+        sessionManager,
+        systemPromptOverride: 'test local failure',
+        tools: [],
+      })
+      const ended: unknown[] = []
+      session.subscribe((event) => {
+        if (event.type === 'message_end' && event.message.role === 'assistant') ended.push(event.message)
+      })
+      try {
+        // when
+        await session.prompt('next')
+
+        // then
+        expect(fetchCalls).toBe(0)
+        expect(ended).toHaveLength(1)
+        expect(ended[0]).toMatchObject({ stopReason: 'error' })
+        expect(detectProviderError(ended[0])?.safeMessage).toBe(localNotice!)
       } finally {
         await dispose()
       }
