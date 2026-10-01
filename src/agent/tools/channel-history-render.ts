@@ -17,5 +17,6 @@ export function renderHistoryMessages(messages: readonly ChannelHistoryMessage[]
 export function renderHistoryMessage(m: ChannelHistoryMessage): string {
   const iso = m.ts > 0 ? new Date(m.ts).toISOString() : 'unknown-time'
   const who = m.isBot ? `BOT (${m.authorName})` : `${m.authorName} (<@${m.authorId}>)`
-  return `[${iso}] ${who}: ${m.text}`
+  const messageId = m.externalMessageId ? ` [message_id=${m.externalMessageId}]` : ''
+  return `[${iso}]${messageId} ${who}: ${m.text}`
 }

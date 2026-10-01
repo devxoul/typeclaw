@@ -102,6 +102,8 @@ Reading splits across two tools. `channel_history` fetches older messages of the
 | `message`           | one message by `message_id`            |
 | `list`              | the channels/chats in a `workspace`    |
 
+Both history modes show each message's platform-native `message_id` next to its timestamp. On adapters supporting single-message reads, the agent can use that ID with the same `chat` (and `thread` where applicable) in `channel_read`'s `message` mode to fetch that exact message again. A message without an ID retains the ordinary timestamp-and-author line.
+
 Not every adapter backs every mode. When an adapter hasn't registered a capability, that mode returns a `*-not-supported` error rather than failing the turn. The matrix below mirrors `ADAPTER_READ_CAPABILITIES` in `src/channels/schema.ts`, the runtime source of truth:
 
 | Adapter        | `history` | `message` | `list` |
