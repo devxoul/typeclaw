@@ -5864,6 +5864,13 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     if (live.promptQueue.length > 0) return
     if (record.text === undefined) return
     if (!detectContinuationWillingness(record.text)) return
+    // A status promise can refer to a child from an earlier logical turn. Gate
+    // only willingness recovery session-wide; ordinary empty-turn recovery stays
+    // turn-scoped so unrelated later requests still get their own answer.
+    if (isPinnedByRunningChild(live.sessionId, live.keyId, 'willingness_nudge')) {
+      logger.info(`[channels] ${live.keyId} willingness_nudge_suppressed cause=awaiting_background_child`)
+      return
+    }
     live.willingnessNudges++
     logger.info(
       `[channels] ${live.keyId} willingness_nudge attempt=${live.willingnessNudges}/${MAX_WILLINGNESS_NUDGES}`,
@@ -6340,6 +6347,13 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         live.successfulChannelSends === successfulSendsBeforePrompt &&
         live.promptQueue.length === 0
       ) {
+        // Recheck at fallback time too: a reminder can already be queued when
+        // the running child becomes visible to the router.
+        if (isPinnedByRunningChild(live.sessionId, live.keyId, 'no_reply_after_willingness_nudge')) {
+          logger.info(`[channels] ${live.keyId} empty_turn_suppressed cause=awaiting_background_child`)
+          armSilentTurnAck(live, 'awaiting_background_child')
+          return
+        }
         await postEmptyTurnFallback(live, 'no_reply_after_willingness_nudge')
         return
       }

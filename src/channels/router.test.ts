@@ -18901,6 +18901,7 @@ describe('injectPrVerdictActivity (PR-keyed verdict liveness)', () => {
 describe('ChannelRouter background-child await suppression', () => {
   const CHILD_STARTED_AT = 1000
   const ACK = '변경사항을 검토 중입니다. 완료되는 대로 정식 리뷰로 남기겠습니다.'
+  const STATUS = "I'll keep checking on that now."
 
   const runningChild = (sessionId: string): number | null => (sessionId === 'ses_fake_1' ? CHILD_STARTED_AT : null)
 
@@ -19084,6 +19085,110 @@ describe('ChannelRouter background-child await suppression', () => {
       expect(logs.some((m) => m.includes('no_reply_after_willingness_nudge'))).toBe(false)
     })
   }
+
+  for (const expired of [false, true]) {
+    test(`a later queued status reply ${expired ? 'recovers after the child backstop' : 'waits for the earlier child without a willingness warning'}`, async () => {
+      const dir = await tempDir()
+      const logs: string[] = []
+      const sent: string[] = []
+      const nowRef = { value: CHILD_STARTED_AT }
+      let childRunning = true
+      const { router, sessions } = makeRouter(dir, {
+        logs,
+        nowRef,
+        newestRunningChildSubagentStartedAt: (sessionId) =>
+          childRunning && sessionId === 'ses_fake_1' ? CHILD_STARTED_AT : null,
+      })
+      router.registerOutbound('discord-bot', async (msg) => {
+        sent.push(msg.text ?? '')
+        return { ok: true }
+      })
+
+      await router.route(inbound({ isBotMention: true, text: 'PR 좀 리뷰해줘' }))
+      let attempt = 0
+      sessions[0]!.onPrompt = async (text) => {
+        attempt++
+        if (attempt === 1) {
+          emptyStopAfterToolWork(sessions[0]!, 'background-child')
+          nowRef.value = CHILD_STARTED_AT + (expired ? SESSION_CHILD_STUCK_BACKSTOP_MS + 1 : 1_000)
+          await router.route(inbound({ isBotMention: true, text: '아직 검토 중이야?' }))
+          return
+        }
+        if (attempt === 2) {
+          const context = continueReplyAck(STATUS)
+          context.result.details = { ok: true, more_work_this_turn: false }
+          await sessions[0]!.agent.afterToolCall!(context)
+          await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: STATUS })
+          sessions[0]!.setAssistantMidTurn(STATUS, 'aborted')
+          return
+        }
+        expect(text).toContain(WILLINGNESS_NUDGE)
+        sessions[0]!.setAssistantText('NO_REPLY')
+      }
+      await router.__testing!.flushDebounce(KEY)
+
+      expect(sent).toEqual(expired ? [STATUS, EMPTY_TURN_FALLBACK_TEXT] : [STATUS])
+      expect(attempt).toBe(expired ? 3 : 2)
+      expect(logs.filter((m) => m.includes('willingness_nudge attempt='))).toHaveLength(expired ? 1 : 0)
+
+      childRunning = false
+      sessions[0]!.onPrompt = () => sessions[0]!.setAssistantText('리뷰 완료: APPROVE')
+      router.injectSubagentCompletionReminder({
+        parentSessionId: 'ses_fake_1',
+        subagent: 'reviewer',
+        taskId: 'bg_reviewer',
+        ok: true,
+        durationMs: 5_000,
+      })
+      await waitFor(() => sent.includes('리뷰 완료: APPROVE'))
+      expect(sent).toEqual(
+        expired ? [STATUS, EMPTY_TURN_FALLBACK_TEXT, '리뷰 완료: APPROVE'] : [STATUS, '리뷰 완료: APPROVE'],
+      )
+    })
+  }
+
+  test('a willingness reminder already queued stays silent if an earlier child is running at NO_REPLY', async () => {
+    const dir = await tempDir()
+    const logs: string[] = []
+    const sent: string[] = []
+    const nowRef = { value: CHILD_STARTED_AT }
+    let childVisible = false
+    const { router, sessions } = makeRouter(dir, {
+      logs,
+      nowRef,
+      newestRunningChildSubagentStartedAt: () => (childVisible ? CHILD_STARTED_AT : null),
+    })
+    router.registerOutbound('discord-bot', async (msg) => {
+      sent.push(msg.text ?? '')
+      return { ok: true }
+    })
+    await router.route(inbound({ isBotMention: true, text: 'check it again' }))
+    let attempt = 0
+    sessions[0]!.onPrompt = async (text) => {
+      attempt++
+      if (attempt === 1) {
+        sessions[0]!.setAssistantText('NO_REPLY')
+        nowRef.value += 1_000
+        await router.route(inbound({ isBotMention: true, text: 'still checking?' }))
+        return
+      }
+      if (attempt === 2) {
+        const context = continueReplyAck(STATUS)
+        context.result.details = { ok: true, more_work_this_turn: false }
+        await sessions[0]!.agent.afterToolCall!(context)
+        await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: STATUS })
+        sessions[0]!.setAssistantMidTurn(STATUS, 'aborted')
+        return
+      }
+      expect(text).toContain(WILLINGNESS_NUDGE)
+      childVisible = true
+      sessions[0]!.setAssistantText('NO_REPLY')
+    }
+    await router.__testing!.flushDebounce(KEY)
+    expect(attempt).toBe(3)
+    expect(sent).toEqual([STATUS])
+    expect(logs.some((m) => m.includes('empty_turn_suppressed cause=awaiting_background_child'))).toBe(true)
+  })
 
   test('a child past the stuck backstop stops suppressing and the normal retry resumes', async () => {
     const dir = await tempDir()
