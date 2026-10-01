@@ -4408,6 +4408,187 @@ describe('wrapBuiltinToolDefinition bash sandbox (role-derived path hiding)', ()
     }
   })
 
+  // Pi 0.99 bash reports a nonzero exit by RETURNING `isError: true` instead of
+  // throwing. The wrapper must route that result through the same error path a
+  // thrown failure takes.
+  type ScriptedBashStep = { text: string; isError?: true }
+  function scriptedBash(results: ReadonlyArray<ScriptedBashStep>) {
+    let attempts = 0
+    const tool = {
+      name: 'bash',
+      label: 'bash',
+      description: '',
+      parameters: Type.Object({ command: Type.String() }),
+      async execute() {
+        const next = results[Math.min(attempts, results.length - 1)]!
+        attempts += 1
+        return {
+          content: [{ type: 'text' as const, text: next.text }],
+          details: undefined,
+          ...(next.isError === true ? { isError: true } : {}),
+        }
+      },
+    }
+    return { tool, attempts: () => attempts }
+  }
+
+  test('a returned isError bash result rejects with the sandbox note and reaches tool.after as an error; a plain result stays a success', async () => {
+    const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-returned-is-error-'))
+    const afterResults: ToolResult[] = []
+    const hooks = createHookBus()
+    hooks.registerAll('observer', agentDir, noopLogger, {
+      'tool.after': (event) => {
+        afterResults.push(event.result)
+      },
+    })
+    const wrapScripted = (results: ReadonlyArray<ScriptedBashStep>, sessionId: string) => {
+      const bash = scriptedBash(results)
+      const wrapped = wrapBuiltinToolDefinition(bash.tool, {
+        agentDir,
+        sessionId,
+        hooks,
+        getOrigin: () => tui,
+        permissions: createPermissionService(),
+        bashSandboxBoundary: {
+          ensureAvailable: async () => {},
+          resolveProcStrategy: async () => ({ strategy: 'proc-bind' as const }),
+          buildCommand: buildSandboxedCommand,
+        },
+      })
+      return { wrapped, attempts: bash.attempts }
+    }
+    const failing = wrapScripted(
+      [{ text: 'fatal: not a git repository\n\nCommand exited with code 128', isError: true }],
+      'returned-is-error-failure',
+    )
+    const succeeding = wrapScripted([{ text: 'clean working tree' }], 'returned-is-error-success')
+
+    try {
+      const rejection = failing.wrapped.execute('failure', { command: 'git status' }, undefined, undefined, {} as never)
+      await expect(rejection).rejects.toThrow('Command exited with code 128')
+      await expect(rejection).rejects.toThrow('[TypeClaw sandbox policy (LOCAL)')
+      expect(failing.attempts()).toBe(1)
+      expect(afterResults).toHaveLength(1)
+      expect(afterResults[0]?.details).toEqual({
+        error: expect.stringMatching(/fatal: not a git repository[\s\S]*\[TypeClaw sandbox policy \(LOCAL\)/),
+      })
+
+      const result = await succeeding.wrapped.execute(
+        'success',
+        { command: 'git status' },
+        undefined,
+        undefined,
+        {} as never,
+      )
+      expect(result.content).toEqual([{ type: 'text', text: 'clean working tree' }])
+      expect(succeeding.attempts()).toBe(1)
+      expect(afterResults).toHaveLength(2)
+      expect(afterResults[1]?.content).toEqual([{ type: 'text', text: 'clean working tree' }])
+      expect(afterResults[1]?.details).toBeUndefined()
+    } finally {
+      await rm(agentDir, { recursive: true, force: true })
+    }
+  })
+
+  test('a returned isError command-not-found result is repaired, retried once, and resolves its incident', async () => {
+    const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-returned-is-error-remediation-'))
+    const registry = new RemediationRegistry()
+    const repairedBins: string[] = []
+    registry.register('bash-command-not-found', async (fact) => {
+      if (fact.kind === 'bash-command-not-found') repairedBins.push(fact.bin)
+      return { repaired: true }
+    })
+    const afterResults: ToolResult[] = []
+    const hooks = createHookBus()
+    hooks.registerAll('observer', agentDir, noopLogger, {
+      'tool.after': (event) => {
+        afterResults.push(event.result)
+      },
+    })
+    const bash = scriptedBash([
+      { text: '/bin/bash: opensoma: command not found\n\nCommand exited with code 127', isError: true },
+      { text: 'ran after repair' },
+    ])
+    const wrapped = wrapBuiltinToolDefinition(bash.tool, {
+      agentDir,
+      sessionId: 'returned-is-error-remediation',
+      hooks,
+      getOrigin: () => tui,
+      permissions: createPermissionService(),
+      remediations: registry,
+      bashSandboxBoundary: {
+        ensureAvailable: async () => {},
+        resolveProcStrategy: async () => ({ strategy: 'proc-bind' as const }),
+        buildCommand: buildSandboxedCommand,
+      },
+    })
+
+    try {
+      const result = await wrapped.execute('c', { command: 'opensoma --version' }, undefined, undefined, {} as never)
+      expect(textOfFirstContent(result)).toBe('ran after repair')
+      expect(bash.attempts()).toBe(2)
+      expect(repairedBins).toEqual(['opensoma'])
+      expect(afterResults).toHaveLength(1)
+      expect(afterResults[0]?.content).toEqual([{ type: 'text', text: 'ran after repair' }])
+      expect((await readIncidentLedger(agentDir)).incidents).toMatchObject([
+        { fingerprint: 'bash:command-not-found:opensoma', count: 1, status: 'resolved' },
+      ])
+    } finally {
+      await rm(agentDir, { recursive: true, force: true })
+    }
+  })
+
+  test.each([
+    { name: 'no registered remediation', repair: false, expectedAttempts: 1 },
+    { name: 'a remediation whose retry still returns isError', repair: true, expectedAttempts: 2 },
+  ])(
+    'a returned isError command-not-found result with $name rejects with the incident marker',
+    async ({ repair, expectedAttempts }) => {
+      const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-returned-is-error-unrepaired-'))
+      const registry = new RemediationRegistry()
+      if (repair) registry.register('bash-command-not-found', async () => ({ repaired: true }))
+      const afterResults: ToolResult[] = []
+      const hooks = createHookBus()
+      hooks.registerAll('observer', agentDir, noopLogger, {
+        'tool.after': (event) => {
+          afterResults.push(event.result)
+        },
+      })
+      const bash = scriptedBash([
+        { text: '/bin/bash: opensoma: command not found\n\nCommand exited with code 127', isError: true },
+      ])
+      const wrapped = wrapBuiltinToolDefinition(bash.tool, {
+        agentDir,
+        sessionId: 'returned-is-error-unrepaired',
+        hooks,
+        getOrigin: () => tui,
+        permissions: createPermissionService(),
+        remediations: registry,
+        bashSandboxBoundary: {
+          ensureAvailable: async () => {},
+          resolveProcStrategy: async () => ({ strategy: 'proc-bind' as const }),
+          buildCommand: buildSandboxedCommand,
+        },
+      })
+
+      try {
+        await expect(
+          wrapped.execute('c', { command: 'opensoma --version' }, undefined, undefined, {} as never),
+        ).rejects.toThrow(/command not found[\s\S]*TYPECLAW_OPERATIONAL_INCIDENT/)
+        expect(bash.attempts()).toBe(expectedAttempts)
+        expect(afterResults).toHaveLength(1)
+        expect(afterResults[0]?.details).toEqual({
+          error: expect.stringMatching(/command not found[\s\S]*TYPECLAW_OPERATIONAL_INCIDENT/),
+        })
+        expect((await readIncidentLedger(agentDir)).incidents).toMatchObject([
+          { fingerprint: 'bash:command-not-found:opensoma', count: 1, status: 'unresolved' },
+        ])
+      } finally {
+        await rm(agentDir, { recursive: true, force: true })
+      }
+    },
+  )
+
   test.each([
     { name: 'masked aggregate success', command: 'opensoma || true' },
     { name: 'success for a different executable', command: 'another-cli' },
