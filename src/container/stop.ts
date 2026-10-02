@@ -6,6 +6,7 @@ import { inspectContainerExit } from './exit-reason'
 import { archiveContainerLogs, dockerLogsUnavailableWarning, type DockerLogArchiver } from './log-archive'
 import {
   classifyRmStderr,
+  CONTAINER_REMOVAL_TIMEOUT_MS,
   containerNameFromCwd,
   defaultDockerExec,
   type DockerExec,
@@ -137,12 +138,12 @@ async function runStop({
         return { ok: false, reason: diagnosis === null ? reason : `${reason} ${diagnosis}` }
       }
       if (kind === 'in-progress' && !(await waitForRemoval(exec, containerName))) {
-        const reason = `Container ${containerName} is still being removed by docker after 10s.`
+        const reason = `Container ${containerName} is still being removed by docker after ${CONTAINER_REMOVAL_TIMEOUT_MS / 1000}s.`
         const diagnosis = await describeUnremovableContainer(exec, containerId)
         return { ok: false, reason: diagnosis === null ? reason : `${reason} ${diagnosis}` }
       }
     } else if (!(await waitForRemoval(exec, containerName))) {
-      const reason = `Container ${containerName} is still being removed by docker after 10s.`
+      const reason = `Container ${containerName} is still being removed by docker after ${CONTAINER_REMOVAL_TIMEOUT_MS / 1000}s.`
       const diagnosis = await describeUnremovableContainer(exec, containerId)
       return { ok: false, reason: diagnosis === null ? reason : `${reason} ${diagnosis}` }
     }

@@ -536,12 +536,19 @@ export async function cleanupRunCorpse(
 // `docker run --name <same>` to succeed — Docker's name-reservation table
 // drains independently. waitForRemoval is the fast path; the retry on
 // `docker run` (see isContainerNameConflict) is the safety net.
+//
+// The budget is generous because a draining removal is normal, not stuck:
+// OrbStack has been observed taking ~40s to destroy agents with large
+// writable layers. Timing out early makes `compose restart` report a healthy
+// drain as stuck and tell the operator to restart Docker for nothing.
+export const CONTAINER_REMOVAL_TIMEOUT_MS = 120_000
+
 export async function waitForRemoval(
   exec: DockerExec,
   name: string,
   options: { timeoutMs?: number; intervalMs?: number } = {},
 ): Promise<boolean> {
-  const timeoutMs = options.timeoutMs ?? 10_000
+  const timeoutMs = options.timeoutMs ?? CONTAINER_REMOVAL_TIMEOUT_MS
   const intervalMs = options.intervalMs ?? 100
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
