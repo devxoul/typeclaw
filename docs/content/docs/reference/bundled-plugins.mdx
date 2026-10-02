@@ -43,6 +43,8 @@ Both fields restart-required. The `dreaming.schedule` is a standard 5-field cron
 
 `idleMs` is how long after the last activity before the backup subagent runs (default 2 minutes). Restart-required.
 
+The `backup-message` subagent returns a commit message as text without file tools. The `backup-diagnose` subagent may inspect Git and retry a narrowly recoverable push, but also returns its diagnosis as text. Backup code stores these responses briefly or appends the diagnosis log; normal agent writes to `.typeclaw/` and `sessions/` remain guarded.
+
 ## `tool-result-cap`
 
 ```json

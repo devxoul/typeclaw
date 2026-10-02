@@ -44,7 +44,7 @@ The runner builds an explicit snapshot from NUL-delimited porcelain status:
 - **Ordinary untracked paths** are staged only while still present. If one disappears between snapshot and `git add`, the runner re-reads status and retries that same snapshot once without the vanished path; paths discovered during that re-read are never added.
 - **`memory/`** remains excluded. Present **`sessions/` and `todo/`** paths reported by porcelain remain force-added; tracked deletions under those prefixes stay in the ordinary snapshot. The post-message pass selects only porcelain-visible late `sessions/` paths.
 
-The runner stages the selected paths in a temporary private Git index for its diffstat, without exposing backup entries in the shared index while `backup-message` selects a message. Git then commits **only** selected paths against its current HEAD; unrelated staged files and intervening commits stay intact. A post-message status drops deletion paths already committed by another writer, and an already-clean selection returns clean rather than a false failure. Discovery of force-added paths is unchanged: gitignored untracked files omitted by porcelain status are not discovered here, while explicitly staged ignored files remain eligible. The `backup-message` subagent sees a truncated status and private-index diffstat and writes a single conventional-ish commit message to a tmp file; on any failure it falls back to `chore: backup`.
+The runner stages the selected paths in a temporary private Git index for its diffstat, without exposing backup entries in the shared index while `backup-message` selects a message. Git then commits **only** selected paths against its current HEAD; unrelated staged files and intervening commits stay intact. A post-message status drops deletion paths already committed by another writer, and an already-clean selection returns clean rather than a false failure. Discovery of force-added paths is unchanged: gitignored untracked files omitted by porcelain status are not discovered here, while explicitly staged ignored files remain eligible. The `backup-message` subagent sees a truncated status and private-index diffstat and returns a conventional-ish subject as its final response. Trusted backup code writes that response to an ephemeral tmp file for the runner to consume; the model has no file tools. On any failure the runner falls back to `chore: backup`.
 
 ## What it pushes
 
@@ -58,7 +58,7 @@ On non-fast-forward rejection (either push shape), the runner runs `git fetch` t
 
 **Credentials.** The runner spawns `git` directly (not via the `bash` tool), so the `github-cli-auth` plugin's `tool.before` credential injection does **not** fire for it. For **GitHub App auth** the backup plugin mints a per-repo installation token for `origin`'s github.com slug and injects it into the runner's git env via the same `GIT_ASKPASS` helper the bash path uses (token in `TYPECLAW_GIT_TOKEN`, never in argv/config; ssh remotes rewritten to https via `insteadOf`). Classic/fine-grained PATs, SSH-key, and credential-helper setups are left untouched — the runner uses its inherited process env. Non-github origins are never minted for.
 
-If any network step fails (rebase conflict, auth failure, network timeout), the runner aborts cleanly and spawns the `backup-diagnose` subagent. That subagent has `bash`, `read`, and `write` tools and writes a short human-readable report to `<agentDir>/sessions/backup-diagnostics.log`. The diagnose subagent is explicitly forbidden from force-pushing or resolving merge conflicts itself.
+If any network step fails (rebase conflict, auth failure, network timeout), the runner aborts cleanly and spawns the `backup-diagnose` subagent. That subagent has `bash` and `read` tools, returns a short human-readable diagnosis, and trusted backup code appends it to `<agentDir>/sessions/backup-diagnostics.log`. The diagnose subagent is explicitly forbidden from force-pushing or resolving merge conflicts itself.
 
 ## What it maintains
 
@@ -76,16 +76,16 @@ Because the backup force-commits `sessions/` every idle window, each cycle lands
 | Kind     | Name                          | Notes                                                                                                                                                       |
 | -------- | ----------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Subagent | `backup`                      | Runner orchestrator. No LLM call — `handler` directly invokes the deterministic `runBackup`. Coalesced per `agentDir`.                                      |
-| Subagent | `backup-message`              | Picks commit message from the diff. Has only the `write` tool. Coalesced per `agentDir`.                                                                    |
-| Subagent | `backup-diagnose`             | Diagnoses push/rebase failures. Has `bash`, `read`, `write`. Coalesced per `agentDir`.                                                                      |
+| Subagent | `backup-message`              | Picks commit message from the diff. Has no tools; trusted code stores its final response. Coalesced per `agentDir`.                                         |
+| Subagent | `backup-diagnose`             | Diagnoses push/rebase failures. Has `bash` and `read`; trusted code appends its final response to the diagnostics log. Coalesced per `agentDir`.            |
 | Hook     | `session.turn.start` / `.end` | Maintains the active-turn counter. Excludes self-induced turns (the three subagents above) so the backup never gates against itself.                        |
 | Hook     | `session.idle`                | Debouncer (idleMs). Resets the timer on every event. On fire, checks the active-turn counter and spawns `backup` if zero.                                   |
 | Hook     | `session.end`                 | Removes the session from the active-turn set on session close. Defensive: if a session ends mid-turn (network drop), `session.turn.end` may not have fired. |
 
 ## Files on disk
 
-- **`<agentDir>/.typeclaw/backup-message.tmp`** — ephemeral. Written by `backup-message` subagent, read and then deleted by the runner. The directory is created on demand. Not gitignored because it always cleans itself up before commit.
-- **`<agentDir>/sessions/backup-diagnostics.log`** — append-only log written by `backup-diagnose` when push/rebase fails. Lives under `sessions/` so it gets force-added by the next successful backup. Read this file when investigating why the backup plugin stopped working.
+- **`<agentDir>/.typeclaw/backup-message.tmp`** — ephemeral. Written by trusted backup code, read and then deleted by the runner. The directory is created on demand. Not gitignored because it always cleans itself up before commit.
+- **`<agentDir>/sessions/backup-diagnostics.log`** — append-only log written by trusted backup code from `backup-diagnose`'s final response when push/rebase fails. Lives under `sessions/` so it gets force-added by the next successful backup. Read this file when investigating why the backup plugin stopped working.
 
 ## Why this design
 

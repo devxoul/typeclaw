@@ -54,7 +54,12 @@ export type SubagentContext<P = unknown> = {
   payload: P
 }
 
-export type RunSession = (override?: { userPrompt?: string }) => Promise<void>
+export type RunSession = (override?: {
+  userPrompt?: string
+  // Called after a completed run with the terminal assistant text, or null
+  // after an empty terminal response or provider failure. No block projection.
+  onFinalMessage?: (message: string | null) => void
+}) => Promise<void>
 
 // The plugin-author-facing subagent declaration. Differs from
 // `@/agent/subagents`'s `Subagent` only in the shape of `tools`/`customTools`:

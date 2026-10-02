@@ -32,7 +32,13 @@ export type SubagentContext<P = unknown> = {
   payload: P
 }
 
-export type RunSession = (override?: { userPrompt?: string }) => Promise<void>
+// onFinalMessage receives the terminal assistant message's text after the
+// completed run (or null for an empty terminal message/provider failure).
+// Unlike orchestration output, it never projects <review>/<report> blocks.
+export type RunSession = (override?: {
+  userPrompt?: string
+  onFinalMessage?: (message: string | null) => void
+}) => Promise<void>
 
 // Fields shared verbatim between the plugin-author-facing `Subagent` in
 // `@/plugin/types` and the runtime-internal `Subagent` below. Every consumer
@@ -480,6 +486,7 @@ export async function invokeSubagent(name: string, options: InvokeSubagentOption
           ...(origin !== undefined ? { origin } : {}),
         })
       }
+      override?.onFinalMessage?.(latestTurnFailure === undefined ? capture.getTerminalAssistantText() : null)
     } finally {
       unsubProviderErrors?.()
       if (hooks && sessionId !== undefined) {
@@ -801,6 +808,8 @@ type SubagentCapture = {
   // True once a required-block subagent (researcher) has emitted its `<report>`
   // block; always false for subagents without a required block.
   hasRequiredBlock: () => boolean
+  // Raw terminal assistant text, independent of the orchestrator's block projection.
+  getTerminalAssistantText: () => string | null
   // Install a captured final message directly — used by the required-block guard
   // to set an honest fallback when the block was never emitted, so the parent
   // gets a structured result rather than stale preamble.
@@ -812,6 +821,7 @@ function attachFinalMessageCapture(
   requiredBlockTag: FinalBlockTag | undefined,
   onFinalMessage: (msg: string) => void,
 ): SubagentCapture {
+  let terminalAssistantText: string | null = null
   let lastAssistant: string | null = null
   let lastReview: string | null = null
   let lastRequired: string | null = null
@@ -824,6 +834,7 @@ function attachFinalMessageCapture(
       const role = ev.message?.role
       if (role !== undefined && role !== 'assistant') return
       const text = extractFinalMessageText(ev.message?.content)
+      terminalAssistantText = text
       if (text === null) return
       lastAssistant = text
 
@@ -851,6 +862,7 @@ function attachFinalMessageCapture(
     // doubles that don't implement it.
   }
   return {
+    getTerminalAssistantText: () => terminalAssistantText,
     hasRequiredBlock: () => lastRequired !== null,
     setSyntheticFinalMessage: (msg) => {
       lastRequired = msg

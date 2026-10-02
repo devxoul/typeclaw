@@ -1,9 +1,9 @@
-import { mkdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { appendFile, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 
 import { z } from 'zod'
 
-import { bashTool, readTool, type Subagent, writeTool } from '@/plugin'
+import { bashTool, readTool, type Subagent } from '@/plugin'
 
 const messagePayloadSchema = z.object({
   agentDir: z.string(),
@@ -33,9 +33,8 @@ A periodic backup is about to commit dirty files in the agent folder. Your only 
 The user message gives you:
 - The output of \`git status --porcelain=v1 --untracked-files=all\` (truncated)
 - The output of \`git diff --cached --stat\` (truncated)
-- An absolute file path you must write the commit message to
 
-# What to write
+# What to return
 
 A single commit message in conventional-commit-ish style:
 - Subject line under 72 characters, imperative mood, lowercase first word, no trailing period.
@@ -49,11 +48,9 @@ Examples:
 
 # Hard rules
 
-1. **Write exactly one file.** Use the \`write\` tool with the absolute path the user gave you. Do not write anywhere else. Do not read other files. Do not run commands.
-2. **Output is the file contents only.** No prose to the user, no explanation, no apologies. The runner ignores everything except the file you wrote.
-3. **Be honest about uncertainty.** If the diff looks like a mix of unrelated changes, write \`chore: backup\` rather than guessing a misleading subject.
-4. **Never include secrets, API keys, or paths that would identify the user's machine.** Stick to repo-relative descriptions.
-5. **Stop when the file is written.** Do not continue after the \`write\` succeeds.`
+1. **Return only the commit message as your final answer.** No prose, explanation, or apologies. Do not write files, read other files, or run commands.
+2. **Be honest about uncertainty.** If the diff looks like a mix of unrelated changes, return \`chore: backup\` rather than guessing a misleading subject.
+3. **Never include secrets, API keys, or paths that would identify the user's machine.** Stick to repo-relative descriptions.`
 
 export const DIAGNOSE_FAILURE_SYSTEM_PROMPT = `You are typeclaw's backup failure-diagnosis subagent.
 
@@ -68,7 +65,7 @@ The user message gives you:
 
 # Tools
 
-You have \`bash\`, \`read\`, and \`write\`. Use \`bash\` to inspect git state (\`git status\`, \`git remote -v\`, \`git log -5 --oneline\`, \`git config --get remote.origin.url\`).
+You have \`bash\` and \`read\`. Use \`bash\` to inspect git state (\`git status\`, \`git remote -v\`, \`git log -5 --oneline\`, \`git config --get remote.origin.url\`).
 
 # Allowed actions
 
@@ -77,7 +74,7 @@ You MAY:
 - Set up a missing upstream branch via \`git push -u origin <branch>\` if it's clear that's the only issue.
 - Retry \`git push\` once after fixing a clear, narrow issue.
 
-**When you run \`git push\` (either to set upstream or to retry), do not add an acknowledgement argument.** Security guards are permission-only; this recovery subagent inherits the operator role that launched the approved backup workflow. If your push retry fails again, write the diagnosis and stop.
+**When you run \`git push\` (either to set upstream or to retry), do not add an acknowledgement argument.** Security guards are permission-only; this recovery subagent inherits the operator role that launched the approved backup workflow. If your push retry fails again, return the diagnosis and stop.
 
 You MUST NOT:
 - Force-push (\`--force\`, \`--force-with-lease\`).
@@ -87,16 +84,16 @@ You MUST NOT:
 
 # Output
 
-Write a brief diagnosis (3-8 lines) describing:
+Return a brief diagnosis (3-8 lines) describing:
 1. What the actual cause was (e.g. "no upstream tracking branch", "remote is ahead and rebase conflicted", "auth failed").
 2. What you did about it (or why you didn't).
 3. What the user should do next, if anything.
 
-Append your diagnosis to \`<agentDir>/sessions/backup-diagnostics.log\` with a timestamp prefix. Keep it short — this log is for the human, not the model.
+Return only the diagnosis as your final answer. The backup runtime appends it with a timestamp to \`<agentDir>/sessions/backup-diagnostics.log\`; do not write that file yourself. Keep it short — this log is for the human, not the model.
 
 # When in doubt
 
-Do nothing destructive. Write the diagnosis and stop. The user can recover manually.`
+Do nothing destructive. Return the diagnosis and stop. The user can recover manually.`
 
 export type CreateCommitMessageSubagentOptions = {
   fallbackMessage?: string
@@ -108,16 +105,24 @@ export function createCommitMessageSubagent(
   const fallback = options.fallbackMessage ?? 'chore: backup'
   return {
     systemPrompt: COMMIT_MESSAGE_SYSTEM_PROMPT,
-    tools: [writeTool],
+    tools: [],
     payloadSchema: messagePayloadSchema,
     inFlightKey: (payload) => payload.agentDir,
     handler: async (ctx, runSession) => {
-      const userPrompt = buildCommitMessagePrompt(ctx.payload)
+      let message = ''
       try {
-        await runSession({ userPrompt })
+        await runSession({
+          userPrompt: buildCommitMessagePrompt(ctx.payload),
+          onFinalMessage: (text) => {
+            message = text ?? ''
+          },
+        })
       } catch {
-        await writeFile(ctx.payload.outputPath, fallback, 'utf8').catch(() => undefined)
+        message = ''
       }
+      await writeFile(ctx.payload.outputPath, normalizeCommitMessageResponse(message) || fallback, 'utf8').catch(
+        () => undefined,
+      )
     },
   }
 }
@@ -125,24 +130,51 @@ export function createCommitMessageSubagent(
 export function createDiagnoseFailureSubagent(): Subagent<DiagnoseFailurePayload> {
   return {
     systemPrompt: DIAGNOSE_FAILURE_SYSTEM_PROMPT,
-    tools: [bashTool, readTool, writeTool],
+    tools: [bashTool, readTool],
     payloadSchema: diagnosePayloadSchema,
     inFlightKey: (payload) => payload.agentDir,
     handler: async (ctx, runSession) => {
-      const userPrompt = buildDiagnosePrompt(ctx.payload)
+      let diagnosis = ''
       try {
-        await runSession({ userPrompt })
+        await runSession({
+          userPrompt: buildDiagnosePrompt(ctx.payload),
+          onFinalMessage: (text) => {
+            diagnosis = text ?? ''
+          },
+        })
       } catch {
-        // Diagnosis is advisory; failures here must not propagate.
+        return
+      }
+      if (diagnosis.trim()) {
+        await appendFile(
+          join(ctx.payload.agentDir, 'sessions', 'backup-diagnostics.log'),
+          `${new Date().toISOString()} ${diagnosis.trim()}\n`,
+          'utf8',
+        ).catch(() => undefined)
       }
     },
   }
 }
 
+// The runner already bounds subject length and preserves an optional body.
+// Remove model presentation wrappers here so neither a fence label nor quotes
+// can become the Git subject line.
+function normalizeCommitMessageResponse(raw: string): string {
+  const trimmed = raw.trim()
+  const fenced = trimmed.match(/^```[^\n]*\n([\s\S]*?)\n```$/)
+  const content = (fenced?.[1] ?? trimmed).trim()
+  const pair =
+    content.startsWith('"') && content.endsWith('"')
+      ? '"'
+      : content.startsWith("'") && content.endsWith("'")
+        ? "'"
+        : null
+  return (pair && content.length >= 2 ? content.slice(1, -1) : content).trim()
+}
+
 function buildCommitMessagePrompt(p: CommitMessagePayload): string {
   return [
-    `Agent folder: ${p.agentDir}`,
-    `Write the commit message to: ${p.outputPath}`,
+    'Choose a commit message for these changes:',
     '',
     '## git status --porcelain=v1 --untracked-files=all',
     '```',
@@ -154,7 +186,7 @@ function buildCommitMessagePrompt(p: CommitMessagePayload): string {
     p.diffstat.trim() || '(empty)',
     '```',
     '',
-    'Write the commit message and stop.',
+    'Return the commit message and stop.',
   ].join('\n')
 }
 
@@ -174,7 +206,7 @@ function buildDiagnosePrompt(p: DiagnoseFailurePayload): string {
     p.stdout.trim() || '(empty)',
     '```',
     '',
-    'Inspect the repo, do the smallest safe action if any, and write your diagnosis to the log file.',
+    'Inspect the repo, do the smallest safe action if any, and return your diagnosis.',
   ].join('\n')
 }
 
