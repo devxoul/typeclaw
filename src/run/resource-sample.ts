@@ -1,5 +1,7 @@
 import { readdirSync, readFileSync, statfsSync } from 'node:fs'
 
+import { readOomEvents, unclaimedOomEvents, type OomEventsReader } from '@/container/oom-events'
+
 const BYTES_PER_MB = 1024 * 1024
 
 export type ResourceSample = {
@@ -140,6 +142,7 @@ export type ResourceSamplerOptions = {
   collect?: () => ResourceSample
   emit?: (line: string) => void
   now?: () => number
+  readOomEvents?: OomEventsReader
 }
 
 // Returns a stop function rather than running forever so the caller owns the
@@ -150,10 +153,26 @@ export function startResourceSampler(options: ResourceSamplerOptions = {}): () =
   const collect = options.collect ?? (() => collectResourceSample())
   const emit = options.emit ?? ((line: string) => console.info(line))
   const now = options.now ?? (() => Date.now())
+  const readEvents = options.readOomEvents ?? readOomEvents
+  let previousOomEvents = readEvents()
 
   let watermark: SampleWatermark | null = null
   const tick = (): void => {
     try {
+      const currentOomEvents = readEvents()
+      if (currentOomEvents !== null) {
+        const events = previousOomEvents === null ? null : unclaimedOomEvents(previousOomEvents, currentOomEvents)
+        previousOomEvents = currentOomEvents
+        if (events !== null) {
+          const pressure = events.reachedLimit
+            ? 'container reached its memory limit'
+            : 'no container memory-limit event recorded (possible Docker VM/ancestor pressure)'
+          emit(
+            `[resource] OOM kill observed (oom_kill ${events.from}→${events.to}); runtime survived — a subprocess was killed; ${pressure}` +
+              (events.claimed.length === 0 ? '' : `; claimed by ${events.claimed.join(', ')}`),
+          )
+        }
+      }
       const sample = collect()
       const at = now()
       if (!shouldEmitSample(watermark, sample, at)) return

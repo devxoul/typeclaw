@@ -5,6 +5,7 @@ import { join } from 'node:path'
 
 import type { PortForward } from '@/config'
 import { defaultDockerExec, type DockerExec, type HostDaemonRegisterPayload } from '@/container'
+import { inspectContainerExit } from '@/container/exit-reason'
 import type { PortForwardEvent } from '@/portbroker'
 import {
   discordChannelBlockSchema,
@@ -126,6 +127,7 @@ export type DaemonLogEvent =
   | { kind: 'register'; containerName: string }
   | { kind: 'deregister'; containerName: string; reason: 'requested' | 'gone' }
   | { kind: 'registration-skipped'; containerName: string; reason: string }
+  | { kind: 'container-exited'; containerName: string; reason: string }
   | { kind: 'shutdown-requested' }
   | { kind: 'port-forward-event'; event: PortForwardEvent }
   | { kind: 'tailscale-serve-event'; event: TailscaleServeEvent }
@@ -327,6 +329,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
   let nextRegistrationGeneration = 0
   const perContainerSerial = new Map<string, Promise<unknown>>()
   const gcMisses = new Map<string, number>()
+  const reportedExits = new Map<string, string>()
   let stopped = false
   let httpPort = 0
   // Boot-time restore runs concurrently with the listeners (see the kickoff
@@ -736,20 +739,27 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
     return json(rpc.kind === 'restart' ? await handleRestart(rpc) : await handleSecretsPatch(rpc))
   }
 
-  // GC tick distinguishes "container confirmed gone" from "docker call failed":
-  // a `docker ps` blip should not deregister a live container registration, so
-  // we require gcMissesToDeregister consecutive confirmed absences. Boot-time
-  // restore reuses the same probe but with a stricter policy — see
-  // restorePersistedRegistrations.
+  // A stopped container is still present in `docker ps -a` and may be
+  // restarted by Docker; retain its registration and tokens. Inspect only
+  // for diagnostics, never to decide whether to GC a present container.
   const probeContainerAlive = async (name: string): Promise<'alive' | 'gone' | 'unknown'> => {
     try {
       const result = await exec(['ps', '-a', '--filter', `name=^${name}$`, '--format', '{{.Names}}'])
       if (result.exitCode !== 0) return 'unknown'
-      const names = result.stdout
-        .trim()
-        .split('\n')
-        .filter((s) => s.length > 0)
-      return names.includes(name) ? 'alive' : 'gone'
+      const names = result.stdout.trim().split('\n')
+      if (!names.includes(name)) return 'gone'
+      const state = await inspectContainerExit(exec, name)
+      // Report each stop once. The container ID survives restarts, so key the
+      // report by ID and FinishedAt: repeated probes of one stop share a key,
+      // while a restart that crashes again between two probes gets a new one.
+      if (state?.kind === 'stopped' && state.reason !== null) {
+        const exitKey = `${state.containerId}@${state.finishedAt}`
+        if (reportedExits.get(name) !== exitKey) {
+          reportedExits.set(name, exitKey)
+          log({ kind: 'container-exited', containerName: name, reason: state.reason })
+        }
+      }
+      return 'alive'
     } catch {
       return 'unknown'
     }

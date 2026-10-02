@@ -43,6 +43,7 @@ import { hostLocaleIsCjk } from '@/shared/host-locale'
 import { type AgentOperationLease, type WithAgentOperationLock, withAgentOperationLock } from './agent-operation-lock'
 import { acquireManagedBuildCache, type ManagedBuildCacheLease } from './build-cache'
 import { COMPOSE_PROJECT } from './compose-project'
+import { inspectContainerExit } from './exit-reason'
 import { archiveContainerLogs, dockerLogsUnavailableWarning, type DockerLogArchiver } from './log-archive'
 import { formatMemorySize, readDockerTotalMemory, resolveMemoryLimit } from './memory-limit'
 import {
@@ -296,21 +297,27 @@ async function runStart({
     const containerName = containerNameFromCwd(cwd)
     const imageTagValue = imageTagFromCwd(cwd)
     const archiveBeforeRemove = async (containerId: string) => {
+      const exit = await inspectContainerExit(exec, containerId)
       const archive = await archiveLogs({
         agentDir: cwd,
         containerId,
         retentionDays: (await loadTypeclawConfig(cwd)).logs.retentionDays,
       })
-      if (archive.ok) return { ok: true as const }
-      if (archive.kind === 'failed') return { ok: false as const, reason: archive.reason }
+      if (!archive.ok && archive.kind === 'failed') return { ok: false as const, reason: archive.reason }
       // Dispatch on the callback, NOT on streamOutput. `streamOutput` defaults
       // to true, and standalone start/restart both stream Docker build output
       // AND pass a collector so they can render warnings after their spinner
       // settles; keying on streamOutput writes under the live spinner and
       // leaves that collector empty. stderr stays the no-callback fallback.
-      const warning = dockerLogsUnavailableWarning(containerId)
-      if (onWarning !== undefined) onWarning(warning)
-      else if (streamOutput) process.stderr.write(`${warning}\n`)
+      if (!archive.ok) {
+        const warning = dockerLogsUnavailableWarning(containerId)
+        if (onWarning !== undefined) onWarning(warning)
+        else if (streamOutput) process.stderr.write(`${warning}\n`)
+      }
+      if (exit?.kind === 'stopped' && exit.reason !== null) {
+        if (onWarning !== undefined) onWarning(exit.reason)
+        else if (streamOutput) process.stderr.write(`typeclaw: ${exit.reason}\n`)
+      }
       return { ok: true as const }
     }
 

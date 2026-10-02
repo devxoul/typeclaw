@@ -2,6 +2,7 @@ import { DEFAULT_LOG_RETENTION_DAYS, loadConfigSync } from '@/config'
 import { isDaemonReachable, send as sendToDaemon } from '@/hostd/client'
 
 import { type AgentOperationLease, type WithAgentOperationLock, withAgentOperationLock } from './agent-operation-lock'
+import { inspectContainerExit } from './exit-reason'
 import { archiveContainerLogs, dockerLogsUnavailableWarning, type DockerLogArchiver } from './log-archive'
 import {
   classifyRmStderr,
@@ -78,6 +79,7 @@ async function runStop({
       }
     }
     const { containerId, running } = parsed
+    const staleExit = running ? null : await inspectContainerExit(exec, containerId)
 
     // Only call `docker stop` when the container is actually running. A stopped
     // corpse from a prior crash is left around by design (no `--rm`), and
@@ -100,6 +102,7 @@ async function runStop({
       }
       onWarning?.(dockerLogsUnavailableWarning(containerId))
     }
+    if (staleExit?.kind === 'stopped' && staleExit.reason !== null) onWarning?.(staleExit.reason)
 
     // Containers run without `--rm`, so `docker stop` only stops them. Remove
     // the inspected ID without force after archival. If that same ID resumed,

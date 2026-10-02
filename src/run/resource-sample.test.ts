@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'bun:test'
+import { describe, expect, test, vi } from 'bun:test'
 import { mkdtemp, mkdir, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -202,6 +202,36 @@ describe('startResourceSampler', () => {
       expect(lines[0]).toContain('[resource-sample]')
     } finally {
       stop()
+    }
+  })
+
+  test('logs unclaimed container-limit and external-pressure kills separately, never flat/unreadable counters', () => {
+    vi.useFakeTimers()
+    const lines: string[] = []
+    let counter: { oom: number; oomKill: number } | null = { oom: 2, oomKill: 2 }
+    const stop = startResourceSampler({
+      intervalMs: 2,
+      collect: () => sample(),
+      readOomEvents: () => counter,
+      emit: (line) => lines.push(line),
+    })
+    try {
+      vi.advanceTimersByTime(2)
+      counter = { oom: 3, oomKill: 3 }
+      vi.advanceTimersByTime(2)
+      counter = null
+      vi.advanceTimersByTime(2)
+      counter = { oom: 3, oomKill: 3 }
+      vi.advanceTimersByTime(2)
+      counter = { oom: 3, oomKill: 4 }
+      vi.advanceTimersByTime(2)
+      expect(lines.filter((line) => line.includes('OOM kill observed'))).toEqual([
+        '[resource] OOM kill observed (oom_kill 2→3); runtime survived — a subprocess was killed; container reached its memory limit',
+        '[resource] OOM kill observed (oom_kill 3→4); runtime survived — a subprocess was killed; no container memory-limit event recorded (possible Docker VM/ancestor pressure)',
+      ])
+    } finally {
+      stop()
+      vi.useRealTimers()
     }
   })
 

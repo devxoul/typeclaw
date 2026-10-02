@@ -10,6 +10,8 @@ import {
 import { applyTurnThinkingLevel } from '@/agent/attention-escalation'
 import { promptWithSameRefRetryOnly } from '@/agent/retry-same-ref'
 import type { ChannelRouter } from '@/channels/router'
+import { readOomEvents, toolOomNote } from '@/container/oom-events'
+import { withToolOomPriorityArgv } from '@/container/tool-oom-priority'
 import type { McpManager } from '@/mcp'
 import type { PermissionService } from '@/permissions'
 import type {
@@ -554,8 +556,9 @@ export async function runExecForCommand(
   // server started by sh -c "node server.js") would keep stdout pipes open
   // for minutes, masking the abort. See src/agent/tools/ddg.ts for the
   // same pattern applied to curl-impersonate wrappers.
+  const oomBefore = readOomEvents()
   const proc = Bun.spawn({
-    cmd: ['sh', '-c', cmd],
+    cmd: withToolOomPriorityArgv(['sh', '-c', cmd]),
     cwd: opts.cwd,
     env: buildExecEnv(opts.cwd),
     stdout: 'pipe',
@@ -582,7 +585,8 @@ export async function runExecForCommand(
       new Response(proc.stdout as unknown as ReadableStream<Uint8Array>).text(),
       new Response(proc.stderr as unknown as ReadableStream<Uint8Array>).text(),
     ])
-    return { stdout: stdoutText, stderr: stderrText, exitCode }
+    const note = toolOomNote(oomBefore, exitCode, 'plugin exec', { log: (line) => console.warn(line) })
+    return { stdout: stdoutText, stderr: note === null ? stderrText : `${stderrText}${note}\n`, exitCode }
   } finally {
     opts.signal.removeEventListener('abort', onAbort)
     if (escalationTimer !== null) clearTimeout(escalationTimer)

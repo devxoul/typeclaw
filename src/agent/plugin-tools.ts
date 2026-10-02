@@ -4,6 +4,7 @@ import { join, relative, sep } from 'node:path'
 
 import {
   createBashToolDefinition as piCreateBashToolDefinition,
+  createLocalBashOperations,
   createEditToolDefinition as piCreateEditToolDefinition,
   createFindToolDefinition as piCreateFindToolDefinition,
   createGrepToolDefinition as piCreateGrepToolDefinition,
@@ -19,6 +20,8 @@ import { z } from 'zod'
 
 import { ACKNOWLEDGE_GUARDS } from '@/bundled-plugins/guard/keys'
 import { config, getSandboxWritablePathSpecs } from '@/config/config'
+import { readOomEvents, toolOomNote } from '@/container/oom-events'
+import { withToolOomPriorityCommand } from '@/container/tool-oom-priority'
 import { readEnvFile } from '@/init/env-file'
 import {
   classifyToolOutcome,
@@ -136,6 +139,7 @@ type BashSpawnEnvContext = {
   // that appears in process.env between policy build and spawn stays out of the
   // sandbox (closes the inherit TOCTOU).
   sandboxSpawnEnv?: Record<string, string>
+  oomNote?: string
 }
 
 const bashEnvStore = new AsyncLocalStorage<BashSpawnEnvContext | undefined>()
@@ -164,8 +168,9 @@ function readBashPreparation(args: Record<string, unknown>): DeferredBashPrepara
 
 function bashSpawnHookWithOverlay(context: BashSpawnContext): BashSpawnContext {
   const store = bashEnvStore.getStore()
-  if (store?.sandboxSpawnEnv !== undefined) return { ...context, env: { ...store.sandboxSpawnEnv } }
-  return { ...context, env: sanitizeBashSpawnEnvironment(context.env, store?.overlay, store?.withhold) }
+  const command = withToolOomPriorityCommand(context.command)
+  if (store?.sandboxSpawnEnv !== undefined) return { ...context, command, env: { ...store.sandboxSpawnEnv } }
+  return { ...context, command, env: sanitizeBashSpawnEnvironment(context.env, store?.overlay, store?.withhold) }
 }
 
 export function sanitizeBashSpawnEnvironment(
@@ -204,14 +209,33 @@ function createPiBuiltinToolDefinition(name: PiBuiltinToolName, cwd: string): To
   switch (name) {
     case 'read':
       return piCreateReadToolDefinition(cwd)
-    case 'bash':
+    case 'bash': {
+      const operations = createLocalBashOperations()
       return piCreateBashToolDefinition(cwd, {
-        // Pi 0.87 assumes a non-empty ExtensionContext when session metadata is
-        // enabled (tools/bash.js:122-143). TypeClaw owns the bash environment
-        // boundary, so disable Pi metadata rather than bypassing the spawn hook.
+        // TypeClaw owns the bash environment boundary, so disable Pi session
+        // metadata rather than bypassing the spawn hook. Bracket the real
+        // process at the operation boundary: only there can memory.events be
+        // read before spawn and after exit (Pi 0.99 reports a signal-killed
+        // shell as 128+signal, so a SIGKILLed shell surfaces as 137 too).
         exposeSessionEnvironment: false,
         spawnHook: bashSpawnHookWithOverlay,
+        operations: {
+          async exec(command, dir, options) {
+            const before = readOomEvents()
+            const result = await operations.exec(command, dir, options)
+            const note =
+              result.exitCode === null
+                ? null
+                : toolOomNote(before, result.exitCode, 'bash', { log: (line) => console.warn(line) })
+            if (note !== null) {
+              const context = bashEnvStore.getStore()
+              if (context !== undefined) context.oomNote = note
+            }
+            return result
+          },
+        },
       })
+    }
     case 'edit':
       return piCreateEditToolDefinition(cwd)
     case 'write':
@@ -639,6 +663,7 @@ export function wrapBuiltinToolDefinition<TParams extends TSchema, TDetails = un
         cleanupError = undefined
         sandboxedRealProcSucceeded = false
         const attemptArgs = { ...originalArgs }
+        let spawnEnvContext: BashSpawnEnvContext | undefined
         try {
           if (tool.name === 'bash') {
             if (opts.permissions === undefined) {
@@ -678,7 +703,7 @@ export function wrapBuiltinToolDefinition<TParams extends TSchema, TDetails = un
             signal,
           })
           await preparedSandboxRuntime?.verify()
-          const spawnEnvContext: BashSpawnEnvContext | undefined =
+          spawnEnvContext =
             bashEnvOverlay !== undefined ||
             bashEnvWithhold !== undefined ||
             preparedSandboxRuntime?.spawnEnv !== undefined
@@ -689,7 +714,9 @@ export function wrapBuiltinToolDefinition<TParams extends TSchema, TDetails = un
                     ? { sandboxSpawnEnv: preparedSandboxRuntime.spawnEnv }
                     : {}),
                 }
-              : undefined
+              : tool.name === 'bash'
+                ? {}
+                : undefined
           const executed = await bashEnvStore.run(spawnEnvContext, () =>
             tool.execute(toolCallId, attemptArgs as Static<TParams>, signal, onUpdate, ctx),
           )
@@ -707,7 +734,8 @@ export function wrapBuiltinToolDefinition<TParams extends TSchema, TDetails = un
             typeof originalCommand === 'string' &&
             (opts.realProcDependencyCheck ?? commandNeedsRealProc)(originalCommand)
         } catch (error) {
-          executionError = error
+          executionError =
+            spawnEnvContext?.oomNote === undefined ? error : appendErrorText(error, spawnEnvContext.oomNote)
         } finally {
           const cleanup = [pinnedFiles?.cleanup(), preparedSandboxRuntime?.cleanup()].filter(
             (task): task is Promise<void> => task !== undefined,

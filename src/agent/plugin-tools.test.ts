@@ -3621,6 +3621,26 @@ describe('wrapBuiltinToolDefinition (pi customTools override path)', () => {
     }
   })
 
+  test.skipIf(process.platform !== 'linux')(
+    'actual model bash spawn inherits tool OOM priority through its shell and grandchild',
+    async () => {
+      const dir = await mkdtemp(path.join(tmpdir(), 'typeclaw-oom-bash-'))
+      try {
+        const bash = defaultBuiltinPiToolDefinitions(dir).find((tool) => tool.name === 'bash')!
+        const result = await bash.execute(
+          'oom-priority',
+          { command: 'cat /proc/self/oom_score_adj; sh -c "cat /proc/self/oom_score_adj"' },
+          undefined,
+          undefined,
+          {} as never,
+        )
+        expect(textOfFirstContent(result)?.trim().split('\n')).toEqual(['600', '600'])
+      } finally {
+        await rm(dir, { recursive: true, force: true })
+      }
+    },
+  )
+
   test('buildBuiltinPiToolOverrides produces same-named ToolDefinitions ready for customTools', async () => {
     const hooks = createHookBus()
     const overrides = buildBuiltinPiToolOverrides({ agentDir: '/agent', sessionId: 's', hooks })

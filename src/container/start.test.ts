@@ -4664,13 +4664,63 @@ describe('start (composition)', () => {
     expect(calls[rmIdx]?.args).toEqual(['rm', 'a'.repeat(64)])
   })
 
+  test('start reports a stale OOM-killed runtime only after archiving its logs', async () => {
+    await writeDockerfile(root)
+    await writePackageJson(root, { typeclaw: '^0.1.0' })
+    const fake = fakeDockerExec({ imageExists: true, container: { exists: true, running: false } })
+    const order: string[] = []
+    const exec: DockerExec = async (args, options) => {
+      if (args[0] === 'inspect' && args.some((arg) => arg.includes('{{.State.OOMKilled}}'))) {
+        return {
+          exitCode: 0,
+          stdout: `${'a'.repeat(64)}|false|true|137|6442450944|2026-09-29T04:58:43Z\n`,
+          stderr: '',
+        }
+      }
+      if (args[0] === 'rm') order.push('rm')
+      return fake.exec(args, options)
+    }
+    const result = await start({
+      cwd: root,
+      preferredHostPort: 8973,
+      exec,
+      allocatePort: deterministicAllocator,
+      ensureDeps: noEnsureDeps,
+      autoUpgrade: noAutoUpgrade,
+      ...bypassVerify,
+      archiveLogs: async () => {
+        order.push('archive')
+        return { ok: true, status: 'archived', path: '/archive.log' }
+      },
+      onWarning: (warning) => {
+        expect(warning).toContain(
+          'agent runtime was SIGKILLed (137) and the container recorded an OOM kill during this run (likely container memory limit 6144 MiB)',
+        )
+        order.push('warning')
+      },
+    })
+    expect(result.ok).toBe(true)
+    expect(order).toEqual(['archive', 'warning', 'rm'])
+  })
+
   test('warns, removes a stale container with unavailable logs, and launches its replacement', async () => {
     await writeDockerfile(root)
     await writePackageJson(root, { typeclaw: '^0.1.0' })
-    const { exec, calls } = fakeDockerExec({
+    const fake = fakeDockerExec({
       imageExists: true,
       container: { exists: true, running: false },
     })
+    const { calls } = fake
+    const exec: DockerExec = async (args, options) => {
+      if (args[0] === 'inspect' && args.some((arg) => arg.includes('{{.State.OOMKilled}}'))) {
+        return {
+          exitCode: 0,
+          stdout: `${'a'.repeat(64)}|false|true|137|6442450944|2026-09-29T04:58:43Z\n`,
+          stderr: '',
+        }
+      }
+      return fake.exec(args, options)
+    }
     const warnings: string[] = []
 
     const result = await start({
@@ -4689,7 +4739,12 @@ describe('start (composition)', () => {
     expect(result.ok).toBe(true)
     expect(calls).toContainEqual(expect.objectContaining({ args: ['rm', 'a'.repeat(64)] }))
     expect(calls.some((call) => call.args[0] === 'run')).toBe(true)
-    expect(warnings).toEqual([expect.stringContaining('no new snapshot was captured')])
+    expect(warnings).toEqual([
+      expect.stringContaining('no new snapshot was captured'),
+      expect.stringContaining(
+        'agent runtime was SIGKILLed (137) and the container recorded an OOM kill during this run (likely container memory limit 6144 MiB)',
+      ),
+    ])
   })
 
   test('routes the unavailable-logs warning to onWarning on the streaming CLI default', async () => {
