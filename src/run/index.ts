@@ -35,11 +35,13 @@ import {
   createSubagentCompletionBridge,
   setReviewObserver,
   setReviewOutputObserver,
+  setReviewCoverageCapture,
   type ChannelManager,
   type PrVerdictActivityBridge,
   type SubagentCompletionBridge,
 } from '@/channels'
-import { BackgroundHandoffInventory } from '@/channels/background-handoff'
+import { LegacyBackgroundHandoffReader } from '@/channels/background-handoff'
+import { BackgroundObligationStore } from '@/channels/background-obligations'
 import { RecoveryDispatcher } from '@/channels/recovery-dispatcher'
 import { RecoveryOutbox } from '@/channels/recovery-outbox'
 import { createTunnelBridge, type TunnelBridge } from '@/channels/tunnel-bridge'
@@ -88,7 +90,7 @@ import { createStream, type Stream } from '@/stream'
 import { createTui as createTuiDefault, type TuiOptions } from '@/tui'
 import { createTunnelManager, type TunnelManager, type TunnelManagerOptions } from '@/tunnels'
 
-import { bootBackgroundHandoffs, prepareBackgroundRecoveryNotice } from './background-handoff-boot'
+import { bootChannelRestartGreeting, bootBackgroundObligations } from './background-handoff-boot'
 import { BUNDLED_PLUGINS } from './bundled-plugins'
 import { buildChannelSessionFactory } from './channel-session-factory'
 import { installFatalGuard } from './fatal-guard'
@@ -481,20 +483,25 @@ async function startAgentRuntime(
     },
   })
 
-  const backgroundInventory = new BackgroundHandoffInventory(cwd, {
-    onError: (error) => console.warn(`[run] background inventory failed: ${error}`),
+  const legacyBackgroundHandoffs = new LegacyBackgroundHandoffReader(cwd, {
+    onError: (error) => console.warn(`[run] legacy background upgrade failed: ${error}`),
   })
-  const liveSubagentRegistry = new LiveSubagentRegistry(backgroundInventory)
+  const backgroundObligations = new BackgroundObligationStore(cwd, {
+    epoch: legacyBackgroundHandoffs.processEpoch,
+    onError: (error) => console.warn(`[run] background continuity failed: ${error}`),
+  })
+  const liveSubagentRegistry = new LiveSubagentRegistry()
   const subagentCoalescer = new SubagentCoalescer()
   const liveSessionRegistry = new LiveSessionRegistry()
 
   const recoveryOutbox = new RecoveryOutbox(cwd, {
-    epoch: crypto.randomUUID(),
+    epoch: backgroundObligations.epoch,
     onError: (error) => console.warn(`[run] recovery outbox failed: ${error}`),
   })
   let recoveryDispatcher: RecoveryDispatcher | undefined
   const channelManager = createChannelManagerFor({
     agentDir: cwd,
+    backgroundObligations,
     secretsProvider: caps.secrets,
     channelsConfigRef: () => getConfig().channels,
     aliasesRef: () => getConfig().alias,
@@ -898,9 +905,11 @@ async function startAgentRuntime(
   // empty-turn fallback is suppressed: the review IS the turn's output, but it goes
   // through the GitHub API, not the channel send path. In-process router call — no
   // stream fan-out, since this is the recording session's own bookkeeping.
-  setReviewOutputObserver((output) => {
-    channelManager.router.noteGithubReviewOutput(output)
-  })
+  setReviewCoverageCapture(async (sessionId) => ({
+    backgroundCoverage: (await channelManager.router.captureBackgroundResultCoverage?.(sessionId)) ?? [],
+  }))
+  registerBootCleanup(() => setReviewCoverageCapture(null))
+  setReviewOutputObserver((output) => channelManager.router.noteGithubReviewOutput(output).then(() => {}))
   registerBootCleanup(() => setReviewOutputObserver(null))
 
   // Registered before channels so its cache clear lands before any channel
@@ -919,13 +928,17 @@ async function startAgentRuntime(
   registerBootCleanup(() => channelManager.stop())
   recoveryDispatcher = new RecoveryDispatcher(recoveryOutbox, channelManager.router, {
     onError: (error) => console.warn(`[run] recovery dispatch failed: ${error}`),
+    backgroundObligations,
   })
   registerBootCleanup(() => recoveryDispatcher?.stop())
-  await bootBackgroundHandoffs({
+  await bootBackgroundObligations({
+    obligations: backgroundObligations,
+    outbox: recoveryOutbox,
+    inventory: legacyBackgroundHandoffs,
+  })
+  await bootChannelRestartGreeting({
     agentDir: cwd,
-    inventory: backgroundInventory,
     router: channelManager.router,
-    recovery: { outbox: recoveryOutbox, prepare: prepareBackgroundRecoveryNotice },
     configured: (key) => getConfig().channels[key.adapter] !== undefined,
     startAdapters: () => channelManager.start(),
     onError: (error) => console.warn(`[run] channel restart-resume failed: ${error}`),
@@ -1106,9 +1119,9 @@ async function startAgentRuntime(
       await channelManager.stop()
       await mcpManager?.closeAll()
     } finally {
-      await backgroundInventory
+      await backgroundObligations
         .flush()
-        .catch((error) => console.warn(`[run] background inventory flush failed: ${error}`))
+        .catch((error) => console.warn(`[run] background continuity flush failed: ${error}`))
       await pluginsLoaded.disposePlugins()
       disposeProcessGlobals()
     }

@@ -24,29 +24,29 @@ afterEach(() => {
 })
 
 describe('review ledger', () => {
-  test('records and reads back a verdict for the same pr', () => {
-    recordReview({ sessionId: S1, workspace: WS, prNumber: 12, verdict: 'APPROVE' })
+  test('records and reads back a verdict for the same pr', async () => {
+    await recordReview({ sessionId: S1, workspace: WS, prNumber: 12, verdict: 'APPROVE' })
     expect(hasReview({ sessionId: S1, workspace: WS, prNumber: 12, verdict: 'APPROVE' })).toBe(true)
   })
 
-  test('a recorded APPROVE does not satisfy a REQUEST_CHANGES query', () => {
-    recordReview({ sessionId: S1, workspace: WS, prNumber: 12, verdict: 'APPROVE' })
+  test('a recorded APPROVE does not satisfy a REQUEST_CHANGES query', async () => {
+    await recordReview({ sessionId: S1, workspace: WS, prNumber: 12, verdict: 'APPROVE' })
     expect(hasReview({ sessionId: S1, workspace: WS, prNumber: 12, verdict: 'REQUEST_CHANGES' })).toBe(false)
   })
 
-  test('verdicts are isolated per pr number', () => {
-    recordReview({ sessionId: S1, workspace: WS, prNumber: 12, verdict: 'APPROVE' })
+  test('verdicts are isolated per pr number', async () => {
+    await recordReview({ sessionId: S1, workspace: WS, prNumber: 12, verdict: 'APPROVE' })
     expect(hasReview({ sessionId: S1, workspace: WS, prNumber: 99, verdict: 'APPROVE' })).toBe(false)
   })
 
-  test('verdicts are isolated per session', () => {
-    recordReview({ sessionId: S1, workspace: WS, prNumber: 12, verdict: 'APPROVE' })
+  test('verdicts are isolated per session', async () => {
+    await recordReview({ sessionId: S1, workspace: WS, prNumber: 12, verdict: 'APPROVE' })
     expect(hasReview({ sessionId: S2, workspace: WS, prNumber: 12, verdict: 'APPROVE' })).toBe(false)
   })
 
-  test('resetReviewTurn clears only the target session', () => {
-    recordReview({ sessionId: S1, workspace: WS, prNumber: 12, verdict: 'APPROVE' })
-    recordReview({ sessionId: S2, workspace: WS, prNumber: 12, verdict: 'APPROVE' })
+  test('resetReviewTurn clears only the target session', async () => {
+    await recordReview({ sessionId: S1, workspace: WS, prNumber: 12, verdict: 'APPROVE' })
+    await recordReview({ sessionId: S2, workspace: WS, prNumber: 12, verdict: 'APPROVE' })
     resetReviewTurn(S1)
     expect(hasReview({ sessionId: S1, workspace: WS, prNumber: 12, verdict: 'APPROVE' })).toBe(false)
     expect(hasReview({ sessionId: S2, workspace: WS, prNumber: 12, verdict: 'APPROVE' })).toBe(true)
@@ -54,27 +54,27 @@ describe('review ledger', () => {
 })
 
 describe('review observer', () => {
-  test('fires the observer with the landed verdict on recordReview', () => {
+  test('fires the observer with the landed verdict on recordReview', async () => {
     const seen: unknown[] = []
     setReviewObserver((args) => seen.push(args))
-    recordReview({ sessionId: S1, workspace: WS, prNumber: 12, verdict: 'APPROVE' })
+    await recordReview({ sessionId: S1, workspace: WS, prNumber: 12, verdict: 'APPROVE' })
     expect(seen).toEqual([{ sessionId: S1, workspace: WS, prNumber: 12, verdict: 'APPROVE' }])
   })
 
-  test('a thrown observer never breaks the ledger record', () => {
+  test('a thrown observer never breaks the ledger record', async () => {
     setReviewObserver(() => {
       throw new Error('boom')
     })
-    expect(() => recordReview({ sessionId: S1, workspace: WS, prNumber: 12, verdict: 'APPROVE' })).not.toThrow()
+    await recordReview({ sessionId: S1, workspace: WS, prNumber: 12, verdict: 'APPROVE' })
     // the record still landed despite the observer throwing
     expect(hasReview({ sessionId: S1, workspace: WS, prNumber: 12, verdict: 'APPROVE' })).toBe(true)
   })
 
-  test('__resetReviewObserverForTest detaches the observer', () => {
+  test('__resetReviewObserverForTest detaches the observer', async () => {
     const seen: unknown[] = []
     setReviewObserver((args) => seen.push(args))
     __resetReviewObserverForTest()
-    recordReview({ sessionId: S1, workspace: WS, prNumber: 12, verdict: 'APPROVE' })
+    await recordReview({ sessionId: S1, workspace: WS, prNumber: 12, verdict: 'APPROVE' })
     expect(seen).toEqual([])
   })
 
@@ -98,20 +98,24 @@ describe('review observer', () => {
 })
 
 describe('review-output observer', () => {
-  test('a recorded verdict also fires the output observer with the same state', () => {
+  test('a recorded verdict also fires the output observer with the same state', async () => {
     const seen: unknown[] = []
-    setReviewOutputObserver((args) => seen.push(args))
-    recordReview({ sessionId: S1, workspace: WS, prNumber: 12, verdict: 'APPROVE' })
+    setReviewOutputObserver((args) => {
+      seen.push(args)
+    })
+    await recordReview({ sessionId: S1, workspace: WS, prNumber: 12, verdict: 'APPROVE' })
     expect(seen).toEqual([{ sessionId: S1, workspace: WS, prNumber: 12, state: 'APPROVE' }])
   })
 
-  test('recordReviewOutput COMMENT fires the output observer but not the verdict ledger', () => {
+  test('recordReviewOutput COMMENT fires the output observer but not the verdict ledger', async () => {
     const output: unknown[] = []
     const verdicts: unknown[] = []
-    setReviewOutputObserver((args) => output.push(args))
+    setReviewOutputObserver((args) => {
+      output.push(args)
+    })
     setReviewObserver((args) => verdicts.push(args))
 
-    recordReviewOutput({ sessionId: S1, workspace: WS, prNumber: 12, state: 'COMMENT' })
+    await recordReviewOutput({ sessionId: S1, workspace: WS, prNumber: 12, state: 'COMMENT' })
 
     // given a COMMENT: the router-facing output signal fires
     expect(output).toEqual([{ sessionId: S1, workspace: WS, prNumber: 12, state: 'COMMENT' }])
@@ -120,19 +124,21 @@ describe('review-output observer', () => {
     expect(hasReview({ sessionId: S1, workspace: WS, prNumber: 12, verdict: 'APPROVE' })).toBe(false)
   })
 
-  test('a thrown output observer never breaks the ledger record', () => {
+  test('a thrown output observer never breaks the ledger record', async () => {
     setReviewOutputObserver(() => {
       throw new Error('boom')
     })
-    expect(() => recordReview({ sessionId: S1, workspace: WS, prNumber: 12, verdict: 'APPROVE' })).not.toThrow()
+    await recordReview({ sessionId: S1, workspace: WS, prNumber: 12, verdict: 'APPROVE' })
     expect(hasReview({ sessionId: S1, workspace: WS, prNumber: 12, verdict: 'APPROVE' })).toBe(true)
   })
 
-  test('__resetReviewObserverForTest detaches the output observer', () => {
+  test('__resetReviewObserverForTest detaches the output observer', async () => {
     const seen: unknown[] = []
-    setReviewOutputObserver((args) => seen.push(args))
+    setReviewOutputObserver((args) => {
+      seen.push(args)
+    })
     __resetReviewObserverForTest()
-    recordReviewOutput({ sessionId: S1, workspace: WS, prNumber: 12, state: 'COMMENT' })
+    await recordReviewOutput({ sessionId: S1, workspace: WS, prNumber: 12, state: 'COMMENT' })
     expect(seen).toEqual([])
   })
 })

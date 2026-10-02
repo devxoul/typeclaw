@@ -26,6 +26,7 @@ import { createTeamsAdapter, type TeamsAdapter } from './adapters/teams'
 import { createTelegramBotAdapter, type TelegramBotAdapter } from './adapters/telegram-bot'
 import { createWebexAdapter, type WebexAdapter } from './adapters/webex'
 import { createWebexBotAdapter, type WebexBotAdapter } from './adapters/webex-bot'
+import type { BackgroundObligationStore } from './background-obligations'
 import { describeError } from './describe-error'
 import type { GithubTokenBridge } from './github-token-bridge'
 import {
@@ -98,6 +99,7 @@ export type ChannelManagerOptions = {
   createTelegramAdapter?: typeof createTelegramBotAdapter
   createWebexAdapter?: typeof createWebexAdapter
   createWebexBotAdapter?: typeof createWebexBotAdapter
+  backgroundObligations?: BackgroundObligationStore
   // Wake-up gate: forwarded to the router, which calls
   // `permissions.has(origin, 'channel.respond')` BEFORE creating a
   // session for any inbound. Optional here to keep direct manager-level
@@ -246,6 +248,7 @@ export function createChannelManager(options: ChannelManagerOptions): ChannelMan
   const env = options.env ?? process.env
   const router = createChannelRouter({
     agentDir: options.agentDir,
+    ...(options.backgroundObligations ? { backgroundObligations: options.backgroundObligations } : {}),
     configForAdapter: (adapter) => options.channelsConfigRef()[adapter],
     logger,
     ...(options.aliasesRef ? { configuredAliases: options.aliasesRef } : {}),

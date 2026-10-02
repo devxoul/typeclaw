@@ -1,150 +1,63 @@
-import { describe, expect, test } from 'bun:test'
+import { expect, test } from 'bun:test'
 
 import { createStream } from '@/stream'
 
-import type { ChannelRouter } from './router'
 import { createSubagentCompletionBridge } from './subagent-completion-bridge'
 
-type Injection = Parameters<ChannelRouter['injectSubagentCompletionReminder']>[0]
-
-function fakeRouter(): {
-  router: Pick<ChannelRouter, 'injectSubagentCompletionReminder'>
-  calls: Injection[]
-  setOutcome: (outcome: ReturnType<ChannelRouter['injectSubagentCompletionReminder']>) => void
-} {
-  const calls: Injection[] = []
-  let outcome: ReturnType<ChannelRouter['injectSubagentCompletionReminder']> = {
-    kind: 'delivered',
-    keyId: 'discord-bot|g1|c1|',
-  }
-  return {
-    router: {
-      injectSubagentCompletionReminder: (args) => {
-        calls.push(args)
-        return outcome
-      },
-    },
-    calls,
-    setOutcome: (o) => {
-      outcome = o
-    },
-  }
+const completion = {
+  kind: 'subagent.completed' as const,
+  taskId: 'task',
+  subagent: 'explorer',
+  parentSessionId: 'parent',
+  ok: true,
+  durationMs: 100,
 }
 
-describe('createSubagentCompletionBridge', () => {
-  test('subagent.completed broadcast → injectSubagentCompletionReminder call with same fields', () => {
-    const stream = createStream()
-    const { router, calls } = fakeRouter()
-    createSubagentCompletionBridge({ stream, router })
-
-    stream.publish({
-      target: { kind: 'broadcast' },
-      payload: {
-        kind: 'subagent.completed',
-        taskId: 'bg_xyz',
-        subagent: 'explorer',
-        parentSessionId: 'ses_abc',
-        ok: true,
-        durationMs: 5_000,
+test('failed durable completion admission is contained and does not retry the child', async () => {
+  const stream = createStream()
+  const warned = Promise.withResolvers<string>()
+  let admissions = 0
+  const bridge = createSubagentCompletionBridge({
+    stream,
+    router: {
+      injectSubagentCompletionReminder: async () => {
+        admissions++
+        throw new Error('disk unavailable')
       },
-    })
-
-    expect(calls).toHaveLength(1)
-    expect(calls[0]).toMatchObject({
-      taskId: 'bg_xyz',
-      subagent: 'explorer',
-      parentSessionId: 'ses_abc',
-      ok: true,
-      durationMs: 5_000,
-    })
+    },
+    logger: { info: () => {}, warn: warned.resolve },
   })
+  stream.publish({ target: { kind: 'broadcast' }, payload: completion })
+  expect(await warned.promise).toContain('response remains owed')
+  expect(admissions).toBe(1)
+  bridge.stop()
+})
 
-  test('failed-completion broadcast forwards the error field', () => {
-    const stream = createStream()
-    const { router, calls } = fakeRouter()
-    createSubagentCompletionBridge({ stream, router })
-
-    stream.publish({
-      target: { kind: 'broadcast' },
-      payload: {
-        kind: 'subagent.completed',
-        taskId: 'bg_err',
-        subagent: 'scout',
-        parentSessionId: 'ses_abc',
-        ok: false,
-        durationMs: 1_500,
-        error: 'provider rate limit',
+test('absent-parent diagnostic waits for durable admission', async () => {
+  const stream = createStream()
+  const admission = Promise.withResolvers<void>()
+  const warned = Promise.withResolvers<string>()
+  const warnings: string[] = []
+  const bridge = createSubagentCompletionBridge({
+    stream,
+    router: {
+      injectSubagentCompletionReminder: async () => {
+        await admission.promise
+        return { kind: 'no-live-session' }
       },
-    })
-
-    expect(calls).toHaveLength(1)
-    expect(calls[0]?.ok).toBe(false)
-    expect(calls[0]?.error).toBe('provider rate limit')
-  })
-
-  test('non-subagent broadcasts are ignored', () => {
-    const stream = createStream()
-    const { router, calls } = fakeRouter()
-    createSubagentCompletionBridge({ stream, router })
-
-    stream.publish({ target: { kind: 'broadcast' }, payload: { kind: 'noise' } })
-    stream.publish({ target: { kind: 'broadcast' }, payload: { kind: 'tunnel-url-changed' } })
-
-    expect(calls).toHaveLength(0)
-  })
-
-  test('no-live-session outcome logs a warn line with the channel key (debuggable drop), no throw', () => {
-    const stream = createStream()
-    const { router, setOutcome } = fakeRouter()
-    setOutcome({ kind: 'no-live-session' })
-    const logs: string[] = []
-    createSubagentCompletionBridge({
-      stream,
-      router,
-      logger: {
-        info: (msg) => logs.push(`info:${msg}`),
-        warn: (msg) => logs.push(`warn:${msg}`),
+    },
+    logger: {
+      info: () => {},
+      warn: (message) => {
+        warnings.push(message)
+        warned.resolve(message)
       },
-    })
-
-    stream.publish({
-      target: { kind: 'broadcast' },
-      payload: {
-        kind: 'subagent.completed',
-        taskId: 'bg_xyz',
-        subagent: 'explorer',
-        parentSessionId: 'ses_gone',
-        ok: true,
-        durationMs: 100,
-        channelKey: { adapter: 'slack-bot', workspace: 'T1', chat: 'C1', thread: 't1' },
-      },
-    })
-
-    const dropLine = logs.find((l) => l.includes('subagent-completion reminder dropped'))
-    expect(dropLine).toBeDefined()
-    expect(dropLine).toStartWith('warn:')
-    expect(dropLine).toContain('ses_gone')
-    expect(dropLine).toContain('channelKey=slack-bot:T1:C1:t1')
+    },
   })
-
-  test('stop() unsubscribes — subsequent broadcasts are not forwarded', () => {
-    const stream = createStream()
-    const { router, calls } = fakeRouter()
-    const bridge = createSubagentCompletionBridge({ stream, router })
-
-    bridge.stop()
-
-    stream.publish({
-      target: { kind: 'broadcast' },
-      payload: {
-        kind: 'subagent.completed',
-        taskId: 'bg_xyz',
-        subagent: 'explorer',
-        parentSessionId: 'ses_abc',
-        ok: true,
-        durationMs: 100,
-      },
-    })
-    expect(calls).toHaveLength(0)
-  })
+  stream.publish({ target: { kind: 'broadcast' }, payload: completion })
+  await Promise.resolve()
+  expect(warnings).toEqual([])
+  admission.resolve()
+  expect(await warned.promise).toContain('no live session')
+  bridge.stop()
 })

@@ -6,6 +6,23 @@
 // is a false receipt (see channel-reply.ts). State is per-session and reset at
 // turn start, so a claim must be backed by an action in the SAME turn.
 
+import type { BackgroundObligationRef } from './background-obligations'
+
+export type ReviewResultCoverage = {
+  backgroundCoverage?: BackgroundObligationRef[]
+}
+
+let reviewCoverageCapture: ((sessionId: string) => Promise<ReviewResultCoverage>) | null = null
+
+export function setReviewCoverageCapture(capture: typeof reviewCoverageCapture): void {
+  reviewCoverageCapture = capture
+}
+
+export async function captureReviewResultCoverage(sessionId: string): Promise<ReviewResultCoverage> {
+  const coverage = await reviewCoverageCapture?.(sessionId)
+  return { backgroundCoverage: coverage?.backgroundCoverage?.map((ref) => ({ ...ref })) ?? [] }
+}
+
 export type ReviewVerdict = 'APPROVE' | 'REQUEST_CHANGES'
 export type ReviewRoundOutcome = ReviewVerdict | 'DISMISSED'
 
@@ -26,12 +43,14 @@ export type ReviewObserver = (args: {
 // verdict-claim risk and must never satisfy `hasReview()`.
 export type ReviewOutputState = ReviewVerdict | 'COMMENT'
 
-export type ReviewOutputObserver = (args: {
-  sessionId: string
-  workspace: string
-  prNumber: number
-  state: ReviewOutputState
-}) => void
+export type ReviewOutputObserver = (
+  args: {
+    sessionId: string
+    workspace: string
+    prNumber: number
+    state: ReviewOutputState
+  } & ReviewResultCoverage,
+) => void | Promise<void>
 
 type PrKey = string
 type ThreadKey = string
@@ -59,6 +78,7 @@ export function setReviewOutputObserver(observer: ReviewOutputObserver | null): 
 export function __resetReviewObserverForTest(): void {
   reviewObserver = null
   reviewOutputObserver = null
+  reviewCoverageCapture = null
 }
 
 function prKey(sessionId: string, workspace: string, prNumber: number): PrKey {
@@ -78,13 +98,15 @@ export function resetReviewTurn(sessionId: string): void {
   }
 }
 
-export function recordReview(args: {
-  sessionId: string
-  workspace: string
-  prNumber: number
-  verdict: ReviewVerdict
-  commitSha?: string
-}): void {
+export async function recordReview(
+  args: {
+    sessionId: string
+    workspace: string
+    prNumber: number
+    verdict: ReviewVerdict
+    commitSha?: string
+  } & ReviewResultCoverage,
+): Promise<void> {
   const key = prKey(args.sessionId, args.workspace, args.prNumber)
   const set = reviewsByPr.get(key) ?? new Set<ReviewVerdict>()
   set.add(args.verdict)
@@ -93,18 +115,25 @@ export function recordReview(args: {
   // ledger write — the false-receipt guard depends on this record being durable.
   if (reviewObserver !== null) {
     try {
-      reviewObserver(args)
+      reviewObserver({
+        sessionId: args.sessionId,
+        workspace: args.workspace,
+        prNumber: args.prNumber,
+        verdict: args.verdict,
+        ...(args.commitSha !== undefined ? { commitSha: args.commitSha } : {}),
+      })
     } catch {
       // swallow: a broken broadcast must not break verdict bookkeeping
     }
   }
   // A decisive verdict IS review output too — fan it to the output observer so the
   // router's empty-turn guard sees it without a second detection path.
-  recordReviewOutput({
+  await recordReviewOutput({
     sessionId: args.sessionId,
     workspace: args.workspace,
     prNumber: args.prNumber,
     state: args.verdict,
+    ...(args.backgroundCoverage !== undefined ? { backgroundCoverage: args.backgroundCoverage } : {}),
   })
 }
 
@@ -117,17 +146,19 @@ export function recordVerifiedDismissal(args: { sessionId: string; workspace: st
   }
 }
 
-export function recordReviewOutput(args: {
-  sessionId: string
-  workspace: string
-  prNumber: number
-  state: ReviewOutputState
-}): void {
+export async function recordReviewOutput(
+  args: {
+    sessionId: string
+    workspace: string
+    prNumber: number
+    state: ReviewOutputState
+  } & ReviewResultCoverage,
+): Promise<void> {
   if (reviewOutputObserver === null) return
   try {
-    reviewOutputObserver(args)
+    await reviewOutputObserver(args)
   } catch {
-    // swallow: a broken router notification must not break review bookkeeping
+    // The review already landed remotely. Settlement failure must not authorize a mutation retry.
   }
 }
 

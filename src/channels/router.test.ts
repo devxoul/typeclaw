@@ -45,6 +45,7 @@ import type { HookBus, SessionIdleEvent } from '@/plugin'
 import { waitFor } from '@/test-helpers/wait-for'
 
 import { createDiscordHistoryCallback } from './adapters/discord'
+import { BackgroundObligationStore } from './background-obligations'
 import {
   __resetReviewVerdictGuardForTest,
   configureReviewVerdictCoordinator,
@@ -88,7 +89,6 @@ import {
   isGraceWorthReusing,
   SESSION_GC_INTERVAL_MS,
   SESSION_FRESHNESS_TTL_MS,
-  buildInterruptedSubagentNotice,
   OBSERVED_MESSAGE_MAX_CHARS,
   SESSION_GRACE_HARD_TTL_MS,
   SESSION_IDLE_MS,
@@ -114,6 +114,7 @@ import type {
   ListChannelsArgs,
   RemoveOwnReactionRequest,
   RemoveOwnReactionResult,
+  OutboundCallback,
   OutboundMessage,
   ReactionRequest,
   ReactionRef,
@@ -532,6 +533,7 @@ function makeRouter(
     handoffRetryRetentionMs?: number
     handoffRetryItemLimit?: number
     handoffRetryByteLimit?: number
+    backgroundObligations?: BackgroundObligationStore
   } = {},
 ): { router: ChannelRouter; sessions: FakeSession[]; origins: SessionOrigin[] } {
   const sessions: FakeSession[] = options.sessions ?? []
@@ -540,6 +542,7 @@ function makeRouter(
   let creationAttempts = 0
   const router = createChannelRouter({
     agentDir,
+    ...(options.backgroundObligations !== undefined ? { backgroundObligations: options.backgroundObligations } : {}),
     configForAdapter: () => options.config ?? baseConfig,
     ...(options.configuredAliases !== undefined ? { configuredAliases: options.configuredAliases } : {}),
     ...(options.ensureLiveTimeoutMs !== undefined ? { ensureLiveTimeoutMs: options.ensureLiveTimeoutMs } : {}),
@@ -3616,7 +3619,7 @@ describe('ChannelRouter reaction cleanup on deliberate silence', () => {
     const dir = await tempDir()
     const { router, sessions, captured } = await setupSilentTurn(dir)
     sessions[0]!.onPrompt = async () => {
-      router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'nothing to add' })
+      await router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'nothing to add' })
       sessions[0]!.setAssistantText('Nothing actionable here.')
     }
     await router.__testing!.flushDebounce(KEY)
@@ -3808,8 +3811,8 @@ describe('ChannelRouter reaction cleanup on deliberate silence', () => {
     router.registerOutbound('discord-bot', async () => ({ ok: true }))
 
     await router.route(inbound({ reactionRef: REACTION_REF, isBotMention: false }))
-    sessions[0]!.onPrompt = () => {
-      router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'not addressed to me' })
+    sessions[0]!.onPrompt = async () => {
+      await router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'not addressed to me' })
       sessions[0]!.setAssistantText('Just observing.')
     }
     await router.__testing!.flushDebounce(KEY)
@@ -3959,14 +3962,14 @@ describe('ChannelRouter persistent output acknowledgements', () => {
     router.registerOutbound('github', async () => ({ ok: true }))
 
     await router.route(inbound({ ...key, isBotMention: true, reactionRef: triggerRef }))
-    sessions[0]!.onPrompt = () => {
-      router.noteGithubReviewOutput({
+    sessions[0]!.onPrompt = async () => {
+      await router.noteGithubReviewOutput({
         sessionId: 'ses_fake_1',
         workspace: 'acme/repo',
         prNumber: 672,
         state: 'APPROVE',
       })
-      router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'review already published' })
+      await router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'review already published' })
       sessions[0]!.setAssistantText('')
     }
     await router.__testing!.flushDebounce(key)
@@ -4003,9 +4006,12 @@ describe('ChannelRouter persistent output acknowledgements', () => {
       return { ok: true }
     })
     await original.router.route(inbound({ ...key, reactionRef: target }))
-    original.sessions[0]!.onPrompt = () => {
-      original.router.noteGithubReviewOutput({
+    original.sessions[0]!.onPrompt = async () => {
+      const captureBackground = original.router.captureBackgroundResultCoverage
+      if (!captureBackground) throw new Error('Missing durable review coverage capabilities')
+      await original.router.noteGithubReviewOutput({
         sessionId: 'ses_fake_1',
+        backgroundCoverage: await captureBackground('ses_fake_1'),
         workspace: key.workspace,
         prNumber: 672,
         state: 'APPROVE',
@@ -4160,8 +4166,8 @@ describe('ChannelRouter persistent output acknowledgements', () => {
 
     await router.route(inbound({ ...key, isBotMention: true, reactionRef: triggerRef }))
     await waitFor(() => present)
-    sessions[0]!.onPrompt = () => {
-      router.noteGithubReviewOutput({
+    sessions[0]!.onPrompt = async () => {
+      await router.noteGithubReviewOutput({
         sessionId: 'ses_fake_1',
         workspace: 'acme/repo',
         prNumber: 672,
@@ -4226,8 +4232,8 @@ describe('ChannelRouter persistent output acknowledgements', () => {
     await router.route(
       inbound({ ...key, isBotMention: true, reactionRef: { adapter: 'github', value: 'review-request' } }),
     )
-    sessions[0]!.onPrompt = () => {
-      router.noteGithubReviewOutput({
+    sessions[0]!.onPrompt = async () => {
+      await router.noteGithubReviewOutput({
         sessionId: 'ses_fake_1',
         workspace: 'acme/repo',
         prNumber: 672,
@@ -4288,8 +4294,8 @@ describe('ChannelRouter persistent output acknowledgements', () => {
           reactionRef: { adapter: 'github', value: `review-request-${index + 1}` },
         }),
       )
-      sessions[0]!.onPrompt = () => {
-        router.noteGithubReviewOutput({
+      sessions[0]!.onPrompt = async () => {
+        await router.noteGithubReviewOutput({
           sessionId: 'ses_fake_1',
           workspace: 'acme/repo',
           prNumber: 672,
@@ -5260,12 +5266,12 @@ describe('ChannelRouter channel-turn protocol', () => {
 
     await router.route(inbound({ adapter: 'github', workspace: 'acme/repo', chat: 'pr:672', text: '@bot review' }))
     let calls = 0
-    sessions[0]!.onPrompt = () => {
+    sessions[0]!.onPrompt = async () => {
       calls++
       // given: the agent lands a formal APPROVE via the GitHub API (never a channel
       // send), then whiffs empty completions on every attempt — the prod failure shape
       if (calls === 1) {
-        router.noteGithubReviewOutput({
+        await router.noteGithubReviewOutput({
           sessionId: 'ses_fake_1',
           workspace: 'acme/repo',
           prNumber: 672,
@@ -5295,8 +5301,8 @@ describe('ChannelRouter channel-turn protocol', () => {
     })
 
     await router.route(inbound({ adapter: 'github', workspace: 'acme/repo', chat: 'pr:672', text: '@bot review' }))
-    sessions[0]!.onPrompt = () => {
-      router.noteGithubReviewOutput({
+    sessions[0]!.onPrompt = async () => {
+      await router.noteGithubReviewOutput({
         sessionId: 'ses_fake_1',
         workspace: 'acme/repo',
         prNumber: 672,
@@ -5324,12 +5330,12 @@ describe('ChannelRouter channel-turn protocol', () => {
 
     await router.route(inbound({ adapter: 'github', workspace: 'acme/repo', chat: 'pr:672', text: '@bot review' }))
     let calls = 0
-    sessions[0]!.onPrompt = () => {
+    sessions[0]!.onPrompt = async () => {
       calls++
       // given: the verdict lands only on attempt 1; per the prod timeline the review
       // is in an EARLIER iteration than the empty completions that follow
       if (calls === 1) {
-        router.noteGithubReviewOutput({
+        await router.noteGithubReviewOutput({
           sessionId: 'ses_fake_1',
           workspace: 'acme/repo',
           prNumber: 672,
@@ -5592,8 +5598,8 @@ describe('ChannelRouter channel-turn protocol', () => {
     })
 
     await router.route(inbound({ text: 'just FYI, no question' }))
-    sessions[0]!.onPrompt = () => {
-      const result = router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'no new info to add' })
+    sessions[0]!.onPrompt = async () => {
+      const result = await router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'no new info to add' })
       expect(result.kind).toBe('recorded')
       sessions[0]!.setAssistantText('Nothing actionable here.')
     }
@@ -5616,8 +5622,8 @@ describe('ChannelRouter channel-turn protocol', () => {
     })
 
     await router.route(inbound({ text: 'casual' }))
-    sessions[0]!.onPrompt = () => {
-      router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'duplicate' })
+    sessions[0]!.onPrompt = async () => {
+      await router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'duplicate' })
       // given: model leaked meta-narration before / instead of NO_REPLY.
       // The skip guard must win — recovery would otherwise post this.
       sessions[0]!.setAssistantMidTurn("Same story as before; I'll stay quiet here.")
@@ -5641,8 +5647,8 @@ describe('ChannelRouter channel-turn protocol', () => {
 
     // Turn 1: skip cleanly.
     await router.route(inbound({ text: 'turn-1' }))
-    sessions[0]!.onPrompt = () => {
-      router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'turn-1-skip' })
+    sessions[0]!.onPrompt = async () => {
+      await router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'turn-1-skip' })
       sessions[0]!.setAssistantText('')
     }
     await router.__testing!.flushDebounce(KEY)
@@ -5674,7 +5680,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     await router.route(inbound({ text: 'hi' }))
     let sendResult: SendResult | undefined
     sessions[0]!.onPrompt = async () => {
-      router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'on second thought' })
+      await router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'on second thought' })
       sendResult = await router.send({
         adapter: 'discord-bot',
         workspace: 'g1',
@@ -5704,7 +5710,7 @@ describe('ChannelRouter channel-turn protocol', () => {
 
     await router.route(inbound({ text: 'hi' }))
     sessions[0]!.onPrompt = async () => {
-      router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'tool skip' })
+      await router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'tool skip' })
       // when: a system-source send fires (mimicking recovery / role-claim)
       const result = await router.send(
         { adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: 'system-side message' },
@@ -5729,7 +5735,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     })
 
     await router.route(inbound({ text: 'hi' }))
-    let markResult: ReturnType<ChannelRouter['markTurnSkipped']> | undefined
+    let markResult: Awaited<ReturnType<ChannelRouter['markTurnSkipped']>> | undefined
     sessions[0]!.onPrompt = async () => {
       // given: a tool-source ack has already landed this turn
       const sendResult = await router.send({
@@ -5740,7 +5746,7 @@ describe('ChannelRouter channel-turn protocol', () => {
       })
       expect(sendResult.ok).toBe(true)
       // when: the model then goes quiet (the ack-then-wait pattern)
-      markResult = router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'waiting for reviewer' })
+      markResult = await router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'waiting for reviewer' })
     }
     await router.__testing!.flushDebounce(KEY)
 
@@ -5769,7 +5775,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     sessions[0]!.onPrompt = async () => {
       await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: 'On it' })
       for (let i = 0; i < MAX_CHANNEL_SENDS_PER_TURN + 5; i++) {
-        const skip = router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'waiting for reviewer' })
+        const skip = await router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'waiting for reviewer' })
         if (skip.kind === 'recorded-after-send' || skip.kind === 'recorded') break
         await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: `still working (${i})` })
       }
@@ -5792,7 +5798,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     await router.route(inbound({ text: 'first' }))
     sessions[0]!.onPrompt = async () => {
       // given: silence-first skip with no prior send arms the send lock
-      const r = router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'nothing to add' })
+      const r = await router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'nothing to add' })
       expect(r.kind).toBe('recorded')
       // when: a later tool-source send is attempted in the same turn
       const send = await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: 'wait, reply' })
@@ -5804,9 +5810,9 @@ describe('ChannelRouter channel-turn protocol', () => {
     expect(sent).toHaveLength(0)
 
     // next turn with no send: skip still records cleanly (per-turn reset)
-    let turn2Result: ReturnType<ChannelRouter['markTurnSkipped']> | undefined
-    sessions[0]!.onPrompt = () => {
-      turn2Result = router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'still nothing' })
+    let turn2Result: Awaited<ReturnType<ChannelRouter['markTurnSkipped']>> | undefined
+    sessions[0]!.onPrompt = async () => {
+      turn2Result = await router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'still nothing' })
       sessions[0]!.setAssistantText('')
     }
     await router.route(inbound({ text: 'second', externalMessageId: 'm2' }))
@@ -5833,7 +5839,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     let sendResult: SendResult | undefined
     sessions[0]!.onPrompt = async () => {
       // given: silence-first skip, then a contested reply attempt
-      router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'on second thought' })
+      await router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'on second thought' })
       sendResult = await router.send({
         adapter: 'discord-bot',
         workspace: 'g1',
@@ -5869,7 +5875,7 @@ describe('ChannelRouter channel-turn protocol', () => {
 
     await router.route(inbound({ text: 'anything to add?' }))
     sessions[0]!.onPrompt = async () => {
-      router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'nothing actionable' })
+      await router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'nothing actionable' })
       await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: 'NO_REPLY' })
       sessions[0]!.setAssistantText('NO_REPLY')
     }
@@ -5895,7 +5901,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     // turn 1: contested skip (recovers a reply)
     await router.route(inbound({ text: 'first' }))
     sessions[0]!.onPrompt = async () => {
-      router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'changed mind' })
+      await router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'changed mind' })
       await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: 'turn-1 reply' })
       sessions[0]!.setAssistantText('turn-1 reply')
     }
@@ -5903,8 +5909,8 @@ describe('ChannelRouter channel-turn protocol', () => {
     expect(sent).toHaveLength(1)
 
     // turn 2: clean skip-only — must short-circuit, no recovery, no leak
-    sessions[0]!.onPrompt = () => {
-      router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'nothing to add' })
+    sessions[0]!.onPrompt = async () => {
+      await router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'nothing to add' })
       sessions[0]!.setAssistantText('this text should NOT be recovered')
     }
     await router.route(inbound({ text: 'second', externalMessageId: 'm2' }))
@@ -5936,7 +5942,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     await router.route(inbound({ text: 'just FYI' }))
     const sendResults: SendResult[] = []
     sessions[0]!.onPrompt = async () => {
-      router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'nothing to add' })
+      await router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'nothing to add' })
       // when: the model ignores the lock and retries SEQUENTIALLY with DIFFERENT
       // text each time (so the byte-identical loop-guard never fires), stopping
       // only when the run signal is aborted — as the real agent loop would
@@ -6011,7 +6017,7 @@ describe('ChannelRouter channel-turn protocol', () => {
 
     await router.route(inbound({ text: 'just FYI' }))
     sessions[0]!.onPrompt = async () => {
-      router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'nothing to add' })
+      await router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'nothing to add' })
       let i = 0
       while (!sessions[0]!.agent.signal.aborted && i < 100) {
         await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: `attempt ${i}` })
@@ -6039,7 +6045,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     // turn 1: skip, then deny just below the ceiling (no throw, no delivery)
     await router.route(inbound({ text: 'first' }))
     sessions[0]!.onPrompt = async () => {
-      router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'nothing' })
+      await router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'nothing' })
       for (let i = 0; i < MAX_POLICY_DENIED_CHANNEL_SENDS_PER_TURN - 1; i++) {
         await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: `x${i}` })
       }
@@ -6058,8 +6064,8 @@ describe('ChannelRouter channel-turn protocol', () => {
     expect(sent[0]!.text).toBe('real reply')
   })
 
-  test('skip_response: markTurnSkipped returns no-live-session when sessionId does not match any live session', () => {
-    const result = makeRouter('/tmp/unused').router.markTurnSkipped({
+  test('skip_response: markTurnSkipped returns no-live-session when sessionId does not match any live session', async () => {
+    const result = await makeRouter('/tmp/unused').router.markTurnSkipped({
       parentSessionId: 'ses_no_such_session',
       reason: 'whatever',
     })
@@ -7791,7 +7797,7 @@ describe('ChannelRouter channel-turn protocol', () => {
 
     await router.route(inbound({ text: 'say something' }))
     sessions[0]!.onPrompt = async () => {
-      router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'changed my mind' })
+      await router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'changed my mind' })
       await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: 'denied attempt' })
       sessions[0]!.setAssistantMidTurn('stranded loop output', 'length')
     }
@@ -9057,7 +9063,7 @@ describe('ChannelRouter duplicate-send guard', () => {
           const mappings = await loadChannelSessions(dir)
           const parentSessionId = mappings[0]?.sessionId
           if (parentSessionId === undefined) throw new Error('live turn did not persist its parent session')
-          router.markTurnSkipped({ parentSessionId, reason: 'intentional quiet' })
+          await router.markTurnSkipped({ parentSessionId, reason: 'intentional quiet' })
         }
         const before = router.__testing!.getRecoveryAccountingSnapshot(KEY)
         expect(before).toBeDefined()
@@ -14432,13 +14438,15 @@ describe('ChannelRouter injectSubagentCompletionReminder', () => {
     // the failure can still be seen.
     failRoleDescribe = true
     expect(
-      router.injectSubagentCompletionReminder({
-        parentSessionId: 'ses_fake_1',
-        subagent: 'explorer',
-        taskId: 'bg_drain_boom',
-        ok: true,
-        durationMs: 100,
-      }).kind,
+      (
+        await router.injectSubagentCompletionReminder({
+          parentSessionId: 'ses_fake_1',
+          subagent: 'explorer',
+          taskId: 'bg_drain_boom',
+          ok: true,
+          durationMs: 100,
+        })
+      ).kind,
     ).toBe('delivered')
 
     // then: the failure is reported rather than swallowed by the tracking, and
@@ -14464,7 +14472,7 @@ describe('ChannelRouter injectSubagentCompletionReminder', () => {
     const initialPromptCount = sessions[0]!.prompts.length
 
     // when a subagent completes for that exact sessionId
-    const result = router.injectSubagentCompletionReminder({
+    const result = await router.injectSubagentCompletionReminder({
       parentSessionId: 'ses_fake_1',
       subagent: 'explorer',
       taskId: 'bg_xyz',
@@ -14488,7 +14496,7 @@ describe('ChannelRouter injectSubagentCompletionReminder', () => {
     await router.route(inbound())
     await router.__testing!.flushDebounce(KEY)
 
-    router.injectSubagentCompletionReminder({
+    await router.injectSubagentCompletionReminder({
       parentSessionId: 'ses_fake_1',
       subagent: 'explorer',
       taskId: 'bg_xyz',
@@ -14513,7 +14521,7 @@ describe('ChannelRouter injectSubagentCompletionReminder', () => {
     expect(sessions).toHaveLength(1)
 
     // when a reviewer subagent completes for it
-    const result = router.injectSubagentCompletionReminder({
+    const result = await router.injectSubagentCompletionReminder({
       parentSessionId: 'ses_fake_1',
       subagent: 'reviewer',
       taskId: 'bg_gh',
@@ -14536,7 +14544,7 @@ describe('ChannelRouter injectSubagentCompletionReminder', () => {
     await router.route(inbound())
     await router.__testing!.flushDebounce(KEY)
 
-    router.injectSubagentCompletionReminder({
+    await router.injectSubagentCompletionReminder({
       parentSessionId: 'ses_fake_1',
       subagent: 'reviewer',
       taskId: 'bg_dc',
@@ -14558,7 +14566,7 @@ describe('ChannelRouter injectSubagentCompletionReminder', () => {
     await router.__testing!.flushDebounce(KEY)
     const promptsBefore = sessions[0]!.prompts.length
 
-    const result = router.injectSubagentCompletionReminder({
+    const result = await router.injectSubagentCompletionReminder({
       parentSessionId: 'someone-else',
       subagent: 'explorer',
       taskId: 'bg_other',
@@ -14587,7 +14595,7 @@ describe('ChannelRouter injectSubagentCompletionReminder', () => {
     const promptsBefore = sessions[1]!.prompts.length
 
     // when the subagent completes carrying the STALE sessionId plus the channel key
-    const result = router.injectSubagentCompletionReminder({
+    const result = await router.injectSubagentCompletionReminder({
       parentSessionId: 'ses_fake_1',
       subagent: 'reviewer',
       taskId: 'bg_rev',
@@ -14612,7 +14620,7 @@ describe('ChannelRouter injectSubagentCompletionReminder', () => {
     await router.__testing!.flushDebounce(KEY)
     const promptsBefore = sessions[0]!.prompts.length
 
-    const result = router.injectSubagentCompletionReminder({
+    const result = await router.injectSubagentCompletionReminder({
       parentSessionId: 'ses_fake_1',
       subagent: 'reviewer',
       taskId: 'bg_exact',
@@ -14632,7 +14640,7 @@ describe('ChannelRouter injectSubagentCompletionReminder', () => {
     await router.route(inbound())
     await router.__testing!.flushDebounce(KEY)
 
-    const result = router.injectSubagentCompletionReminder({
+    const result = await router.injectSubagentCompletionReminder({
       parentSessionId: 'someone-else',
       subagent: 'reviewer',
       taskId: 'bg_nokey',
@@ -14650,7 +14658,7 @@ describe('ChannelRouter injectSubagentCompletionReminder', () => {
     await router.__testing!.flushDebounce(KEY)
     const initial = sessions[0]!.prompts.length
 
-    router.injectSubagentCompletionReminder({
+    await router.injectSubagentCompletionReminder({
       parentSessionId: 'ses_fake_1',
       subagent: 'scout',
       taskId: 'bg_err',
@@ -14684,7 +14692,7 @@ describe('ChannelRouter injectSubagentCompletionReminder', () => {
     // Queue another user inbound (held by debounce) then inject the reminder
     // before the debounce fires.
     await router.route(inbound({ externalMessageId: 'm2', text: 'follow up' }))
-    router.injectSubagentCompletionReminder({
+    await router.injectSubagentCompletionReminder({
       parentSessionId: 'ses_fake_1',
       subagent: 'explorer',
       taskId: 'bg_coalesce',
@@ -14720,7 +14728,7 @@ describe('ChannelRouter injectSubagentCompletionReminder', () => {
     const promptsBeforeReminder = sessions[0]!.prompts.length
 
     // when: a subagent completion fires while the promptQueue is empty
-    router.injectSubagentCompletionReminder({
+    await router.injectSubagentCompletionReminder({
       parentSessionId: 'ses_fake_1',
       subagent: 'explorer',
       taskId: 'bg_empty_current',
@@ -14806,7 +14814,7 @@ describe('ChannelRouter injectSubagentCompletionReminder', () => {
 
     await router.stop()
 
-    const result = router.injectSubagentCompletionReminder({
+    const result = await router.injectSubagentCompletionReminder({
       parentSessionId: 'ses_fake_1',
       subagent: 'explorer',
       taskId: 'bg_xyz',
@@ -14839,7 +14847,7 @@ describe('ChannelRouter injectSubagentCompletionReminder', () => {
       originDuringReminder = router.__testing!.getLiveOriginSnapshot(KEY)
     }
 
-    router.injectSubagentCompletionReminder({
+    await router.injectSubagentCompletionReminder({
       parentSessionId: 'ses_fake_1',
       subagent: 'explorer',
       taskId: 'bg_xyz',
@@ -14875,7 +14883,7 @@ describe('ChannelRouter injectSubagentCompletionReminder', () => {
       originDuringReminder = router.__testing!.getLiveOriginSnapshot(KEY)
     }
 
-    router.injectSubagentCompletionReminder({
+    await router.injectSubagentCompletionReminder({
       parentSessionId: 'ses_fake_1',
       subagent: 'explorer',
       taskId: 'bg_xyz',
@@ -14915,7 +14923,7 @@ describe('ChannelRouter injectSubagentCompletionReminder', () => {
       }
     }
 
-    router.injectSubagentCompletionReminder({
+    await router.injectSubagentCompletionReminder({
       parentSessionId: 'ses_fake_1',
       subagent: 'explorer',
       taskId: 'bg_xyz',
@@ -14979,7 +14987,7 @@ describe('ChannelRouter injectSubagentCompletionReminder', () => {
     expect(router.liveCount()).toBe(1)
 
     nowRef.value += SESSION_IDLE_MS + 1
-    router.injectSubagentCompletionReminder({
+    await router.injectSubagentCompletionReminder({
       parentSessionId: 'ses_fake_1',
       subagent: 'explorer',
       taskId: 'bg_xyz',
@@ -17474,7 +17482,7 @@ describe('ChannelRouter more_work_this_turn:true empty-stop recovery (phrase-ind
       })
       sessions[0]!.setAssistantMidTurn('', 'error')
     }
-    router.injectSubagentCompletionReminder({
+    await router.injectSubagentCompletionReminder({
       parentSessionId: 'ses_fake_1',
       subagent: 'reviewer',
       taskId: 'bg_reviewer',
@@ -18262,94 +18270,37 @@ describe('resumeRestartHandoff', () => {
     expect(sessions[0]?.prompts.some((p) => p.includes('container just restarted'))).toBe(true)
   })
 
-  test('delivers the interrupted-subagent notice even when a real inbound coalesced', async () => {
-    // given: a handoff carrying interrupted names AND a racing inbound. The
-    //   generic wake is skipped, but the lost-work directive must still land or
-    //   the thread is never told its result was lost (the review-flagged gap).
-    const dir = await tempDir()
-    await seedMapping(dir, 'ses_origin', '2026-05-02T16-56-52-380Z_ses_origin.jsonl')
-    const { router, sessions } = makeRouter(dir, {
-      transcriptPathFor: (sessionId) => `/tmp/fake/2026-05-02T16-56-52-380Z_${sessionId}.jsonl`,
-    })
-    const reservation = router.reserveRestartHandoff(channelHandoff({ interruptedSubagents: ['researcher'] }))!
-    const inboundDone = router.route(inbound({ authorId: 'alice', authorName: 'alice', text: 'hi there' }))
-    await waitFor(() => reservation.sawInbound)
-
-    // when
-    await reservation.resume()
-    await inboundDone
-    await router.__testing!.flushDebounce(KEY)
-
-    // then: no generic synthetic wake, but the lost-work directive rode a turn
-    expect(sessions).toHaveLength(1)
-    const prompts = sessions[0]!.prompts
-    expect(prompts.some((p) => p.includes('container just restarted'))).toBe(false)
-    expect(prompts.some((p) => p.includes(buildInterruptedSubagentNotice(['researcher'])))).toBe(true)
-  })
-
   test('flushDebounce settles a drain already in flight, not merely one it starts', async () => {
-    // given: the same coalesced-restart shape as above, but the fire-and-forget
-    //   drain's FIRST turn parks on a macrotask. The racing inbound is queued
-    //   behind it, so its prompt can only land on a later iteration of that same
-    //   drain — which flushDebounce's own `drain()` call cannot reach, because
-    //   drain() no-ops while `live.draining` is set. The park makes that window
-    //   deterministic instead of contention-dependent: it is the oversubscribed-
-    //   CI flake reproduced on purpose.
     const dir = await tempDir()
-    await seedMapping(dir, 'ses_origin', '2026-05-02T16-56-52-380Z_ses_origin.jsonl')
-    const { router, sessions } = makeRouter(dir, {
-      transcriptPathFor: (sessionId) => `/tmp/fake/2026-05-02T16-56-52-380Z_${sessionId}.jsonl`,
-      onSessionCreated: (fake) => {
-        fake.onPrompt = async () => {
-          if (fake.prompts.length > 1) return
-          await new Promise<void>((resolve) => setTimeout(resolve, 25))
-        }
-      },
+    const entered = Promise.withResolvers<void>()
+    const release = Promise.withResolvers<void>()
+    let secondTurnCompleted = false
+    const { router, sessions } = makeRouter(dir)
+    await router.route(inbound({ text: 'first request' }))
+    sessions[0]!.onPrompt = async (text) => {
+      if (sessions[0]!.prompts.length === 1) {
+        entered.resolve()
+        await release.promise
+      } else {
+        secondTurnCompleted = text.includes('second request')
+      }
+      sessions[0]!.setAssistantText('NO_REPLY')
+    }
+    const firstDrain = router.__testing!.flushDebounce(KEY)
+    await entered.promise
+    await router.route(inbound({ text: 'second request', externalMessageId: 'second' }))
+    let flushReturned = false
+    const settling = router.__testing!.flushDebounce(KEY).then(() => {
+      flushReturned = true
     })
-    const reservation = router.reserveRestartHandoff(channelHandoff({ interruptedSubagents: ['researcher'] }))!
-    const inboundDone = router.route(inbound({ authorId: 'alice', authorName: 'alice', text: 'hi there' }))
-    await waitFor(() => reservation.sawInbound)
-
-    // when
-    await reservation.resume()
-    await inboundDone
-    await router.__testing!.flushDebounce(KEY)
-
-    // then: both turns the in-flight drain owed had landed before the flush
-    // returned — no polling, because the seam settles rather than merely starts
-    const prompts = sessions[0]!.prompts
-    expect(prompts.some((p) => p.includes(buildInterruptedSubagentNotice(['researcher'])))).toBe(true)
-    expect(prompts.some((p) => p.includes('hi there'))).toBe(true)
-  })
-
-  test('delivers the notice even when the racing inbound is observe-only (never engages)', async () => {
-    // given: a handoff with interrupted names and a racing inbound that will NOT
-    //   engage (not a mention, not a reply, mentions no one). sawInbound flips
-    //   before that decision, so without an explicit drain the queued notice is
-    //   stranded — the review-flagged observe-only gap.
-    const dir = await tempDir()
-    await seedMapping(dir, 'ses_origin', '2026-05-02T16-56-52-380Z_ses_origin.jsonl')
-    const { router, sessions } = makeRouter(dir, {
-      transcriptPathFor: (sessionId) => `/tmp/fake/2026-05-02T16-56-52-380Z_${sessionId}.jsonl`,
-    })
-    const reservation = router.reserveRestartHandoff(channelHandoff({ interruptedSubagents: ['researcher'] }))!
-    const inboundDone = router.route(
-      inbound({ authorId: 'alice', authorName: 'alice', text: 'just chatting', isBotMention: false }),
-    )
-    await waitFor(() => reservation.sawInbound)
-
-    // when
-    await reservation.resume()
-    await inboundDone
-    await router.__testing!.flushDebounce(KEY)
-
-    // then: the notice still reached a prompt via the explicit drain
-    await waitFor(
-      () =>
-        sessions.length > 0 &&
-        sessions[0]!.prompts.some((p) => p.includes(buildInterruptedSubagentNotice(['researcher']))),
-    )
-    expect(sessions[0]!.prompts.some((p) => p.includes('container just restarted'))).toBe(false)
+    await Promise.resolve()
+    expect(flushReturned).toBe(false)
+    release.resolve()
+    await settling
+    expect(secondTurnCompleted).toBe(true)
+    await firstDrain
+    expect(sessions[0]!.prompts).toHaveLength(2)
+    await rm(dir, { recursive: true, force: true })
   })
 
   test('resume wake turn re-seeds the handoff author so author-scoped roles survive restart', async () => {
@@ -18523,8 +18474,8 @@ describe('GitHub review follow-up round composition', () => {
       return { ok: true, reviewId: 81, state: 'CHANGES_REQUESTED' }
     })
     const completed = Promise.withResolvers<{ kind: 'completed' | 'no-round' }>()
-    setReviewObserver((review) => {
-      void router.completeGithubReviewRound?.(review).then(completed.resolve)
+    setReviewObserver(async (review) => {
+      completed.resolve(await router.completeGithubReviewRound!(review))
     })
     const reviewTool = createPostGithubReviewTool({
       router,
@@ -18866,8 +18817,8 @@ describe('GitHub review follow-up round composition', () => {
       githubReviewRound: round,
     })
     const roundCompleted = Promise.withResolvers<{ kind: 'completed' | 'no-round' }>()
-    setReviewObserver((review) => {
-      void router.completeGithubReviewRound?.(review).then(roundCompleted.resolve)
+    setReviewObserver(async (review) => {
+      roundCompleted.resolve(await router.completeGithubReviewRound!(review))
     })
 
     const initialStarted = Promise.withResolvers<void>()
@@ -18919,7 +18870,7 @@ describe('GitHub review follow-up round composition', () => {
         }
         if (text.includes('You are now the carrier')) {
           formalSubmissions += 1
-          recordReview({
+          await recordReview({
             workspace: 'acme/widgets',
             prNumber: 7,
             verdict: 'REQUEST_CHANGES',
@@ -19188,10 +19139,10 @@ describe('GitHub review follow-up round composition', () => {
     })
 
     const completed = Promise.withResolvers<{ kind: 'completed' | 'no-round' }>()
-    setReviewObserver((review) => {
-      void router.completeGithubReviewRound?.(review).then(completed.resolve)
+    setReviewObserver(async (review) => {
+      completed.resolve(await router.completeGithubReviewRound!(review))
     })
-    recordVerifiedDismissal({ workspace: 'acme/widgets', prNumber: 7, sessionId: 'ses_fake_1' })
+    await recordVerifiedDismissal({ workspace: 'acme/widgets', prNumber: 7, sessionId: 'ses_fake_1' })
     expect(await completed.promise).toEqual({ kind: 'completed' })
     expect(
       router.injectPrVerdictActivity({
@@ -19429,9 +19380,9 @@ describe('ChannelRouter background-child await suppression', () => {
     // given: the model does tool work (spawning a background child), then ends the turn empty
     const reactionRef: ReactionRef = { adapter: 'discord-bot', value: 'review-request' }
     await router.route(inbound({ isBotMention: true, text: 'PR 좀 리뷰해줘', reactionRef }))
-    sessions[0]!.onPrompt = () => {
+    sessions[0]!.onPrompt = async () => {
       strandOnUnansweredToolUse(sessions[0]!, 'background-child')
-      router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'waiting for background child' })
+      await router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'waiting for background child' })
     }
     await router.__testing!.flushDebounce(KEY)
 
@@ -19499,7 +19450,7 @@ describe('ChannelRouter background-child await suppression', () => {
     // when: the clock advances and child A's completion wakes the session
     nowRef.value = CHILD_STARTED_AT + 60_000
     sessions[0]!.onPrompt = () => emptyStopAfterToolWork(sessions[0]!)
-    router.injectSubagentCompletionReminder({
+    await router.injectSubagentCompletionReminder({
       parentSessionId: 'ses_fake_1',
       subagent: 'reviewer',
       taskId: 'bg_child_a',
@@ -19540,8 +19491,8 @@ describe('ChannelRouter background-child await suppression', () => {
           await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: '살펴볼게.' })
           // Queued mid-drain so both land in the SAME next iteration; the drain is
           // already running, so the completion wake will not start its own.
-          const queueWake = (): void => {
-            router.injectSubagentCompletionReminder({
+          const queueWake = async (): Promise<void> => {
+            await router.injectSubagentCompletionReminder({
               parentSessionId: 'ses_fake_1',
               subagent: 'reviewer',
               taskId: 'bg_reviewer',
@@ -19551,11 +19502,11 @@ describe('ChannelRouter background-child await suppression', () => {
           }
           const queueRetry = (): void => router.__testing!.injectContinuationReminder(KEY, WILLINGNESS_NUDGE)
           if (wakeupFirst) {
-            queueWake()
+            await queueWake()
             queueRetry()
           } else {
             queueRetry()
-            queueWake()
+            await queueWake()
           }
           sessions[0]!.setAssistantText('')
           return
@@ -19619,7 +19570,7 @@ describe('ChannelRouter background-child await suppression', () => {
 
       childRunning = false
       sessions[0]!.onPrompt = () => sessions[0]!.setAssistantText('리뷰 완료: APPROVE')
-      router.injectSubagentCompletionReminder({
+      await router.injectSubagentCompletionReminder({
         parentSessionId: 'ses_fake_1',
         subagent: 'reviewer',
         taskId: 'bg_reviewer',
@@ -19723,7 +19674,7 @@ describe('ChannelRouter background-child await suppression', () => {
       await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: '리뷰 완료: APPROVE' })
       sessions[0]!.setAssistantText('')
     }
-    router.injectSubagentCompletionReminder({
+    await router.injectSubagentCompletionReminder({
       parentSessionId: 'ses_fake_1',
       subagent: 'reviewer',
       taskId: 'bg_reviewer',
@@ -19873,8 +19824,8 @@ describe('ChannelRouter GitHub review-thread closeout obligation', () => {
       return { ok: true }
     })
     const { sibling } = await routePendingRoundSiblings(router, sessions)
-    sibling.onPrompt = () => {
-      router.markTurnSkipped({ parentSessionId: 'ses_fake_2', reason: 'waiting for carrier' })
+    sibling.onPrompt = async () => {
+      await router.markTurnSkipped({ parentSessionId: 'ses_fake_2', reason: 'waiting for carrier' })
       sibling.setAssistantText('NO_REPLY')
     }
 
@@ -19942,7 +19893,7 @@ describe('ChannelRouter GitHub review-thread closeout obligation', () => {
         return
       }
       if (text.includes('still owes a close-out')) {
-        router.injectSubagentCompletionReminder({
+        await router.injectSubagentCompletionReminder({
           parentSessionId: 'ses_fake_1',
           subagent: 'reviewer',
           taskId: 'bg_review',
@@ -19977,9 +19928,9 @@ describe('ChannelRouter GitHub review-thread closeout obligation', () => {
     })
     await router.route(closeoutInbound())
     const session = sessions[0]!
-    session.onPrompt = (text) => {
+    session.onPrompt = async (text) => {
       if (text.includes('still owes a close-out')) {
-        router.injectSubagentCompletionReminder({
+        await router.injectSubagentCompletionReminder({
           parentSessionId: 'ses_fake_1',
           subagent: 'reviewer',
           taskId: 'bg_review',
@@ -20025,7 +19976,7 @@ describe('ChannelRouter GitHub review-thread closeout obligation', () => {
         })
         await router.send({ ...GITHUB_KEY, text: 'Verified — this concern is addressed.' })
       } else {
-        router.markTurnSkipped({ parentSessionId: 'ses_fake_2', reason: 'waiting for carrier' })
+        await router.markTurnSkipped({ parentSessionId: 'ses_fake_2', reason: 'waiting for carrier' })
       }
       sibling.setAssistantText('NO_REPLY')
     }
@@ -20075,8 +20026,8 @@ describe('ChannelRouter GitHub review-thread closeout obligation', () => {
       return { ok: true }
     })
     const { sibling } = await routePendingRoundSiblings(router, sessions)
-    sibling.onPrompt = () => {
-      router.markTurnSkipped({ parentSessionId: 'ses_fake_2', reason: 'no close-out' })
+    sibling.onPrompt = async () => {
+      await router.markTurnSkipped({ parentSessionId: 'ses_fake_2', reason: 'no close-out' })
       sibling.setAssistantText('NO_REPLY')
     }
     await router.__testing!.flushDebounce(GITHUB_KEY)
@@ -20113,8 +20064,8 @@ describe('ChannelRouter GitHub review-thread closeout obligation', () => {
       return { ok: true }
     })
     const { sibling } = await routePendingRoundSiblings(router, sessions)
-    sibling.onPrompt = () => {
-      router.markTurnSkipped({ parentSessionId: 'ses_fake_2', reason: 'no close-out' })
+    sibling.onPrompt = async () => {
+      await router.markTurnSkipped({ parentSessionId: 'ses_fake_2', reason: 'no close-out' })
       sibling.setAssistantText('NO_REPLY')
     }
     await router.__testing!.flushDebounce(GITHUB_KEY)
@@ -20143,8 +20094,8 @@ describe('ChannelRouter GitHub review-thread closeout obligation', () => {
       return { ok: true }
     })
     const { sibling } = await routePendingRoundSiblings(router, sessions)
-    sibling.onPrompt = () => {
-      router.markTurnSkipped({ parentSessionId: 'ses_fake_2', reason: 'waiting for carrier' })
+    sibling.onPrompt = async () => {
+      await router.markTurnSkipped({ parentSessionId: 'ses_fake_2', reason: 'waiting for carrier' })
       sibling.setAssistantText('NO_REPLY')
     }
     await router.__testing!.flushDebounce(GITHUB_KEY)
@@ -20184,8 +20135,8 @@ describe('ChannelRouter GitHub review-thread closeout obligation', () => {
         return { ok: true }
       })
       const { sibling } = await routePendingRoundSiblings(router, sessions)
-      sibling.onPrompt = () => {
-        router.markTurnSkipped({ parentSessionId: 'ses_fake_2', reason: 'no close-out' })
+      sibling.onPrompt = async () => {
+        await router.markTurnSkipped({ parentSessionId: 'ses_fake_2', reason: 'no close-out' })
         sibling.setAssistantText('NO_REPLY')
       }
       await router.__testing!.flushDebounce(GITHUB_KEY)
@@ -20211,8 +20162,8 @@ describe('ChannelRouter GitHub review-thread closeout obligation', () => {
         }),
       )
       const activeSibling = release === 'expired' ? sessions.at(-1)! : sibling
-      activeSibling.onPrompt = () => {
-        router.markTurnSkipped({
+      activeSibling.onPrompt = async () => {
+        await router.markTurnSkipped({
           parentSessionId: release === 'expired' ? 'ses_fake_3' : 'ses_fake_2',
           reason: 'no close-out',
         })
@@ -20248,8 +20199,8 @@ describe('ChannelRouter GitHub review-thread closeout obligation', () => {
         return { ok: true }
       })
       const initial = await routePendingRoundSiblings(router, sessions)
-      initial.sibling.onPrompt = () => {
-        router.markTurnSkipped({ parentSessionId: 'ses_fake_2', reason: 'waiting for carrier' })
+      initial.sibling.onPrompt = async () => {
+        await router.markTurnSkipped({ parentSessionId: 'ses_fake_2', reason: 'waiting for carrier' })
         initial.sibling.setAssistantText('NO_REPLY')
       }
       await router.__testing!.flushDebounce(GITHUB_KEY)
@@ -20271,8 +20222,8 @@ describe('ChannelRouter GitHub review-thread closeout obligation', () => {
         }),
       )
       const rehydratedSibling = sessions[3]!
-      rehydratedSibling.onPrompt = () => {
-        router.markTurnSkipped({ parentSessionId: 'ses_fake_2', reason: 'no close-out' })
+      rehydratedSibling.onPrompt = async () => {
+        await router.markTurnSkipped({ parentSessionId: 'ses_fake_2', reason: 'no close-out' })
         rehydratedSibling.setAssistantText('NO_REPLY')
       }
       await router.__testing!.flushDebounce(GITHUB_KEY)
@@ -20322,8 +20273,8 @@ describe('ChannelRouter GitHub review-thread closeout obligation', () => {
         return { ok: true }
       })
       const initial = await routePendingRoundSiblings(router, sessions)
-      initial.sibling.onPrompt = () => {
-        router.markTurnSkipped({ parentSessionId: 'ses_fake_2', reason: 'waiting for carrier' })
+      initial.sibling.onPrompt = async () => {
+        await router.markTurnSkipped({ parentSessionId: 'ses_fake_2', reason: 'waiting for carrier' })
         initial.sibling.setAssistantText('NO_REPLY')
       }
       await router.__testing!.flushDebounce(GITHUB_KEY)
@@ -20338,8 +20289,8 @@ describe('ChannelRouter GitHub review-thread closeout obligation', () => {
         }),
       )
       const successor = sessions[2]!
-      successor.onPrompt = () => {
-        router.markTurnSkipped({ parentSessionId: 'ses_fake_3', reason: 'waiting for carrier' })
+      successor.onPrompt = async () => {
+        await router.markTurnSkipped({ parentSessionId: 'ses_fake_3', reason: 'waiting for carrier' })
         successor.setAssistantText('NO_REPLY')
       }
       await router.__testing!.flushDebounce(GITHUB_KEY)
@@ -20384,8 +20335,8 @@ describe('ChannelRouter GitHub review-thread closeout obligation', () => {
     })
 
     await router.route(closeoutInbound())
-    sessions[0]!.onPrompt = () => {
-      router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'stand down' })
+    sessions[0]!.onPrompt = async () => {
+      await router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'stand down' })
       sessions[0]!.setAssistantText('NO_REPLY')
     }
     await router.__testing!.flushDebounce(GITHUB_KEY)
@@ -20414,8 +20365,8 @@ describe('ChannelRouter GitHub review-thread closeout obligation', () => {
     })
 
     await router.route(closeoutInbound())
-    sessions[0]!.onPrompt = () => {
-      router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'waiting for reviewer' })
+    sessions[0]!.onPrompt = async () => {
+      await router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'waiting for reviewer' })
       sessions[0]!.setAssistantText('NO_REPLY')
     }
     await router.__testing!.flushDebounce(GITHUB_KEY)
@@ -20434,7 +20385,7 @@ describe('ChannelRouter GitHub review-thread closeout obligation', () => {
     await router.route(closeoutInbound())
     sessions[0]!.onPrompt = async () => {
       if (sessions[0]!.prompts.length === 1) {
-        router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'child cancelled' })
+        await router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'child cancelled' })
       } else {
         await router.send({ ...GITHUB_KEY, text: 'This still needs manual review.' })
       }
@@ -20454,7 +20405,7 @@ describe('ChannelRouter GitHub review-thread closeout obligation', () => {
     await router.route(closeoutInbound())
     sessions[0]!.onPrompt = async () => {
       if (sessions[0]!.prompts.length === 1) {
-        router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'old child still running' })
+        await router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'old child still running' })
       } else {
         await router.send({ ...GITHUB_KEY, text: 'This remains open pending manual review.' })
       }
@@ -20518,7 +20469,7 @@ describe('ChannelRouter GitHub review-thread closeout obligation', () => {
           {} as Parameters<typeof reply.execute>[4],
         )
         expect(result.details).toMatchObject({ ok: true })
-        router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'done' })
+        await router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'done' })
       }
       await router.__testing!.flushDebounce(GITHUB_KEY)
 
@@ -20560,8 +20511,8 @@ describe('ChannelRouter GitHub review-thread closeout obligation', () => {
     for (const [index, item] of cases.entries()) {
       await router.route(item.message)
       const session = sessions[index]!
-      session.onPrompt = () => {
-        router.markTurnSkipped({ parentSessionId: `ses_fake_${index + 1}`, reason: 'ordinary skip' })
+      session.onPrompt = async () => {
+        await router.markTurnSkipped({ parentSessionId: `ses_fake_${index + 1}`, reason: 'ordinary skip' })
         session.setAssistantText('NO_REPLY')
       }
       await router.__testing!.flushDebounce(item.key)
@@ -20595,7 +20546,7 @@ describe('ChannelRouter GitHub review-thread closeout obligation', () => {
         })
         await router.send({ ...GITHUB_KEY, text: 'This remains open pending another change.' })
       }
-      skipKind = router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'done' }).kind
+      skipKind = (await router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'done' })).kind
       sessions[0]!.setAssistantText('NO_REPLY')
     }
     await router.__testing!.flushDebounce(GITHUB_KEY)
@@ -20621,7 +20572,7 @@ describe('ChannelRouter GitHub review-thread closeout obligation', () => {
         await router.send({ ...GITHUB_KEY, text: '확인해볼게요.' })
         emptyStopAfterToolWork(sessions[0]!)
       } else {
-        router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'test correction' })
+        await router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'test correction' })
         sessions[0]!.setAssistantText('NO_REPLY')
       }
     }
@@ -20653,8 +20604,8 @@ describe('ChannelRouter GitHub review-thread closeout obligation', () => {
         },
       }),
     )
-    sessions[0]!.onPrompt = () => {
-      router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'unknown review state' })
+    sessions[0]!.onPrompt = async () => {
+      await router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'unknown review state' })
       sessions[0]!.setAssistantText('NO_REPLY')
     }
     await router.__testing!.flushDebounce(GITHUB_KEY)
@@ -20698,8 +20649,8 @@ describe('ChannelRouter GitHub review-thread closeout obligation', () => {
         },
       }),
     )
-    sessions[0]!.onPrompt = () => {
-      router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'unknown review state' })
+    sessions[0]!.onPrompt = async () => {
+      await router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'unknown review state' })
       sessions[0]!.setAssistantText('NO_REPLY')
     }
     await router.__testing!.flushDebounce(GITHUB_KEY)
@@ -20803,5 +20754,356 @@ describe('ChannelRouter GitHub review-thread closeout obligation', () => {
     expect(sent.map((message) => message.text)).toContain(GITHUB_REVIEW_THREAD_CLOSEOUT_FALLBACK_TEXT)
     expect(logs.filter((line) => line.includes('github_thread_closeout_retry'))).toHaveLength(1)
     expect(logs.filter((line) => line.includes('github_thread_closeout_fallback'))).toHaveLength(1)
+  })
+})
+
+describe('ChannelRouter durable background response coverage', () => {
+  async function fixture(key: ChannelKey = KEY, onSessionCreated?: (session: FakeSession) => void) {
+    const dir = await tempDir()
+    const store = new BackgroundObligationStore(dir, { epoch: 'router-proof' })
+    const { router, sessions } = makeRouter(dir, {
+      backgroundObligations: store,
+      ...(onSessionCreated === undefined ? {} : { onSessionCreated }),
+    })
+    const sent: string[] = []
+    const outbound: OutboundCallback = async (message) => {
+      sent.push(message.text ?? '')
+      return { ok: true }
+    }
+    router.registerOutbound(key.adapter, outbound)
+    await router.route(inbound({ ...key }))
+    sessions[0]!.onPrompt = async () => {
+      sessions[0]!.setAssistantText('NO_REPLY')
+    }
+    await router.__testing!.flushDebounce(key)
+    async function accept(taskId: string, target = key, parentSessionId = 'ses_fake_1') {
+      return await router.acceptBackgroundResponse({
+        parentSessionId,
+        key: target,
+        taskId,
+        subagentName: 'explorer',
+        startedAt: 1000,
+        accountIdentity: 'proof-account',
+        triggeringAuthorId: 'alice',
+      })
+    }
+    return { dir, store, router, sessions, sent, accept, outbound }
+  }
+
+  async function reply(session: FakeSession, router: ChannelRouter, key: ChannelKey, text: string, moreWork = false) {
+    const backgroundCoverage = await router.captureBackgroundResultCoverage!('ses_fake_1')
+    expect((await router.send({ ...key, text })).ok).toBe(true)
+    await session.agent.afterToolCall!({
+      assistantMessage: assistantMessage(''),
+      toolCall: { type: 'toolCall', id: 'proof-reply', name: 'channel_reply', arguments: { text } },
+      args: { text },
+      result: {
+        content: [{ type: 'text', text: 'sent' }],
+        details: { ok: true, more_work_this_turn: moreWork, backgroundCoverage },
+      },
+      isError: false,
+      context: { messages: [] },
+    } as AfterToolCallContext)
+    session.setAssistantMidTurn(text, 'aborted')
+  }
+
+  for (const ending of ['reply', 'skip', 'review', 'stop'] as const) {
+    test(`${ending} settles fetched task only, leaving sibling and unrelated parent owed`, async () => {
+      const key: ChannelKey =
+        ending === 'review' ? { adapter: 'github', workspace: 'acme/repo', chat: 'pr:672', thread: null } : KEY
+      const f = await fixture(key)
+      const consumed = await f.accept('fetched')
+      const sibling = await f.accept('unfetched-sibling')
+      const unrelated = await f.accept('other-parent', { ...key, chat: 'other' }, 'absent-parent')
+      f.sessions[0]!.onPrompt = async () => {
+        await f.router.attachBackgroundResultCoverage({ parentSessionId: 'ses_fake_1', taskId: 'fetched' })
+        if (ending === 'reply') await reply(f.sessions[0]!, f.router, key, 'The answer is 42.')
+        if (ending === 'skip')
+          await f.router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'explicitly suppressed' })
+        if (ending === 'review')
+          await f.router.noteGithubReviewOutput({
+            sessionId: 'ses_fake_1',
+            workspace: 'acme/repo',
+            prNumber: 672,
+            state: 'APPROVE',
+            backgroundCoverage: await f.router.captureBackgroundResultCoverage!('ses_fake_1'),
+          })
+        if (ending === 'stop') await f.router.route(inbound({ ...key, text: '/stop', externalMessageId: 'stop' }))
+        f.sessions[0]!.setAssistantText('NO_REPLY')
+      }
+      await f.router.route(inbound({ ...key, externalMessageId: 'followup' }))
+      await f.router.__testing!.flushDebounce(key)
+      expect((await f.store.get(consumed.obligationId))?.phase).toBe('closed')
+      expect((await f.store.get(consumed.obligationId))?.outcome?.kind).toBe(
+        ending === 'skip' || ending === 'stop' ? 'intentionally-suppressed' : 'delivered',
+      )
+      expect((await f.store.get(sibling.obligationId))?.phase).not.toBe('closed')
+      expect((await f.store.get(unrelated.obligationId))?.phase).not.toBe('closed')
+      if (ending === 'reply') expect(f.sent).toEqual(['The answer is 42.'])
+      if (ending === 'review' || ending === 'skip') expect(f.sent).toEqual([])
+      await rm(f.dir, { recursive: true, force: true })
+    })
+  }
+
+  for (const output of ['progress', 'more-work', 'willingness', 'NO_REPLY'] as const) {
+    test(`${output} does not settle fetched background coverage`, async () => {
+      const f = await fixture()
+      const ref = await f.accept('still-owed')
+      f.sessions[0]!.onPrompt = async () => {
+        await f.router.attachBackgroundResultCoverage({ parentSessionId: 'ses_fake_1', taskId: 'still-owed' })
+        if (output === 'progress') await f.router.send({ ...KEY, text: 'Progress update.' })
+        if (output === 'more-work') await reply(f.sessions[0]!, f.router, KEY, 'Progress update.', true)
+        if (output === 'willingness') await reply(f.sessions[0]!, f.router, KEY, "I'll keep checking on that now.")
+        f.sessions[0]!.setAssistantText('NO_REPLY')
+      }
+      await f.router.route(inbound({ externalMessageId: 'followup' }))
+      await f.router.__testing!.flushDebounce(KEY)
+      expect((await f.store.get(ref.obligationId))?.phase).not.toBe('closed')
+      expect((await f.store.get(ref.obligationId))?.outcome).toBeUndefined()
+      await rm(f.dir, { recursive: true, force: true })
+    })
+  }
+
+  test('consumed completion settles only its task after a healthy terminal reply', async () => {
+    const f = await fixture()
+    const ref = await f.accept('completed')
+    const sibling = await f.accept('running-sibling')
+    f.sessions[0]!.onPrompt = async () => {
+      await reply(f.sessions[0]!, f.router, KEY, 'Completed result.')
+    }
+    await f.router.injectSubagentCompletionReminder({
+      parentSessionId: 'ses_fake_1',
+      taskId: 'completed',
+      subagent: 'explorer',
+      ok: true,
+      durationMs: 20,
+    })
+    await waitFor(async () => (await f.store.get(ref.obligationId))?.phase === 'closed')
+    expect((await f.store.get(sibling.obligationId))?.phase).toBe('accepted')
+    expect(f.sent).toEqual(['Completed result.'])
+    await rm(f.dir, { recursive: true, force: true })
+  })
+
+  test('reload moves retry coverage without granting another willingness nudge', async () => {
+    let created = 0
+    let successor: FakeSession | undefined
+    const f = await fixture(KEY, (session) => {
+      created++
+      if (created > 1) {
+        successor = session
+        session.onPrompt = async () => {
+          await reply(session, f.router, KEY, "I'll keep checking on that now.")
+        }
+      }
+    })
+    const ref = await f.accept('reload-retry')
+    const retryEntered = Promise.withResolvers<void>()
+    const release = Promise.withResolvers<void>()
+    let attempts = 0
+    f.sessions[0]!.onPrompt = async () => {
+      attempts++
+      if (attempts === 1) {
+        await reply(f.sessions[0]!, f.router, KEY, "I'll keep checking on that now.")
+      } else {
+        retryEntered.resolve()
+        await release.promise
+        f.sessions[0]!.setAssistantText('NO_REPLY')
+      }
+    }
+    await f.router.injectSubagentCompletionReminder({
+      parentSessionId: 'ses_fake_1',
+      taskId: 'reload-retry',
+      subagent: 'explorer',
+      ok: true,
+      durationMs: 20,
+    })
+    await retryEntered.promise
+    const owned = await f.store.get(ref.obligationId)
+    expect(owned?.phase).toBe('turn-owned')
+    f.router.__testing!.injectContinuationReminder(KEY, WILLINGNESS_NUDGE)
+    await f.router.tearDownAllLive()
+    release.resolve()
+    await f.router.__testing!.flushDebounce(KEY)
+    await waitFor(() => successor?.prompts.length === 1)
+    await f.router.__testing!.flushDebounce(KEY)
+    const moved = await f.store.get(ref.obligationId)
+    expect(moved?.generation).toBeGreaterThan(owned!.generation)
+    expect(moved?.claim?.turnId).toBe(owned?.claim?.turnId)
+    expect(successor!.prompts).toHaveLength(1)
+    expect(f.sent.filter((text) => text === "I'll keep checking on that now.")).toHaveLength(2)
+    await rm(f.dir, { recursive: true, force: true })
+  })
+
+  test('late final-result fetch cannot enlarge an already dispatched reply coverage', async () => {
+    const f = await fixture()
+    const first = await f.accept('first')
+    const late = await f.accept('late')
+    const entered = Promise.withResolvers<void>()
+    const release = Promise.withResolvers<void>()
+    f.router.unregisterOutbound('discord-bot', f.outbound)
+    f.router.registerOutbound('discord-bot', async (message) => {
+      f.sent.push(message.text ?? '')
+      entered.resolve()
+      await release.promise
+      return { ok: true }
+    })
+    f.sessions[0]!.onPrompt = async () => {
+      await f.router.attachBackgroundResultCoverage({ parentSessionId: 'ses_fake_1', taskId: 'first' })
+      const sending = reply(f.sessions[0]!, f.router, KEY, 'First result.')
+      await entered.promise
+      await f.router.attachBackgroundResultCoverage({ parentSessionId: 'ses_fake_1', taskId: 'late' })
+      release.resolve()
+      await sending
+    }
+    await f.router.route(inbound({ externalMessageId: 'followup' }))
+    await f.router.__testing!.flushDebounce(KEY)
+    expect((await f.store.get(first.obligationId))?.phase).toBe('closed')
+    expect((await f.store.get(late.obligationId))?.phase).toBe('turn-owned')
+    expect(f.sent).toEqual(['First result.'])
+    await rm(f.dir, { recursive: true, force: true })
+  })
+
+  test('failed durable claim preserves the queued completion before prompt consumption', async () => {
+    const f = await fixture()
+    const ref = await f.accept('claim-failure')
+    const original = f.store.claim.bind(f.store)
+    const attempted = Promise.withResolvers<void>()
+    f.store.claim = async () => {
+      attempted.resolve()
+      throw new Error('claim sync failed')
+    }
+    await f.router.injectSubagentCompletionReminder({
+      parentSessionId: 'ses_fake_1',
+      taskId: 'claim-failure',
+      subagent: 'explorer',
+      ok: true,
+      durationMs: 20,
+    })
+    await attempted.promise
+    await waitFor(() => f.router.__testing!.pendingReminderCount(KEY) === 1)
+    expect(f.sessions[0]!.prompts.length).toBe(1)
+    expect((await f.store.get(ref.obligationId))?.phase).toBe('result-ready')
+    f.store.claim = original
+    f.sessions[0]!.onPrompt = async () => {
+      await reply(f.sessions[0]!, f.router, KEY, 'Recovered queued result.')
+    }
+    await f.router.route(inbound({ externalMessageId: 'retry' }))
+    await f.router.__testing!.flushDebounce(KEY)
+    expect((await f.store.get(ref.obligationId))?.phase).toBe('closed')
+    expect(f.sent).toEqual(['Recovered queued result.'])
+    await rm(f.dir, { recursive: true, force: true })
+  })
+
+  test('failed suppression decision neither clears coverage nor arms the skip send lock', async () => {
+    const f = await fixture()
+    const ref = await f.accept('decision-failure')
+    const original = f.store.settle.bind(f.store)
+    f.sessions[0]!.onPrompt = async () => {
+      await f.router.attachBackgroundResultCoverage({ parentSessionId: 'ses_fake_1', taskId: 'decision-failure' })
+      f.store.settle = async () => {
+        throw new Error('outcome sync failed')
+      }
+      await expect(f.router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'quiet' })).rejects.toThrow(
+        'outcome sync failed',
+      )
+      expect((await f.store.get(ref.obligationId))?.phase).toBe('turn-owned')
+      expect((await f.router.send({ ...KEY, text: 'A progress update remains allowed.' })).ok).toBe(true)
+      f.store.settle = original
+      await f.router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'intentional quiet after progress' })
+      f.sessions[0]!.setAssistantText('NO_REPLY')
+    }
+    await f.router.route(inbound({ externalMessageId: 'followup' }))
+    await f.router.__testing!.flushDebounce(KEY)
+    expect((await f.store.get(ref.obligationId))?.outcome?.kind).toBe('intentionally-suppressed')
+    expect(f.sent).toEqual(['A progress update remains allowed.'])
+    await rm(f.dir, { recursive: true, force: true })
+  })
+
+  test('inbound arriving during durable claim remains a separate normal turn', async () => {
+    const f = await fixture()
+    const ref = await f.accept('claim-in-flight')
+    const entered = Promise.withResolvers<void>()
+    const release = Promise.withResolvers<void>()
+    const original = f.store.claim.bind(f.store)
+    f.store.claim = async (refs, owner) => {
+      if (refs.length > 0) {
+        entered.resolve()
+        await release.promise
+      }
+      return await original(refs, owner)
+    }
+    let prompts = 0
+    f.sessions[0]!.onPrompt = async (text) => {
+      prompts++
+      if (prompts === 1) {
+        expect(text).not.toContain('unrelated new request')
+        await reply(f.sessions[0]!, f.router, KEY, 'Completed task result.')
+      } else {
+        expect(text).toContain('unrelated new request')
+        expect(await f.router.captureBackgroundResultCoverage!('ses_fake_1')).toEqual([])
+        await reply(f.sessions[0]!, f.router, KEY, 'Normal new request answer.')
+      }
+    }
+    await f.router.injectSubagentCompletionReminder({
+      parentSessionId: 'ses_fake_1',
+      taskId: 'claim-in-flight',
+      subagent: 'explorer',
+      ok: true,
+      durationMs: 20,
+    })
+    await entered.promise
+    await f.router.route(inbound({ text: 'unrelated new request', externalMessageId: 'during-claim' }))
+    release.resolve()
+    await f.router.__testing!.flushDebounce(KEY)
+    expect(prompts).toBe(2)
+    expect((await f.store.get(ref.obligationId))?.phase).toBe('closed')
+    expect(f.sent).toEqual(['Completed task result.', 'Normal new request answer.'])
+    await rm(f.dir, { recursive: true, force: true })
+  })
+
+  test('frozen background continuity does not block an independent ordinary reply', async () => {
+    const f = await fixture()
+    f.store.setFrozen(new Error('journal repair required'))
+    f.sessions[0]!.onPrompt = async () => {
+      expect(await f.router.captureBackgroundResultCoverage!('ses_fake_1')).toEqual([])
+      await reply(f.sessions[0]!, f.router, KEY, 'Independent normal answer.')
+    }
+    await f.router.route(inbound({ text: 'ordinary new request', externalMessageId: 'independent' }))
+    await f.router.__testing!.flushDebounce(KEY)
+    expect(f.sent).toEqual(['Independent normal answer.'])
+    expect(f.sessions[0]!.prompts).toHaveLength(2)
+    await rm(f.dir, { recursive: true, force: true })
+  })
+
+  test('absent parent and provider failure leave completed results owed', async () => {
+    const f = await fixture()
+    const absent = await f.accept('absent', KEY, 'missing-parent')
+    expect(
+      await f.router.injectSubagentCompletionReminder({
+        parentSessionId: 'missing-parent',
+        taskId: 'absent',
+        subagent: 'explorer',
+        ok: true,
+        durationMs: 20,
+      }),
+    ).toMatchObject({ kind: 'no-live-session' })
+    expect((await f.store.get(absent.obligationId))?.phase).toBe('result-ready')
+    const failed = await f.accept('provider-failed')
+    f.sessions[0]!.onPrompt = async () => {
+      throw new Error('provider unavailable')
+    }
+    await f.router.injectSubagentCompletionReminder({
+      parentSessionId: 'ses_fake_1',
+      taskId: 'provider-failed',
+      subagent: 'explorer',
+      ok: true,
+      durationMs: 20,
+    })
+    await waitFor(() => f.sessions[0]!.prompts.length > 1)
+    await f.router.__testing!.flushDebounce(KEY)
+    expect((await f.store.get(failed.obligationId))?.phase).not.toBe('closed')
+    expect((await f.store.get(failed.obligationId))?.outcome).toBeUndefined()
+    expect(f.sent).toEqual([])
+    await rm(f.dir, { recursive: true, force: true })
   })
 })

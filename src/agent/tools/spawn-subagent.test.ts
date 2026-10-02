@@ -210,6 +210,10 @@ describe('createSpawnSubagentTool — GitHub review-round carrier gate', () => {
       agentDir: '/agent',
       parentSessionId: 'ses_parent',
       getOrigin,
+      router: {
+        acceptBackgroundResponse: async () => ({ obligationId: 'obligation', generation: 1 }),
+        suppressUnstartedBackgroundResponse: async () => {},
+      },
       generateTaskId: () => 'bg_round',
       now: () => 1_000,
     })
@@ -632,6 +636,10 @@ describe('createSpawnSubagentTool — background mode', () => {
       createSessionForSubagent: async () => stubSession(),
       agentDir: '/agent',
       parentSessionId: 'ses_parent',
+      router: {
+        acceptBackgroundResponse: async () => ({ obligationId: 'obligation', generation: 1 }),
+        suppressUnstartedBackgroundResponse: async () => {},
+      },
       getOrigin: () => ({
         kind: 'channel',
         adapter: 'slack-bot',

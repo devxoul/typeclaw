@@ -930,7 +930,7 @@ export function buildSubagentOrchestrationTools(opts: {
       ...(opts.getSessionFile !== undefined ? { getSessionFile: opts.getSessionFile } : {}),
       ...(opts.channelRouter === undefined
         ? {}
-        : { getAccountIdentity: opts.channelRouter.getRecoveryAccountIdentity }),
+        : { getAccountIdentity: opts.channelRouter.getRecoveryAccountIdentity, router: opts.channelRouter }),
       ...(opts.permissions ? { permissions: opts.permissions } : {}),
       ...(opts.stream ? { stream: opts.stream } : {}),
       ...(opts.allowBackgroundFromSubagent !== undefined
@@ -942,6 +942,7 @@ export function buildSubagentOrchestrationTools(opts: {
       liveRegistry: opts.liveRegistry,
       getOrigin: opts.getOrigin,
       callerSessionId: opts.parentSessionId,
+      ...(opts.channelRouter ? { router: opts.channelRouter } : {}),
       ...(opts.permissions ? { permissions: opts.permissions } : {}),
     }),
     createSubagentCancelTool({

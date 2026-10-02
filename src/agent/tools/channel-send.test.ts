@@ -15,6 +15,15 @@ function fakeRouter(
 ): ChannelRouter {
   return {
     route: async () => {},
+    acceptBackgroundResponse: async () => {
+      throw new Error('Unexpected background admission')
+    },
+    suppressUnstartedBackgroundResponse: async () => {
+      throw new Error('Unexpected background suppression')
+    },
+    attachBackgroundResultCoverage: async () => {
+      throw new Error('Unexpected background coverage')
+    },
     send: handler,
     getConsecutiveSendCount: () => options.consecutiveCount ?? 0,
     getSendRate: () => ({ count: 0, windowMs: 5_000 }),
@@ -83,13 +92,13 @@ function fakeRouter(
     markRestartAbortForAllLive: async () => {},
     liveCount: () => 0,
     executeCommand: async () => ({ kind: 'no-live-session' }),
-    injectSubagentCompletionReminder: () => ({ kind: 'no-live-session' }),
+    injectSubagentCompletionReminder: async () => ({ kind: 'no-live-session' }),
     injectPrVerdictActivity: () => ({ kind: 'delivered', count: 0 }),
     ...(options.finishGithubReviewThreadCloseout !== undefined
       ? { finishGithubReviewThreadCloseout: options.finishGithubReviewThreadCloseout }
       : {}),
-    noteGithubReviewOutput: () => ({ kind: 'no-live-session' }),
-    markTurnSkipped: () => ({ kind: 'no-live-session' }),
+    noteGithubReviewOutput: async () => ({ kind: 'no-live-session' }),
+    markTurnSkipped: async () => ({ kind: 'no-live-session' }),
     clearSticky: () => ({ keyId: '', cleared: 0 }),
     reserveRestartHandoff: () => null,
     resumeRestartHandoff: async () => {},

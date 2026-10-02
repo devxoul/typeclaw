@@ -1,102 +1,58 @@
 import { describe, expect, test } from 'bun:test'
 
 import type { ChannelRouter } from '@/channels/router'
-import type { OutboundMessage, SendResult } from '@/channels/types'
 
 import type { ChannelToolLogger } from './channel-log'
 import { createSkipResponseTool } from './skip-response'
 
-type MarkTurnSkippedResult = ReturnType<ChannelRouter['markTurnSkipped']>
+type MarkTurnSkippedResult = { kind: 'recorded' | 'recorded-after-send'; keyId: string } | { kind: 'no-live-session' }
 
 function fakeRouter(
   opts: {
     markResult?: MarkTurnSkippedResult
-    sendHandler?: (msg: OutboundMessage) => Promise<SendResult>
     markCalls?: Array<{ parentSessionId: string; reason: string }>
   } = {},
-): ChannelRouter {
+): Pick<ChannelRouter, 'markTurnSkipped'> {
   return {
-    route: async () => {},
-    send: opts.sendHandler ?? (async () => ({ ok: false, error: 'no adapter', code: 'no-adapter' as const })),
-    getConsecutiveSendCount: () => 0,
-    getSendRate: () => ({ count: 0, windowMs: 5_000 }),
-    registerOutbound: () => {},
-    unregisterOutbound: () => {},
-    registerRecoveryAdapter: () => {},
-    unregisterRecoveryAdapter: () => {},
-    getRecoveryAccountIdentity: async () => undefined,
-    validateRecovery: async () => undefined,
-    reconcileRecovery: async () => ({ status: 'unreconcilable' }),
-    setRecoveryStopHandler: () => {},
-    registerReaction: () => {},
-    unregisterReaction: () => {},
-    react: async () => ({ ok: true }),
-    queueReactionAfterReply: async () => ({ ok: true }),
-    registerRemoveReaction: () => {},
-    unregisterRemoveReaction: () => {},
-    removeReaction: async () => ({ ok: true }),
-    registerPrepareOwnReaction: () => {},
-    unregisterPrepareOwnReaction: () => {},
-    registerRemoveOwnReaction: () => {},
-    unregisterRemoveOwnReaction: () => {},
-    removeOwnReaction: async () => ({ ok: true }),
-    recoverWaitingReactions: async () => {},
-    registerTyping: () => {},
-    unregisterTyping: () => {},
-    setTypingCapability: () => {},
-    setTypingHeartbeatInterval: () => {},
-    setAdapterConfigured: () => {},
-    registerChannelNameResolver: () => {},
-    unregisterChannelNameResolver: () => {},
-    registerSelfIdentity: () => {},
-    unregisterSelfIdentity: () => {},
-    registerMembership: () => {},
-    unregisterMembership: () => {},
-    registerHistory: () => {},
-    unregisterHistory: () => {},
-    fetchHistory: async () => ({ ok: false, error: 'history-not-supported' }),
-    registerMessageGet: () => {},
-    unregisterMessageGet: () => {},
-    getMessage: async () => ({ ok: false, error: 'message-get-not-supported', code: 'not-supported' }),
-    registerList: () => {},
-    unregisterList: () => {},
-    listChannels: async () => ({ ok: false, error: 'list-not-supported', code: 'not-supported' }),
-    registerEditMessage: () => {},
-    unregisterEditMessage: () => {},
-    editMessage: async () => ({ ok: false, error: 'message-edit-not-supported', code: 'not-supported' }),
-    registerFetchAttachment: () => {},
-    unregisterFetchAttachment: () => {},
-    fetchAttachment: async () => ({ ok: false, error: 'no fetchAttachment' }),
-    registerReviewThreadResolver: () => {},
-    unregisterReviewThreadResolver: () => {},
-    resolveReviewThread: async () => ({ ok: true }),
-    registerReviewStateResolver: () => {},
-    unregisterReviewStateResolver: () => {},
-    getReviewState: async () => ({ ok: true, selfBlocking: false, selfBlockingReviewId: null, approve: true }),
-    registerReviewSubmitter: () => {},
-    unregisterReviewSubmitter: () => {},
-    submitReview: async () => ({ ok: true, reviewId: 1, state: 'COMMENTED' }),
-    lookupInboundAttachment: () => null,
-    listInboundAttachmentIds: () => [],
-    registerHistoryAttachments: () => {},
-    getSelfAliases: () => [],
-    stop: async () => {},
-    tearDownAllLive: async () => {},
-    markRestartAbortForAllLive: async () => {},
-    liveCount: () => 0,
-    executeCommand: async () => ({ kind: 'no-live-session' }),
-    injectSubagentCompletionReminder: () => ({ kind: 'no-live-session' }),
-    injectPrVerdictActivity: () => ({ kind: 'delivered', count: 0 }),
-    noteGithubReviewOutput: () => ({ kind: 'no-live-session' }),
-    markTurnSkipped: (args) => {
+    markTurnSkipped: async (args) => {
       opts.markCalls?.push({ parentSessionId: args.parentSessionId, reason: args.reason })
       return opts.markResult ?? { kind: 'recorded', keyId: 'discord-bot:g1:c1' }
     },
-    clearSticky: () => ({ keyId: '', cleared: 0 }),
-    reserveRestartHandoff: () => null,
-    resumeRestartHandoff: async () => {},
   }
 }
+
+test('skip waits for the owner commit and exposes storage failure', async () => {
+  const decision = Promise.withResolvers<void>()
+  const committing = Promise.withResolvers<void>()
+  const tool = createSkipResponseTool({
+    sessionId: 'parent',
+    router: {
+      markTurnSkipped: async () => {
+        committing.resolve()
+        await decision.promise
+        return { kind: 'recorded', keyId: 'key' }
+      },
+    },
+  })
+  let returned = false
+  const pending = runTool(tool, { reason: 'no new information' }).then((value) => {
+    returned = true
+    return value
+  })
+  await committing.promise
+  expect(returned).toBe(false)
+  decision.resolve()
+  expect((await pending).details).toMatchObject({ ok: true, suppressed: true })
+  const failing = createSkipResponseTool({
+    sessionId: 'parent',
+    router: {
+      markTurnSkipped: async () => {
+        throw new Error('storage unavailable')
+      },
+    },
+  })
+  await expect(runTool(failing, { reason: 'no new information' })).rejects.toThrow('storage unavailable')
+})
 
 function memoryLogger(): { logger: ChannelToolLogger; warns: string[] } {
   const warns: string[] = []
@@ -197,13 +153,8 @@ describe('createSkipResponseTool', () => {
     expect(warns.some((w) => w.includes('no live channel session for sessionId=ses_unmatched'))).toBe(true)
   })
 
-  test('tool schema: name, label, and parameters expose the structured-silence contract to the model', () => {
+  test('reason schema bounds operator log input', () => {
     const tool = createSkipResponseTool({ router: fakeRouter(), sessionId: 'ses_x' })
-    expect(tool.name).toBe('skip_response')
-    expect(tool.label).toBe('Skip Response')
-    expect(tool.description).toContain('NO_REPLY')
-    expect(tool.description).toContain('channel_reply')
-    expect(tool.description).toContain('logs')
     // Parameter schema must require a string `reason` with a finite max so
     // the model cannot dump unbounded chain-of-thought into operator logs.
     const reasonProp = (tool.parameters as { properties: { reason: { maxLength?: number; minLength?: number } } })

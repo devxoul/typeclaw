@@ -47,8 +47,8 @@ const consoleLogger: SubagentCompletionBridgeLogger = {
 // `LiveSession`, so the lookup is O(N) over live sessions with N small
 // (one per active conversation).
 //
-// On `no-live-session`, we drop the reminder. When the parent was a
-// channel session, the broadcast now carries the channel-key coordinate
+// On `no-live-session`, live routing stops but the durable response remains owed.
+// For a channel session, the broadcast carries the channel-key coordinate
 // `{ adapter, workspace, chat, thread }`, and the router first tries to
 // reroute to the live successor session for that key — covering the two
 // common drop paths where the exact sessionId is gone but the
@@ -62,22 +62,25 @@ const consoleLogger: SubagentCompletionBridgeLogger = {
 // A reminder still reaching this branch means there is no live session
 // for the key at all (the whole conversation went idle), or the parent
 // was a TUI session (handled by the TUI bridge in src/server/index.ts).
-// Logged at warn with the channel key so an undelivered completion is
-// diagnosable from logs alone.
+// Logged at warn so absent-parent completion routing remains diagnosable.
 export function createSubagentCompletionBridge(options: SubagentCompletionBridgeOptions): SubagentCompletionBridge {
   const logger = options.logger ?? consoleLogger
-  const unsubscribe = options.stream.subscribe({ target: { kind: 'broadcast' } }, (msg) => {
+  const unsubscribe = options.stream.subscribe({ target: { kind: 'broadcast' } }, async (msg) => {
     const parsed = parseSubagentCompletedPayload(msg.payload)
     if (parsed === null) return
-    const result = options.router.injectSubagentCompletionReminder(parsed)
-    if (result.kind === 'no-live-session') {
-      const keyInfo =
-        parsed.channelKey !== undefined
-          ? ` channelKey=${parsed.channelKey.adapter}:${parsed.channelKey.workspace}:${parsed.channelKey.chat}:${parsed.channelKey.thread ?? ''}`
-          : ''
-      logger.warn(
-        `[channels] subagent-completion reminder dropped: no live session for parentSessionId=${parsed.parentSessionId} task=${parsed.taskId}${keyInfo}`,
-      )
+    try {
+      const result = await options.router.injectSubagentCompletionReminder(parsed)
+      if (result.kind === 'no-live-session') {
+        const keyInfo =
+          parsed.channelKey !== undefined
+            ? ` channelKey=${parsed.channelKey.adapter}:${parsed.channelKey.workspace}:${parsed.channelKey.chat}:${parsed.channelKey.thread ?? ''}`
+            : ''
+        logger.warn(
+          `[channels] subagent-completion reminder not routed: no live session for parentSessionId=${parsed.parentSessionId} task=${parsed.taskId}${keyInfo}`,
+        )
+      }
+    } catch {
+      logger.warn(`[channels] subagent-completion admission failed: task=${parsed.taskId}; response remains owed`)
     }
   })
   return { stop: unsubscribe }

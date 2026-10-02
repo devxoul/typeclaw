@@ -4,7 +4,7 @@ description: Four typed targets, subagent dispatch, the cron split, wire-protoco
 icon: Radio
 ---
 
-`src/stream/` is the in-process pub/sub coordination primitive. Keyed by typed targets. **Ephemeral** — Bun process crash loses stream queues. Durable recovery belongs to the decision owner outside the stream: the retained background-launch inventory transfers interrupted work into the runtime recovery outbox. A queued completion is not a confirmed response. Agentic work is not resumed mid-LLM-call or replayed after death.
+`src/stream/` is the in-process pub/sub coordination primitive. Keyed by typed targets. **Ephemeral** — Bun process crash loses stream queues. Durable recovery belongs to the decision owner outside the stream: the router's background-response obligations transfer interrupted work into the runtime recovery outbox. **Queued is not delivered:** publishing, consuming or prompting a completion does not confirm a response. Agentic work is not resumed mid-LLM-call or replayed after death.
 
 ## Targets
 
@@ -26,6 +26,16 @@ Adding a fifth kind is a deliberate design choice. No generic `handler` extensio
 3. `startSubagent` wraps `invokeSubagent` with a live handle and completion result for sync/background tool spawns. Background completions publish `subagent.completed`; failed runs can carry a captured final message as recoverable output without changing the failed lifecycle status.
 
 Production registry is built from plugin contributions. The bundled memory plugin is auto-loaded and contributes `memory-logger` + `dreaming`. Each plugin `Subagent` may declare `inFlightKey(payload)`; dispatch uses `${parentSessionId}:${name}:${key}` when a trusted parent exists and `${name}:${key}` for parentless scheduler work. `payloadSchema` is validated by the cron loader at parse time and on every `reloadAll()`.
+
+### Background result continuity
+
+For direct channel-background tool launches, the router durably accepts an owed response before the child starts. `src/channels/background-obligations.ts` owns those JSON records; `LiveSubagentRegistry` owns execution status, and transcripts own result content. The completion bridge awaits the result-ready write against an existing obligation before enqueueing a wake. Missing live parents or provider failures do not erase the obligation.
+
+The parent claims exact completion IDs and generations before prompt consumption. Successful final-result fetches attach task coverage as well; running polls do not. Only a router terminal decision closes consumed or fetched coverage: a confirmed terminal reply, recognized formal review, explicit skip or `/stop`. Progress, `more_work_this_turn`, willingness, assistant `stop`, `NO_REPLY` and unrelated output leave the response owed. Siblings are not implicitly covered.
+
+After process death, boot transfers unresolved background obligations into the fixed runtime-notice outbox, using idempotent import-before-ownership and receipt-before-source-acknowledgment. A confirmed notice ends its exact coverage. The notice does not require a provider, transcript reopen or model follow-up. Healthy settlement produces no extra notice; failed local settlement after a landed reply or review can produce a conservative notice alongside that answer, never replay of the answer or work.
+
+This is the background-work guarantee, not durable admission of ordinary inbound messages. Delivery is at least once: remote notice success before a local receipt commit is ambiguous and may duplicate a notice on retry. Unavailable destinations remain blocked and owed until authorized delivery becomes possible. See [engagement](/docs/internals/engagement#background-work-across-runtime-death) for target/account fences, stop races and durability limits.
 
 ### Tool-loop termination
 

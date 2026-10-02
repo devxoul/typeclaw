@@ -39,7 +39,13 @@ import {
 } from './git-command'
 import { buildGitCredentialEnv, type GitRepoCredential } from './git-credential-env'
 import { checkGraphqlAuthNudge } from './graphql-auth-nudge'
-import { commitReviewIfSucceeded, dismissalMutationSucceeded, noteReviewCommand } from './review-recorder'
+import {
+  commitReviewIfSucceeded,
+  discardReviewCommand,
+  dismissalMutationSucceeded,
+  noteReviewCommand,
+  type NoteReviewResult,
+} from './review-recorder'
 import { classifyGhToken, shouldMintAppToken } from './token-class'
 
 const REPO_LIST_RE = /\bgh\s+repo\s+list\b/
@@ -278,7 +284,7 @@ export default definePlugin({
     // 'fall-through' means "not a repo-targeting gh command" so the caller can
     // try the git path on the same command (e.g. `git ... # gh` substrings).
     const handleGhCommand = async (params: {
-      event: { callId: string; args: Record<string, unknown>; origin?: SessionOrigin }
+      event: { callId: string; sessionId: string; args: Record<string, unknown>; origin?: SessionOrigin }
       command: string
     }): Promise<HookResult | 'fall-through'> => {
       const { event, command } = params
@@ -327,6 +333,7 @@ export default definePlugin({
         if (leaseClaimed) await verdictGuard.release({ callId: event.callId, outcome: 'failed' })
         if (dismissalLeaseClaimed) releaseGithubReviewRoundDismissal(event.callId, false)
         pendingDismissals.delete(event.callId)
+        discardReviewCommand(event.callId)
         return block
       }
       const dismissal = detectReviewDismissal(command)
@@ -343,7 +350,12 @@ export default definePlugin({
         dismissalLeaseClaimed = event.origin?.kind === 'channel' && event.origin.githubReviewRound !== undefined
         pendingDismissals.set(event.callId, dismissal)
       }
-      const review = await noteReviewCommand({ callId: event.callId, command })
+      let review: NoteReviewResult
+      try {
+        review = await noteReviewCommand({ callId: event.callId, command, sessionId: event.sessionId })
+      } catch (error) {
+        return await blockAfterLease({ block: true, reason: `Cannot capture review coverage: ${String(error)}` })
+      }
       if (review.detected !== null) {
         const block = await verdictGuard.guard({
           callId: event.callId,
@@ -354,7 +366,7 @@ export default definePlugin({
             ? { round: event.origin.githubReviewRound, thread: event.origin.thread }
             : {}),
         })
-        if (block !== null) return block
+        if (block !== null) return blockAfterLease(block)
         leaseClaimed = true
       }
       if (review.dump !== null) return blockAfterLease(review.dump)
@@ -663,7 +675,7 @@ export default definePlugin({
               releaseGithubReviewRoundDismissal(event.callId, verified)
             }
           }
-          const review = commitReviewIfSucceeded({
+          const review = await commitReviewIfSucceeded({
             sessionId: event.sessionId,
             callId: event.callId,
             result: event.result,

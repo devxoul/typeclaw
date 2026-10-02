@@ -3,6 +3,7 @@ import { link, mkdir, open, readFile, readdir, rename, stat, unlink } from 'node
 import { basename, dirname, join, resolve } from 'node:path'
 
 import { validateRecoveryRecord, type RecoveryRecord } from './continuity-types'
+import { createRecoveryNotice } from './recovery-notice'
 import type { ChannelKey, ReactionRef } from './types'
 import { channelKeyId } from './types'
 
@@ -47,6 +48,31 @@ export function resolveBackgroundRecoveryIdentity(record: BackgroundInventoryRec
   }
 }
 
+/** Frozen PR1 identity; upgrading the source must not create another delivery. */
+export function createLegacyRecoveryNotice(source: BackgroundInventoryRecord): RecoveryRecord {
+  const identity = JSON.stringify([channelKeyId(source.key), source.parentSessionId, source.generationId])
+  return createRecoveryNotice({
+    target: source.key,
+    ...resolveBackgroundRecoveryIdentity(source),
+    principal: {
+      kind: 'channel',
+      adapter: source.key.adapter,
+      workspace: source.key.workspace,
+      chat: source.key.chat,
+      ...(source.parentChat !== undefined ? { parentChat: source.parentChat } : {}),
+      ...(source.triggeringAuthorId ? { lastInboundAuthorId: source.triggeringAuthorId } : {}),
+    },
+    covers: source.tasks.map((task) => ({
+      store: 'inventory' as const,
+      id: createHash('sha256').update(`inventory:${identity}:${task.taskId}`).digest('hex'),
+      generation: 1,
+    })),
+    recoveryGeneration: `${source.generationId}:${source.parentSessionId}`,
+    transferId: createHash('sha256').update(`inventory-transfer:${identity}`).digest('hex'),
+    sourceParentSessionId: source.parentSessionId,
+  })
+}
+
 function transferMatchesSource(source: BackgroundInventoryRecord, transfer: RecoveryRecord): boolean {
   const resolved = resolveBackgroundRecoveryIdentity(source)
   const identity = JSON.stringify([channelKeyId(source.key), source.parentSessionId, source.generationId])
@@ -71,20 +97,7 @@ function transferMatchesSource(source: BackgroundInventoryRecord, transfer: Reco
   )
 }
 
-export type BackgroundLaunchIdentity = {
-  parentSessionId: string
-  key: ChannelKey
-  taskId: string
-  generationId: string
-  processEpoch: string
-}
-
 export type ClaimedBackgroundInventory = { record: BackgroundInventoryRecord; claimPath: string }
-type LaunchInput = Pick<
-  BackgroundInventoryRecord,
-  'parentSessionId' | 'parentSessionFile' | 'key' | 'parentChat' | 'triggeringAuthorId' | 'accountIdentity'
-> &
-  BackgroundInventoryRecord['tasks'][number]
 
 const hashPattern = '[a-f0-9]{64}'
 const uuidPattern = '[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}'
@@ -259,11 +272,11 @@ async function publish(path: string, record: BackgroundInventoryRecord, exclusiv
   }
 }
 
-export class BackgroundHandoffInventory {
+export class LegacyBackgroundHandoffReader {
+  /** Upgrade-only legacy reader. New launches are admitted by BackgroundObligationStore. */
   readonly processEpoch: string
   private readonly directory: string
   private readonly bootStartedAt: number
-  private readonly pending = new Set<Promise<unknown>>()
   private readonly onError: (error: unknown) => void
   private readonly ownedClaims = new Set<string>()
 
@@ -284,124 +297,6 @@ export class BackgroundHandoffInventory {
     } catch {
       /* Logging must not strand other records. */
     }
-  }
-
-  private track<T>(promise: Promise<T>): Promise<T> {
-    this.pending.add(promise)
-    void promise.then(
-      () => this.pending.delete(promise),
-      () => this.pending.delete(promise),
-    )
-    return promise
-  }
-
-  add(input: LaunchInput): Promise<BackgroundLaunchIdentity> {
-    // Capture caller-owned metadata before queueing, not when its filesystem turn arrives.
-    const snapshot = structuredClone(input)
-    const hash = recordHash(snapshot.key, snapshot.parentSessionId)
-    const path = join(this.directory, `${hash}.json`)
-    return this.track(
-      serialized(path, async () => {
-        const file = snapshot.parentSessionFile ? basename(snapshot.parentSessionFile) : undefined
-        if (
-          !validKey(snapshot.key) ||
-          !snapshot.parentSessionId ||
-          !snapshot.taskId ||
-          typeof snapshot.subagentName !== 'string' ||
-          !Number.isFinite(snapshot.startedAt) ||
-          (snapshot.parentChat !== undefined && (typeof snapshot.parentChat !== 'string' || !snapshot.parentChat)) ||
-          !validReaction(snapshot.triggerReactionRef)
-        )
-          throw new Error('Invalid background launch metadata')
-        await mkdir(this.directory, { recursive: true })
-        await syncDirectory(dirname(this.directory))
-        await syncDirectory(dirname(dirname(this.directory)))
-        let record: BackgroundInventoryRecord | undefined
-        let invalid = false
-        try {
-          record = await readRecord(path, hash)
-        } catch (error) {
-          if (!(error instanceof InvalidBackgroundInventory)) throw error
-          invalid = true
-          this.report(error)
-        }
-        if (invalid || (record && record.processEpoch !== this.processEpoch)) {
-          // Retain prior or unreadable evidence in the existing claim namespace.
-          // Recovery bookkeeping must not reserve a healthy parent's launch slot.
-          const claimDirectory = join(this.directory, 'claimed')
-          await mkdir(claimDirectory, { recursive: true })
-          try {
-            await rename(path, join(claimDirectory, `${hash}.${randomUUID()}.json`))
-          } catch (error) {
-            if (!missing(error)) throw error
-          }
-          await syncDirectory(claimDirectory)
-          await syncDirectory(this.directory)
-          record = undefined
-        }
-        if (!record) {
-          record = {
-            schemaVersion: 1,
-            generationId: randomUUID(),
-            processEpoch: this.processEpoch,
-            parentSessionId: snapshot.parentSessionId,
-            ...(validSessionFile(file) ? { parentSessionFile: file } : {}),
-            key: snapshot.key,
-            triggeringAuthorId: snapshot.triggeringAuthorId,
-            ...(snapshot.parentChat !== undefined ? { parentChat: snapshot.parentChat } : {}),
-            tasks: [],
-          }
-        }
-        if (!record.tasks.some((task) => task.taskId === snapshot.taskId)) {
-          const next = {
-            ...record,
-            triggeringAuthorId: snapshot.triggeringAuthorId ?? record.triggeringAuthorId,
-            ...(snapshot.parentChat !== undefined ? { parentChat: snapshot.parentChat } : {}),
-            tasks: [
-              ...record.tasks,
-              {
-                taskId: snapshot.taskId,
-                subagentName: snapshot.subagentName,
-                startedAt: snapshot.startedAt,
-                accountIdentity: snapshot.accountIdentity || 'unbound-legacy',
-                triggerReactionRef: snapshot.triggerReactionRef,
-              },
-            ],
-          }
-          if (!(await publish(path, next, record.tasks.length === 0))) {
-            throw new Error('Concurrent runtime inventory publication is unsupported')
-          }
-        }
-        return {
-          parentSessionId: record.parentSessionId,
-          key: record.key,
-          taskId: snapshot.taskId,
-          generationId: record.generationId,
-          processEpoch: record.processEpoch,
-        }
-      }),
-    )
-  }
-
-  remove(identity: BackgroundLaunchIdentity): Promise<void> {
-    const snapshot = structuredClone(identity)
-    const hash = recordHash(snapshot.key, snapshot.parentSessionId)
-    const path = join(this.directory, `${hash}.json`)
-    return this.track(
-      serialized(path, async () => {
-        const record = await readRecord(path, hash)
-        if (!record || record.generationId !== snapshot.generationId || record.processEpoch !== snapshot.processEpoch)
-          return
-        const tasks = record.tasks.filter((task) => task.taskId !== snapshot.taskId)
-        if (tasks.length === record.tasks.length) return
-        if (tasks.length === 0) await removeFile(path)
-        else await publish(path, { ...record, tasks }, false)
-      }),
-    )
-  }
-
-  async flush(): Promise<void> {
-    while (this.pending.size) await Promise.allSettled(this.pending)
   }
 
   private async files(): Promise<string[]> {
@@ -528,14 +423,12 @@ export class BackgroundHandoffInventory {
     ) {
       return Promise.reject(new Error('Invalid background inventory claim path'))
     }
-    return this.track(
-      serialized(path, async () => {
-        const current = await readRecord(path, match[1]!)
-        if (!current) return
-        if (current.generationId !== claim.record.generationId)
-          throw new Error('Background inventory generation changed before retirement')
-        await removeFile(path)
-      }),
-    )
+    return serialized(path, async () => {
+      const current = await readRecord(path, match[1]!)
+      if (!current) return
+      if (current.generationId !== claim.record.generationId)
+        throw new Error('Background inventory generation changed before retirement')
+      await removeFile(path)
+    })
   }
 }

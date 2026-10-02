@@ -1,6 +1,11 @@
 import { readFile } from 'node:fs/promises'
 
-import { recordReview, recordReviewOutput } from '@/channels/github-review-turn-ledger'
+import {
+  captureReviewResultCoverage,
+  recordReview,
+  recordReviewOutput,
+  type ReviewResultCoverage,
+} from '@/channels/github-review-turn-ledger'
 import type { ContentPart, ToolResult } from '@/plugin'
 
 import {
@@ -35,6 +40,14 @@ const submissionAttempts = new Map<string, ReviewSubmissionAttempt>()
 // credited to the false-receipt ledger via recordReview (which also fans to the
 // output observer), so only non-verdict COMMENTs need their own output credit.
 const pendingCommentOutput = new Map<string, DetectedReviewOutput>()
+const pendingCoverage = new Map<string, ReviewResultCoverage>()
+
+export function discardReviewCommand(callId: string): void {
+  pending.delete(callId)
+  pendingCommentOutput.delete(callId)
+  submissionAttempts.delete(callId)
+  pendingCoverage.delete(callId)
+}
 
 const MAX_INPUT_BYTES = 1_000_000
 
@@ -43,7 +56,12 @@ export type NoteReviewResult = {
   detected: DetectedReview | null
 }
 
-export async function noteReviewCommand(args: { callId: string; command: string }): Promise<NoteReviewResult> {
+export async function noteReviewCommand(args: {
+  callId: string
+  command: string
+  sessionId?: string
+}): Promise<NoteReviewResult> {
+  discardReviewCommand(args.callId)
   const inputFileContents = await readInputFile(args.command)
   const detected = detectReviewSubmission({ command: args.command, inputFileContents })
   if (detected !== null) pending.set(args.callId, detected)
@@ -65,6 +83,17 @@ export async function noteReviewCommand(args: { callId: string; command: string 
       if (attempt !== null) submissionAttempts.set(args.callId, attempt)
     }
   }
+  if (pending.has(args.callId) || pendingCommentOutput.has(args.callId) || submissionAttempts.has(args.callId)) {
+    try {
+      pendingCoverage.set(
+        args.callId,
+        args.sessionId === undefined ? {} : await captureReviewResultCoverage(args.sessionId),
+      )
+    } catch (error) {
+      discardReviewCommand(args.callId)
+      throw error
+    }
+  }
   return { dump: detectReviewDump({ command: args.command, inputFileContents }), detected }
 }
 
@@ -82,21 +111,24 @@ export function dismissalMutationSucceeded(result: ToolResult): boolean {
   return !FAILURE_MARKERS.some((marker) => text.includes(marker)) && /"state"\s*:\s*"DISMISSED"/.test(text)
 }
 
-export function commitReviewIfSucceeded(args: {
+export async function commitReviewIfSucceeded(args: {
   sessionId: string
   callId: string
   result: ToolResult
-}): CommitReviewResult {
+}): Promise<CommitReviewResult> {
   const text = collectText(args.result.content)
+  const coverage = pendingCoverage.get(args.callId) ?? {}
+  pendingCoverage.delete(args.callId)
   const detected = pending.get(args.callId)
   if (detected !== undefined) {
     pending.delete(args.callId)
     if (!looksSucceeded(detected, text)) return { committed: false, landedFromResult: null }
-    recordReview({
+    await recordReview({
       sessionId: args.sessionId,
       workspace: detected.workspace,
       prNumber: detected.prNumber,
       verdict: detected.verdict,
+      ...coverage,
     })
     return { committed: true, landedFromResult: null }
   }
@@ -107,11 +139,12 @@ export function commitReviewIfSucceeded(args: {
   if (comment !== undefined) {
     pendingCommentOutput.delete(args.callId)
     if (commentReviewSucceeded(text)) {
-      recordReviewOutput({
+      await recordReviewOutput({
         sessionId: args.sessionId,
         workspace: comment.workspace,
         prNumber: comment.prNumber,
         state: 'COMMENT',
+        ...coverage,
       })
     }
     return { committed: false, landedFromResult: null }
@@ -130,11 +163,12 @@ export function commitReviewIfSucceeded(args: {
   if (landed.workspace !== attempt.workspace || landed.prNumber !== attempt.prNumber) {
     return { committed: false, landedFromResult: null }
   }
-  recordReview({
+  await recordReview({
     sessionId: args.sessionId,
     workspace: landed.workspace,
     prNumber: landed.prNumber,
     verdict: landed.verdict,
+    ...coverage,
   })
   return { committed: true, landedFromResult: landed }
 }
