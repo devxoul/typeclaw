@@ -860,6 +860,55 @@ describe('runBackup', () => {
     }
   })
 
+  test('backs up ordinary files without turning nested repositories into gitlinks', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'autobackup-nested-repos-'))
+    const realGit = makeDefaultGitSpawn()
+    const git = async (dir: string, args: string[]): Promise<GitSpawnResult> => {
+      const result = await realGit(args, { cwd: dir, timeoutMs: 30_000 })
+      expect(result.exitCode).toBe(0)
+      return result
+    }
+
+    try {
+      await git(cwd, ['init', '-q', '-b', 'main'])
+      await git(cwd, ['config', 'user.name', 'Test'])
+      await git(cwd, ['config', 'user.email', 'test@example.com'])
+      await writeFile(join(cwd, 'initial.txt'), 'initial\n')
+      await git(cwd, ['add', 'initial.txt'])
+      await git(cwd, ['commit', '-qm', 'initial'])
+      await mkdir(join(cwd, '.worktrees'))
+      await git(cwd, ['worktree', 'add', '-qb', 'dev', '.worktrees/dev'])
+      const clone = join(cwd, 'packages', 'app')
+      await mkdir(clone, { recursive: true })
+      await git(clone, ['init', '-q'])
+      await git(clone, ['config', 'user.name', 'Test'])
+      await git(clone, ['config', 'user.email', 'test@example.com'])
+      await writeFile(join(clone, 'nested.txt'), 'nested\n')
+      await git(clone, ['add', 'nested.txt'])
+      await git(clone, ['commit', '-qm', 'nested'])
+      await writeFile(join(cwd, 'ordinary.txt'), 'ordinary\n')
+
+      const before = await git(cwd, ['status', '--porcelain=v1', '-z', '--untracked-files=all'])
+      expect(before.stdout.split('\0')).toContain('?? .worktrees/dev/')
+      expect(before.stdout.split('\0')).toContain('?? packages/app/')
+      const result = await runBackup(
+        { cwd, pushToOrigin: false },
+        { gitSpawn: realGit, pickCommitMessage: async () => 'backup ordinary files' },
+      )
+      expect(result).toEqual({ ok: true, kind: 'committed' })
+      const tree = await git(cwd, ['ls-tree', '-r', 'HEAD'])
+      expect(tree.stdout).toContain('\tordinary.txt\n')
+      expect(tree.stdout).not.toContain('160000 commit')
+      expect(tree.stdout).not.toContain('.worktrees/dev')
+      expect(tree.stdout).not.toContain('packages/app')
+      expect((await git(cwd, ['status', '--porcelain=v1', '-z', '--untracked-files=all'])).stdout).toContain(
+        '?? packages/app/',
+      )
+    } finally {
+      await rm(cwd, { recursive: true, force: true })
+    }
+  })
+
   test('stages both tracked rename endpoints from the original snapshot', async () => {
     const cwd = await makeRepo()
     const { spawn, calls } = makeSpawn((args) => {
