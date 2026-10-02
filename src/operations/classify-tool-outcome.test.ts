@@ -86,7 +86,58 @@ describe('classifyToolOutcome', () => {
       'bash-command-not-found': 'successful-bin',
       'declared-skill-bin-unresolved': 'successful-bin',
       'sandbox-proc-unavailable': 'successful-sandbox-real-proc',
+      'builtin-search-bin-unavailable': 'successful-builtin-search-tool',
     })
+  })
+
+  // Pi's fixed unavailability literals (protocol tokens, not natural language).
+  const RG_UNAVAILABLE = 'ripgrep (rg) is not available and could not be downloaded'
+  const FD_UNAVAILABLE = 'fd is not available and could not be downloaded'
+
+  test.each([
+    { tool: 'grep', literal: RG_UNAVAILABLE, bin: 'rg' },
+    { tool: 'find', literal: FD_UNAVAILABLE, bin: 'fd' },
+  ])('classifies $tool binary unavailability from released and detailed pi errors', ({ tool, literal, bin }) => {
+    const detail = 'Failed to download ripgrep: connect ECONNREFUSED http://alice:hunter2@proxy.example:3128'
+
+    for (const message of [literal, `${literal}: ${detail}`, `${literal}: ${detail}\n\nHint: unrelated`]) {
+      expect(classifyToolOutcome({ tool, error: new Error(message) })).toEqual({
+        kind: 'builtin-search-bin-unavailable',
+        bin,
+      })
+    }
+  })
+
+  test.each([
+    { tool: 'bash', message: RG_UNAVAILABLE },
+    { tool: 'read', message: RG_UNAVAILABLE },
+    { tool: 'find', message: RG_UNAVAILABLE },
+    { tool: 'grep', message: FD_UNAVAILABLE },
+    { tool: 'grep', message: `${RG_UNAVAILABLE}.` },
+    { tool: 'grep', message: `${RG_UNAVAILABLE}:no-space` },
+    { tool: 'grep', message: `warning: ${RG_UNAVAILABLE}` },
+    { tool: 'grep', message: 'Path not found: /path/to/file' },
+    { tool: 'grep', message: 'Operation aborted' },
+    { tool: 'find', message: 'fd exited with code 2' },
+    { tool: 'grep', message: 'ripgrep (rg)을 사용할 수 없으며 다운로드할 수 없습니다' },
+  ])('does not classify $tool / $message as builtin search unavailability', ({ tool, message }) => {
+    expect(classifyToolOutcome({ tool, error: new Error(message) })).toBeNull()
+  })
+
+  test('does not classify a non-Error grep rejection', () => {
+    expect(classifyToolOutcome({ tool: 'grep', error: RG_UNAVAILABLE })).toBeNull()
+  })
+
+  test('derives search-binary resolution only from successful builtin grep and find', () => {
+    const success = (tool: string, args: Record<string, unknown>) =>
+      deriveOperationalIncidentFactsForSuccess({ tool, args, sandboxedRealProcSucceeded: false })
+
+    expect(success('grep', { pattern: 'x' })).toEqual([{ kind: 'builtin-search-bin-unavailable', bin: 'rg' }])
+    expect(success('find', { pattern: '*.ts' })).toEqual([{ kind: 'builtin-search-bin-unavailable', bin: 'fd' }])
+    for (const command of ['rg x', 'fd x']) {
+      expect(success('bash', { command }).some((fact) => fact.kind === 'builtin-search-bin-unavailable')).toBe(false)
+    }
+    expect(success('ls', { path: '.' })).toEqual([])
   })
 
   test.each([
