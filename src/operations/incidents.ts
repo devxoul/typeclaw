@@ -40,11 +40,16 @@ export function incidentsPath(agentDir: string): string {
 }
 
 export function fingerprintIncident(fact: OperationalIncidentFact): string {
-  if (fact.kind === 'sandbox-proc-unavailable') return 'sandbox:proc-unavailable'
-  const bin = normalizeBin(fact.bin)
-  return fact.kind === 'bash-command-not-found'
-    ? `bash:command-not-found:${bin}`
-    : `skill-bin:declared-but-unresolved:${bin}`
+  switch (fact.kind) {
+    case 'sandbox-proc-unavailable':
+      return 'sandbox:proc-unavailable'
+    case 'bash-command-not-found':
+      return `bash:command-not-found:${normalizeBin(fact.bin)}`
+    case 'declared-skill-bin-unresolved':
+      return `skill-bin:declared-but-unresolved:${normalizeBin(fact.bin)}`
+    case 'builtin-search-bin-unavailable':
+      return `builtin-search:bin-unavailable:${fact.bin}`
+  }
 }
 
 export function deriveMechanicallyVerifiedIncidentFingerprints(input: OperationalIncidentSuccessInput): Set<string> {

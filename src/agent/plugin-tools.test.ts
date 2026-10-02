@@ -5608,6 +5608,148 @@ describe('wrapBuiltinToolDefinition bash sandbox (role-derived path hiding)', ()
   })
 })
 
+describe('wrapBuiltinToolDefinition builtin search binary incidents', () => {
+  // Pi's fixed grep/find unavailability literals (protocol tokens).
+  const SEARCH_TOOLS = [
+    { tool: 'grep', bin: 'rg', literal: 'ripgrep (rg) is not available and could not be downloaded' },
+    { tool: 'find', bin: 'fd', literal: 'fd is not available and could not be downloaded' },
+  ]
+  const tui: SessionOrigin = { kind: 'tui', sessionId: 's' }
+  const detail = 'Failed to download ripgrep: connect ECONNREFUSED http://alice:hunter2@proxy.example:3128'
+
+  type Outcome = { error: Error } | { text: string }
+  function scriptedSearch(name: string, outcome: () => Outcome) {
+    return {
+      name,
+      label: name,
+      description: '',
+      parameters: Type.Object({ pattern: Type.String(), path: Type.String() }),
+      async execute() {
+        const next = outcome()
+        if ('error' in next) throw next.error
+        return { content: [{ type: 'text' as const, text: next.text }], details: undefined }
+      },
+    }
+  }
+  function wrapSearch(name: string, agentDir: string, sessionId: string, outcome: () => Outcome) {
+    return wrapBuiltinToolDefinition(scriptedSearch(name, outcome), { agentDir, sessionId, hooks: createHookBus() })
+  }
+  async function doctor(agentDir: string) {
+    return buildOperationalIncidentChecks()[0]!.run({ cwd: agentDir, hasAgentFolder: true })
+  }
+
+  // Directory inputs need Linux inode anchoring; a file input pins on every host.
+  async function searchInput(agentDir: string) {
+    const input = path.join(agentDir, 'input.txt')
+    await writeFile(input, 'x')
+    return input
+  }
+
+  test.each(SEARCH_TOOLS)(
+    '$tool unavailability records $bin, escalates across sessions, and resolves on a later $tool success',
+    async ({ tool, bin, literal }) => {
+      const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-search-incident-'))
+      const fingerprint = `builtin-search:bin-unavailable:${bin}`
+      const args = { pattern: 'x', path: await searchInput(agentDir) }
+      try {
+        const detailed = wrapSearch(tool, agentDir, 'session-a', () => ({ error: new Error(`${literal}: ${detail}`) }))
+        const firstError = await detailed.execute('a', args, undefined, undefined, {} as never).catch((e: Error) => e)
+        expect(firstError).toBeInstanceOf(Error)
+        expect((firstError as Error).message.startsWith(`${literal}: ${detail}`)).toBe(true)
+        expect((firstError as Error).message).toContain(`TYPECLAW_OPERATIONAL_INCIDENT {"fingerprint":"${fingerprint}"`)
+        expect((await readIncidentLedger(agentDir)).incidents).toEqual([
+          expect.objectContaining({ fingerprint, kind: 'builtin-search-bin-unavailable', bin, count: 1 }),
+        ])
+        expect((await doctor(agentDir)).status).toBe('warning')
+
+        const released = wrapSearch(tool, agentDir, 'session-b', () => ({ error: new Error(literal) }))
+        await expect(released.execute('b', args, undefined, undefined, {} as never)).rejects.toThrow('"recurrent":true')
+        const recurrentDoctor = await doctor(agentDir)
+        expect(recurrentDoctor.status).toBe('error')
+        const persisted = await readFile(path.join(agentDir, '.typeclaw', 'incidents.json'), 'utf8')
+        for (const surface of [persisted, JSON.stringify(recurrentDoctor)]) {
+          expect(surface).not.toContain('hunter2')
+          expect(surface).not.toContain('proxy.example')
+          expect(surface).not.toContain('Failed to download')
+        }
+
+        const repaired = wrapSearch(tool, agentDir, 'session-c', () => ({ text: 'match' }))
+        expect(textOfFirstContent(await repaired.execute('c', args, undefined, undefined, {} as never))).toBe('match')
+        expect((await readIncidentLedger(agentDir)).incidents).toMatchObject([{ fingerprint, status: 'resolved' }])
+        expect((await doctor(agentDir)).status).toBe('ok')
+      } finally {
+        await rm(agentDir, { recursive: true, force: true })
+      }
+    },
+  )
+
+  test('bash rg/fd success and the other search tool success leave the search incident open', async () => {
+    const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-search-incident-wrong-tool-'))
+    const incidentLedger = new IncidentLedger(agentDir)
+    await incidentLedger.record({ kind: 'builtin-search-bin-unavailable', bin: 'rg' }, 'failure')
+    const bash = wrapBuiltinToolDefinition(
+      {
+        name: 'bash',
+        label: 'bash',
+        description: '',
+        parameters: Type.Object({ command: Type.String() }),
+        async execute() {
+          return { content: [{ type: 'text' as const, text: 'ran' }], details: undefined }
+        },
+      },
+      {
+        agentDir,
+        sessionId: 'bash-success',
+        hooks: createHookBus(),
+        getOrigin: () => tui,
+        permissions: createPermissionService(),
+        incidentLedger,
+        bashSandboxBoundary: {
+          ensureAvailable: async () => {},
+          resolveProcStrategy: async () => ({ strategy: 'proc-bind' as const }),
+          buildCommand: buildSandboxedCommand,
+        },
+      },
+    )
+    try {
+      for (const command of ['rg x', 'fd x']) {
+        await bash.execute('bash', { command }, undefined, undefined, {} as never)
+      }
+      const find = wrapSearch('find', agentDir, 'find-success', () => ({ text: 'found' }))
+      await find.execute('find', { pattern: '*', path: await searchInput(agentDir) }, undefined, undefined, {} as never)
+
+      expect((await readIncidentLedger(agentDir)).incidents).toMatchObject([
+        { fingerprint: 'builtin-search:bin-unavailable:rg', status: 'unresolved' },
+      ])
+    } finally {
+      await rm(agentDir, { recursive: true, force: true })
+    }
+  })
+
+  test.each([
+    { name: 'a different grep error', error: () => new Error('Path not found: /path/to/file'), abort: false },
+    { name: 'an aborted unavailability failure', error: () => new Error(SEARCH_TOOLS[0]!.literal), abort: true },
+  ])('$name records no incident and keeps the original error', async ({ error, abort }) => {
+    const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-search-incident-negative-'))
+    const controller = new AbortController()
+    const thrown = error()
+    const wrapped = wrapSearch('grep', agentDir, 'negative', () => {
+      if (abort) controller.abort()
+      return { error: thrown }
+    })
+    try {
+      const rejected = await wrapped
+        .execute('n', { pattern: 'x', path: await searchInput(agentDir) }, controller.signal, undefined, {} as never)
+        .catch((e: Error) => e)
+      expect((rejected as Error).message.startsWith(thrown.message)).toBe(true)
+      expect((rejected as Error).message).not.toContain('TYPECLAW_OPERATIONAL_INCIDENT')
+      expect((await readIncidentLedger(agentDir)).incidents).toEqual([])
+    } finally {
+      await rm(agentDir, { recursive: true, force: true })
+    }
+  })
+})
+
 describe('buildSandboxEnvPolicy exposable .env names', () => {
   test('adds exposable names to inherit so values stay out of argv', () => {
     const policy = buildSandboxEnvPolicy(undefined, undefined, ['SERVICE_CONFIG_DIR', 'DATABASE_URL'])

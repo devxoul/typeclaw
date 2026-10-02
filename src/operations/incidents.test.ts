@@ -16,6 +16,12 @@ describe('operational incident ledger', () => {
     expect(fingerprintIncident({ kind: 'declared-skill-bin-unresolved', bin: 'OpenSoma' })).toBe(
       'skill-bin:declared-but-unresolved:opensoma',
     )
+    expect(fingerprintIncident({ kind: 'builtin-search-bin-unavailable', bin: 'rg' })).toBe(
+      'builtin-search:bin-unavailable:rg',
+    )
+    expect(fingerprintIncident({ kind: 'builtin-search-bin-unavailable', bin: 'fd' })).toBe(
+      'builtin-search:bin-unavailable:fd',
+    )
   })
 
   test('marks recurrence only after the fingerprint appears in a different session', async () => {
