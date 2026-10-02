@@ -518,10 +518,32 @@ describe('stop (composition)', () => {
     expect(calls.some((call) => call.includes('-f') || call.includes('--force'))).toBe(false)
   })
 
+  test('waits out a slow removal drain instead of reporting it stuck', async () => {
+    // given: OrbStack takes ~40s to destroy a container with a large writable layer
+    const now = spyOn(Date, 'now')
+    let timestamp = 0
+    now.mockImplementation(() => (timestamp += 4_000))
+    const { exec } = fakeDockerExec({
+      scenario: { exists: true, running: true },
+      drainAfterInspectCalls: 10,
+      lifeStatus: 'removing',
+    })
+
+    try {
+      // when
+      const result = await stop({ cwd: root, exec, archiveLogs })
+
+      // then
+      expect(result.ok).toBe(true)
+    } finally {
+      now.mockRestore()
+    }
+  })
+
   test('diagnoses a timed-out removal drain when Docker reports the container dead', async () => {
     const now = spyOn(Date, 'now')
     let timestamp = 0
-    now.mockImplementation(() => (timestamp += 10_001))
+    now.mockImplementation(() => (timestamp += 120_001))
     const { exec, calls } = fakeDockerExec({
       scenario: { exists: true, running: false },
       drainAfterInspectCalls: Number.MAX_SAFE_INTEGER,
@@ -533,7 +555,7 @@ describe('stop (composition)', () => {
 
       expect(result.ok).toBe(false)
       if (result.ok) throw new Error('expected failure')
-      expect(result.reason).toContain('still being removed by docker after 10s')
+      expect(result.reason).toContain('still being removed by docker after 120s')
       expect(result.reason).toContain('marked this container dead')
       expect(calls.some((call) => call.includes('-f') || call.includes('--force'))).toBe(false)
     } finally {
