@@ -14,6 +14,16 @@ Transport: **gateway intents** (no public URL required). Setup walkthrough: [Add
 
 Temporary waiting cleanup addresses the original channel/message and canonical emoji through the own-user `/@me` reaction endpoint. It never uses bulk reaction deletion. The expected authenticated account must still match; a changed identity blocks cleanup. Replies do not await cleanup transport, and protected acknowledgments survive temporary cleanup and reboot. The same contract applies to the [Discord user adapter](/docs/reference/discord).
 
+## Crash recovery correlation
+
+Interruption notices use authenticated HTTP with a stable `nonce` and
+`enforce_nonce`. Discord's nonce deduplication covers only a short recent-message
+window, not arbitrary downtime. Recovery paginates the exact channel or thread's
+history, requiring both the authenticated bot author and matching nonce.
+Read failures do not prove absence; unavailable or omitted historical nonces may
+cause a duplicate notice after an ambiguous send. The bot account is revalidated
+before each attempt. Ordinary SDK sends are unchanged.
+
 ## Auth
 
 One token, stored in [`secrets.json`](/docs/reference/secrets-json):

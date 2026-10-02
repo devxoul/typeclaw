@@ -4,7 +4,7 @@ description: Four typed targets, subagent dispatch, the cron split, wire-protoco
 icon: Radio
 ---
 
-`src/stream/` is the in-process pub/sub coordination primitive. Keyed by typed targets. **Ephemeral** — Bun process crash loses everything. Persistence is out of scope; agentic work isn't resumable mid-LLM-call, the container is the failure unit.
+`src/stream/` is the in-process pub/sub coordination primitive. Keyed by typed targets. **Ephemeral** — Bun process crash loses stream queues. Durable recovery belongs to the decision owner outside the stream: the retained background-launch inventory transfers interrupted work into the runtime recovery outbox. A queued completion is not a confirmed response. Agentic work is not resumed mid-LLM-call or replayed after death.
 
 ## Targets
 
@@ -55,7 +55,7 @@ TUI ↔ WS depends on the stream-driven drain loop:
 
 ## Rules of thumb
 
-- **In-memory and ephemeral.** Anything that must survive a restart belongs elsewhere (session JSONL, `cron.json`, MEMORY.md).
+- **In-memory and ephemeral.** Anything that must survive a restart belongs elsewhere (session JSONL, `cron.json`, MEMORY.md, recovery outbox). Publication alone never settles a durable response obligation.
 - **Wire-protocol changes require a container restart.** Source loads once at process start.
 - **Each new target kind is a deliberate addition.** Prefer typed targets over a catch-all.
 - **Drain loops own serialization.** Broker fans out; doesn't gate.

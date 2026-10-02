@@ -476,6 +476,8 @@ function makeRouterStub(onRoute: (m: InboundMessage) => void) {
   return {
     registered,
     route: async (m: InboundMessage) => onRoute(m),
+    registerSelfIdentity: () => {},
+    unregisterSelfIdentity: () => {},
     registerOutbound: () => {
       registered.outbound = true
     },

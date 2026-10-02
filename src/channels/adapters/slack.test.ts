@@ -93,6 +93,8 @@ function router(): ChannelRouter & {
       r.outbound = cb
     },
     unregisterOutbound: (adapter: string) => unregistered.push(`outbound:${adapter}`),
+    registerRecoveryAdapter: () => {},
+    unregisterRecoveryAdapter: () => {},
     setTypingCapability: (adapter: string, supported: boolean) =>
       registered.push(`typing-cap:${adapter}=${String(supported)}`),
     registerChannelNameResolver: (adapter: string) => registered.push(`names:${adapter}`),

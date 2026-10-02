@@ -55,6 +55,10 @@ export type CreateSpawnSubagentToolOptions = {
   parentSessionId: string
   getOrigin: () => SessionOrigin | undefined
   getSessionFile?: () => string | undefined
+  getAccountIdentity?: (
+    adapter: NonNullable<Extract<SessionOrigin, { kind: 'channel' }>['adapter']>,
+    workspace?: string,
+  ) => Promise<string | undefined>
   permissions?: PermissionService
   stream?: Stream
   generateTaskId?: () => string
@@ -239,8 +243,19 @@ export function createSpawnSubagentTool(options: CreateSpawnSubagentToolOptions)
       }
       if (background && origin?.kind === 'channel' && liveRegistry.backgroundInventory !== undefined) {
         try {
-          const parentSessionFile = options.getSessionFile?.()
-          if (parentSessionFile === undefined) throw new Error('channel session transcript is unavailable')
+          const { parentChat, lastInboundAuthorId } = origin
+          let parentSessionFile: string | undefined
+          try {
+            parentSessionFile = options.getSessionFile?.()
+          } catch {
+            // Recovery notices do not need the parent transcript to launch work.
+          }
+          let accountIdentity: string | undefined
+          try {
+            accountIdentity = await options.getAccountIdentity?.(origin.adapter, origin.workspace)
+          } catch {
+            // Recovery identity must not add a prerequisite to healthy launches.
+          }
           backgroundLaunch = await liveRegistry.backgroundInventory.add({
             parentSessionId,
             parentSessionFile,
@@ -248,7 +263,9 @@ export function createSpawnSubagentTool(options: CreateSpawnSubagentToolOptions)
             taskId,
             subagentName,
             startedAt,
-            ...(origin.lastInboundAuthorId !== undefined ? { triggeringAuthorId: origin.lastInboundAuthorId } : {}),
+            accountIdentity: accountIdentity ?? 'unbound-legacy',
+            ...(parentChat !== undefined ? { parentChat } : {}),
+            ...(lastInboundAuthorId !== undefined ? { triggeringAuthorId: lastInboundAuthorId } : {}),
             ...(origin.reactionRef !== undefined ? { triggerReactionRef: origin.reactionRef } : {}),
           })
         } catch (error) {

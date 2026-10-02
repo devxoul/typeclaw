@@ -1,6 +1,7 @@
 import type { OutboundCallback, OutboundMessage, SendResult } from '@/channels/types'
 
 import { describeError } from '../../describe-error'
+import { recoveryHttpFailure, recoveryMarker } from '../recovery-correlation'
 import type { GithubAuthContext } from './auth'
 import { GITHUB_API_BASE, githubJsonHeaders } from './auth-pat'
 import {
@@ -17,12 +18,37 @@ export function createGithubOutboundCallback(deps: {
   authType: GithubAuthType
   logger: GithubOutboundLogger
   fetchImpl?: typeof fetch
+  accountIdentity?: () => Promise<string | undefined>
 }): OutboundCallback {
   const fetchImpl = deps.fetchImpl ?? fetch
   return async (msg: OutboundMessage): Promise<SendResult> => {
     if (msg.adapter !== 'github') return { ok: false, error: `unknown adapter: ${msg.adapter}` }
     if ((msg.attachments ?? []).length > 0) return { ok: false, error: 'github-bot-does-not-support-attachments' }
-    const body = msg.text ?? ''
+    const recovery = msg.sendOptions?.accounting === 'recovery' ? msg.sendOptions : undefined
+    if (recovery && (await deps.accountIdentity?.()) !== recovery.expectedAccountIdentity)
+      return {
+        ok: false,
+        error: 'recovery-account-identity-changed',
+        recoveryFailure: { kind: 'identity', safeReason: 'Authenticated account changed' },
+      }
+    const body = (msg.text ?? '') + (recovery ? `\n\n${recoveryMarker(recovery.deliveryId)}` : '')
+    let recoveryResponse: Response | undefined
+    const transport: typeof fetch = recovery
+      ? ((async (input, init) => {
+          const response = await fetchImpl(input, init)
+          recoveryResponse = response
+          return response
+        }) as typeof fetch)
+      : fetchImpl
+    const finish = (result: SendResult): SendResult =>
+      result.ok || !recovery
+        ? result
+        : {
+            ...result,
+            recoveryFailure: recoveryResponse
+              ? recoveryHttpFailure(recoveryResponse)
+              : { kind: 'transient', safeReason: 'Recovery transport failed' },
+          }
     if (body === '') return { ok: false, error: 'message has neither text nor attachments' }
 
     const repo = parseRepo(msg.workspace)
@@ -31,31 +57,41 @@ export function createGithubOutboundCallback(deps: {
     if (target === null) return { ok: false, error: `invalid GitHub chat: ${msg.chat}` }
 
     const token = () => deps.token({ repoSlug: msg.workspace })
+    if (recovery && target.kind !== 'pr' && msg.thread !== undefined && msg.thread !== null)
+      return {
+        ok: false,
+        error: 'invalid-recovery-github-thread',
+        recoveryFailure: { kind: 'target', safeReason: 'Unsupported original GitHub target' },
+      }
 
     if (target.kind === 'discussion') {
-      return await postDiscussionComment({
-        ...deps,
-        token,
-        fetchImpl,
-        repo,
-        discussionNumber: target.number,
-        body,
-      })
+      return finish(
+        await postDiscussionComment({
+          ...deps,
+          token,
+          fetchImpl: transport,
+          repo,
+          discussionNumber: target.number,
+          body,
+        }),
+      )
     }
 
     const isPrReviewReply = target.kind === 'pr' && msg.thread !== null && msg.thread !== undefined && msg.thread !== ''
     const endpoint = isPrReviewReply
       ? `${GITHUB_API_BASE}/repos/${repo.owner}/${repo.name}/pulls/${target.number}/comments/${encodeURIComponent(msg.thread ?? '')}/replies`
       : `${GITHUB_API_BASE}/repos/${repo.owner}/${repo.name}/issues/${target.number}/comments`
-    return await postJson(
-      fetchImpl,
-      await token(),
-      endpoint,
-      { body },
-      {
-        authType: deps.authType,
-        endpointKind: isPrReviewReply ? 'pr-review-reply' : 'issue-comment',
-      },
+    return finish(
+      await postJson(
+        transport,
+        await token(),
+        endpoint,
+        { body },
+        {
+          authType: deps.authType,
+          endpointKind: isPrReviewReply ? 'pr-review-reply' : 'issue-comment',
+        },
+      ),
     )
   }
 }

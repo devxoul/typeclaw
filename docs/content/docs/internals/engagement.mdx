@@ -116,19 +116,59 @@ If intent storage fails, the waiting add is skipped. JSON replacement synchroniz
 
 ## Background work across runtime death
 
-`src/channels/background-handoff.ts` records direct background launches of channel-origin parents before child execution. `LiveSubagentRegistry` removes each task after its winning canonical terminal transition; all per-parent additions and removals serialize. Empty inventories disappear. TUI, cron, foreground children and nested descendants do not get separate inventory rows.
+`src/channels/background-handoff.ts` records direct background launches of channel-origin parents before child execution. Each task row snapshots the adapter's already-authenticated, cached account identity without a network request. If that identity is temporarily unavailable, the launch remains admissible and the row uses an unbound marker; changing identity availability between siblings never rejects a launch. Transcript filenames are optional metadata, not an admission or recovery prerequisite. A failed durable inventory write can still prevent execution. `LiveSubagentRegistry` removes each task after its winning canonical terminal transition; per-parent additions and removals serialize. TUI, cron, foreground children and nested descendants do not get separate inventory rows.
 
-`src/run/background-handoff-boot.ts` claims prior-process inventories by rename, reads the owned claim, and merges them with the accepted ordinary channel restart handoff **before reserving each channel key once**. The explicit handoff retains its author and origin. Inventory has no age TTL: only an unconfigured adapter or a changed/missing exact parent mapping makes it stale, not elapsed time or newer inbound traffic. The ordinary restart greeting still has its existing 60-second TTL, and TUI consumption stays separate.
+`src/run/background-handoff-boot.ts` reclaims pending **and abandoned claimed** inventories before adapter startup. It freezes the original exact target, permission principal, coverage, delivery ID and English notice in a source transfer, durably imports that transfer into `channels/recovery-outbox/<deliveryId>.json`, then records outbox ownership before retiring the source. Import failure keeps the source. A reboot repeats the same transfer rather than asking a model to recover the work. Missing transcripts, changed session mappings and provider outages cannot redirect or discard the notice. Ordinary #291 channel restart greetings keep their existing reservation and 60-second TTL; TUI handoff remains separate.
 
-Reservations precede adapter startup. After startup, boot retires each exact claim before resuming the parent with the existing lost-work directive; failures are isolated and gates are released even when adapter startup fails. A racing observed inbound does not discard the directive. Recovery never launches the child again. Persisted trigger targets are not reaction-instance refs: without adapter-owned lookup of the bot's eyes by target, boot skips reaction cleanup entirely. It does not pass those targets to `removeReaction`, restore reaction ownership, or promise to remove all stale eyes.
+One inventory generation transfers to one generic notice. At preparation, agreeing
+bound task identities select that identity, even if other rows are unbound. If all
+rows are unbound, the notice remains unbound. Conflicting bound identities also
+leave the notice unbound, with sorted `accountIdentityConflict` diagnostics frozen
+in its outbox payload. The first authorized lease binds that notice once; later
+identity changes remain blocked. This does not rewrite any task's captured
+identity or change an already-prepared transfer.
+
+Prior-process or malformed pending inventory bytes do not become another launch
+precondition. Admission first moves that evidence into the existing claimed
+namespace and syncs the move, then publishes a fresh generation. Corrupt bytes
+remain unchanged and are reported for diagnostics; actual read, archive or
+publication I/O failures still prevent admission.
+
+The dispatcher runs after adapter readiness with independent per-target lanes. Each attempt revalidates the configured authenticated account, original destination and current response/send permission. Removed credentials, permission denial and unavailable destinations leave the record **blocked and still owed**, not terminal or age-expired; another target can continue. Transient failures, including identity preflight failures, are persisted with capped backoff and server retry delays. A lease is usable only after its file and directory publication complete; visible leased bytes following a failed sync do not authorize transport. A confirmed receipt is synced before source acknowledgment. Known receipts are never reposted.
+
+Admission also freezes the permission-matching origin context, including a native
+thread's `parentChat` and triggering author, before asynchronous metadata lookup.
+Recovery reuses that context: a thread authorized by its parent-channel grant
+keeps the same permission principal without moving the notice to the parent.
+Prepared transfers are validated against their source principal and never
+reconstructed from a later live turn.
+
+| Transition                                    | Decision owner and durable fence                                                                                                                                                                               |
+| --------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Inventory → notice-prepared                   | Inventory freezes source generation, coverage and payload before import.                                                                                                                                       |
+| notice-prepared → notice-owned                | Outbox syncs the idempotent import before inventory acknowledges ownership and retires.                                                                                                                        |
+| pending / blocked / old-epoch leased → leased | Outbox checks expected generation, advances it and syncs epoch/attempt ownership before transport. Same-epoch in-flight work is never leased twice.                                                            |
+| same-epoch leased → durably repaired leased   | Before reusing a failed acquisition, outbox republishes the captured lease and awaits file/directory sync without changing its attempt identity or count. This repair does not grant a second concurrent send. |
+| leased → pending                              | Outbox retains owed work with capped backoff and any server retry delay after a transient failure.                                                                                                             |
+| leased → blocked                              | Account, configuration, destination or permission denial retains owed work for later revalidation.                                                                                                             |
+| leased → delivered                            | Outbox syncs a confirmed or reconciled receipt before acknowledgment; later boots do not send again.                                                                                                           |
+| pending / blocked / leased → suppressed       | Explicit user-stop decision is synced before parent abort/clear. A concurrently landed receipt is retained without authorizing a retry.                                                                        |
+
+The fixed runtime notice is independent of providers, `NO_REPLY`, session reopening and child execution:
+
+> ⚠️ I restarted before I could confirm a reply to your earlier request. I didn't rerun it automatically — please ask again if you still need it.
+
+The locale, template version and text are frozen at transfer preparation. This stack uses the existing English system-notice fallback only; it adds no locale selector or model language inference. Recovery sends retain transport/flood checks but do not change unrelated live-turn send counts, promise/leaf/skip state, engagement/reaction policy, typing or sticky state.
 
 ### Recovery boundary
 
-- This is an unfinished-launch inventory, **not durable result delivery**. Child termination ends recovery coverage even if the parent is absent, its provider fails, or it has not answered yet. No completion hydration, settlement tracking, cancellation tombstones or replay scheduler is added.
-- Intent publication before execution and asynchronous removal after terminal CAS can leave conservative false positives: a notice may describe a launch that never executed or a child that already ended. Removal errors are logged without suppressing live completion.
-- Claim ownership provides **at-most-once recovery-directive attempts**, not guaranteed exactly-once visible delivery. A second crash after claiming but before notice delivery can lose the notice; claimed inventories are not replayed.
-- One active runtime per agent directory is supported. Boot claim contention does not make concurrent runtime writers safe.
-- `/stop` still stops the parent, not its running children. Physical `subagent_cancel` alone does not retire inventory; canonical child termination does. Healthy engagement, completion delivery and live eyes cleanup remain router-owned.
+- This remains an unfinished-launch inventory, **not durable result delivery**. Child termination ends inventory coverage even if the parent is absent, its provider fails, or it has not answered yet. Result obligations and inbound journals are later RFC #1491 stages; ordinary replies/reviews do not enter this outbox.
+- Intent publication before execution and asynchronous removal after terminal CAS can leave conservative false positives. The notice contains no request content, names, transcript or provider errors. Interrupted work is never automatically replayed.
+- Delivery is **at least once**, not exactly once. Death after a remote POST succeeds but before the local receipt is synced is ambiguous. Supported adapters reconcile the stable correlation marker against paginated history from their own authenticated actor at the exact target; a read failure or first-page miss is not proof of absence. Unknown or unsupported reconciliation eventually retries, accepting a possible duplicate notice. No ambiguous remote success authorizes replay of a reply, review or logical turn.
+- Inventories written before this version, and new admissions whose cached identity was unavailable, use an unbound marker. The first authorized attempt durably binds the authenticated actor serving the original exact adapter/workspace under its lease before sending. Slack direct-message coordinates use a workspace sentinel, while account identity still uses the authenticated team/user. A later identity change blocks delivery. An unbound record cannot prove that the posting identity stayed unchanged between death and reboot.
+- One active runtime per agent directory is supported. Local leases fence callbacks and reboots, not simultaneous runtimes or already-issued remote requests. JSON publication syncs the file and containing directory on POSIX; Windows development cannot provide the same directory-sync power-loss guarantee. Unresolved records and terminal receipts are retained.
+- `/stop` withdraws current parent coverage before abort/clear. Stop before dispatch prevents the notice; a remote POST already in flight cannot be recalled and may land after stop. Concurrent suppression remains durable and an ambiguous suppressed send is never retried. Running descendants retain their existing independent completion policy.
+- Reaction cleanup is independent work. Persisted trigger targets are not removable reaction-instance refs, and this outbox does not restore or delete temporary reactions.
 
 ## Rules of thumb
 

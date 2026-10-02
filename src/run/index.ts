@@ -40,6 +40,8 @@ import {
   type SubagentCompletionBridge,
 } from '@/channels'
 import { BackgroundHandoffInventory } from '@/channels/background-handoff'
+import { RecoveryDispatcher } from '@/channels/recovery-dispatcher'
+import { RecoveryOutbox } from '@/channels/recovery-outbox'
 import { createTunnelBridge, type TunnelBridge } from '@/channels/tunnel-bridge'
 import { createConfigReloadable, getConfig, loadConfigBundleSync, reloadConfig, withDefaultPlugins } from '@/config'
 import {
@@ -86,7 +88,7 @@ import { createStream, type Stream } from '@/stream'
 import { createTui as createTuiDefault, type TuiOptions } from '@/tui'
 import { createTunnelManager, type TunnelManager, type TunnelManagerOptions } from '@/tunnels'
 
-import { bootBackgroundHandoffs } from './background-handoff-boot'
+import { bootBackgroundHandoffs, prepareBackgroundRecoveryNotice } from './background-handoff-boot'
 import { BUNDLED_PLUGINS } from './bundled-plugins'
 import { buildChannelSessionFactory } from './channel-session-factory'
 import { installFatalGuard } from './fatal-guard'
@@ -486,11 +488,19 @@ async function startAgentRuntime(
   const subagentCoalescer = new SubagentCoalescer()
   const liveSessionRegistry = new LiveSessionRegistry()
 
+  const recoveryOutbox = new RecoveryOutbox(cwd, {
+    epoch: crypto.randomUUID(),
+    onError: (error) => console.warn(`[run] recovery outbox failed: ${error}`),
+  })
+  let recoveryDispatcher: RecoveryDispatcher | undefined
   const channelManager = createChannelManagerFor({
     agentDir: cwd,
     secretsProvider: caps.secrets,
     channelsConfigRef: () => getConfig().channels,
     aliasesRef: () => getConfig().alias,
+    onRecoveryReady: () => {
+      void recoveryDispatcher?.wake().catch((error) => console.warn(`[run] recovery wake failed: ${error}`))
+    },
     tunnelUrlForChannel: (name) => resolveTunnelUrlForChannel(name, tunnelManager),
     tunnelConfiguredForChannel: (name) => isTunnelConfiguredForChannel(name),
     createSessionForChannel: buildChannelSessionFactory({
@@ -907,14 +917,20 @@ async function startAgentRuntime(
   reloadRegistry.register(createChannelsReloadable({ manager: channelManager }))
 
   registerBootCleanup(() => channelManager.stop())
+  recoveryDispatcher = new RecoveryDispatcher(recoveryOutbox, channelManager.router, {
+    onError: (error) => console.warn(`[run] recovery dispatch failed: ${error}`),
+  })
+  registerBootCleanup(() => recoveryDispatcher?.stop())
   await bootBackgroundHandoffs({
     agentDir: cwd,
     inventory: backgroundInventory,
     router: channelManager.router,
+    recovery: { outbox: recoveryOutbox, prepare: prepareBackgroundRecoveryNotice },
     configured: (key) => getConfig().channels[key.adapter] !== undefined,
     startAdapters: () => channelManager.start(),
     onError: (error) => console.warn(`[run] channel restart-resume failed: ${error}`),
   })
+  await recoveryDispatcher.wake()
 
   // Captured separately from setSpawnSubagent so both the plugin context and
   // the plugin-command runner can dispatch through the same path. The setter
@@ -1086,6 +1102,7 @@ async function startAgentRuntime(
       prVerdictActivityBridge.stop()
       setReviewObserver(null)
       await tunnelManager.stop()
+      await recoveryDispatcher?.stop()
       await channelManager.stop()
       await mcpManager?.closeAll()
     } finally {

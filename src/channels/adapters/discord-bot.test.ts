@@ -2298,6 +2298,8 @@ class FakeDiscordBotRouter {
     route: async () => {},
     registerOutbound: () => this.registered.push('outbound'),
     unregisterOutbound: () => this.unregistered.push('outbound'),
+    registerRecoveryAdapter: () => {},
+    unregisterRecoveryAdapter: () => {},
     registerReaction: () => this.registered.push('reaction'),
     unregisterReaction: () => this.unregistered.push('reaction'),
     registerRemoveReaction: () => this.registered.push('removeReaction'),

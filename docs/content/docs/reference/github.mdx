@@ -10,6 +10,18 @@ Part of the [channel adapters](/docs/reference/channel-adapters) family.
 
 Transport: **webhook delivery** (public URL required). Setup walkthrough: [Add a channel](/docs/guides/add-a-channel).
 
+## Crash recovery correlation
+
+Interruption notices carry a stable opaque HTML comment marker. Recovery
+paginates the exact issue/PR comments, PR review replies, or discussion comments.
+It requires the authenticated actor (numeric ID for REST, authenticated login for
+GraphQL discussion authors) and matching marker; review replies must also match
+their original parent comment. A failed page read never proves absence.
+Account changes block delivery rather than redirect it. Deleted comments or
+markers can cause duplicate notices after an ambiguous send; delivery is
+at-least-once, not exactly-once. Other adapters without provable correlation
+also retry ambiguous sends and may produce duplicates.
+
 <Callout type="warn" title="Public URL required">
 The `github` adapter needs a public URL to receive webhook events. Set `channels.github.webhookUrl` in `typeclaw.json`, or configure a tunnel entry with `for: { kind: 'channel', name: 'github' }`. Without one, webhook registration is skipped and no events arrive. See [Add a tunnel](/docs/guides/first-tunnel).
 </Callout>
