@@ -78,6 +78,64 @@ describe('createSlackDedupe', () => {
     expect(dedupe.check({ channel: 'C0', ts: 't3', client_msg_id: 'cmid-3' })).toBe('client_msg_id')
   })
 
+  test('an observed message can add a mention once, but later edits and retries cannot re-engage', () => {
+    const dedupe = createSlackDedupe()
+    const original = { channel: 'C0', ts: 't1', client_msg_id: 'cmid-1', text: '질문입니다' }
+    const edited = { ...original, text: '<@UBOT> 질문입니다' }
+    dedupe.mark(original, false)
+    expect(dedupe.check(edited, true)).toBeNull()
+    dedupe.mark(edited, true)
+    expect(dedupe.check(edited, true)).toBe('client_msg_id')
+    expect(dedupe.check({ ...edited, text: '<@UBOT> 추가 질문' }, true)).toBe('client_msg_id')
+    expect(dedupe.check({ ...edited, ts: 't2' }, true)).toBe('client_msg_id')
+  })
+
+  test('same-version message and app_mention deliveries cannot promote an observed message', () => {
+    const dedupe = createSlackDedupe()
+    const event = { channel: 'C0', ts: 't1', text: '<@UBOT> hello' }
+    dedupe.mark(event, false)
+    expect(dedupe.check(event, true)).toBe('channel_ts')
+    const edited = { ...event, text: '<@UBOT> hello again' }
+    expect(dedupe.check(edited, true)).toBeNull()
+    dedupe.mark(edited, true)
+    expect(dedupe.check(edited, true)).toBe('channel_ts')
+  })
+
+  test('associates dropped retry identities so a cmid-less edit can engage only once', () => {
+    const dedupe = createSlackDedupe()
+    const original = { channel: 'C0', ts: 't1', client_msg_id: 'X', text: 'A' }
+    dedupe.mark(original, false)
+    expect(dedupe.check({ ...original, ts: 't2' }, false)).toBe('client_msg_id')
+    const edited = { channel: 'C0', ts: 't2', text: '<@UBOT> B' }
+    let mentionedDeliveries = 0
+    if (dedupe.check(edited, true) === null) {
+      dedupe.mark(edited, true)
+      mentionedDeliveries++
+    }
+    expect(dedupe.check({ ...edited, client_msg_id: 'X' }, true)).not.toBeNull()
+    const retry = { ...edited, ts: 't3', client_msg_id: 'X' }
+    if (dedupe.check(retry, true) === null) {
+      dedupe.mark(retry, true)
+      mentionedDeliveries++
+    }
+    expect(mentionedDeliveries).toBe(1)
+    expect(dedupe.check(retry, true)).toBe('client_msg_id')
+  })
+
+  test('merges split records and their older aliases without refreshing insertion order', () => {
+    const dedupe = createSlackDedupe(3)
+    const observed = { channel: 'C0', ts: 't1', client_msg_id: 'X', text: 'A' }
+    const mentioned = { channel: 'C0', ts: 't2', text: '<@UBOT> B' }
+    dedupe.mark(observed, false)
+    dedupe.mark(mentioned, true)
+    expect(dedupe.check({ ...mentioned, client_msg_id: 'X' }, true)).toBe('channel_ts')
+    expect(dedupe.check({ ...observed, text: '<@UBOT> C', client_msg_id: undefined }, true)).toBe('channel_ts')
+    expect(dedupe.check({ ...mentioned, ts: 't3', client_msg_id: 'X' }, true)).toBe('client_msg_id')
+    dedupe.mark({ channel: 'C0', ts: 't4', text: 'unrelated' })
+    expect(dedupe.check({ ...observed, client_msg_id: undefined }, false)).toBeNull()
+    expect(dedupe.check(mentioned, true)).toBe('channel_ts')
+  })
+
   test('default capacity matches the published constant', () => {
     expect(SLACK_DEDUPE_CAPACITY).toBe(256)
   })

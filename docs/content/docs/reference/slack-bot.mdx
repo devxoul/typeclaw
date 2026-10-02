@@ -49,6 +49,10 @@ Replies in the same Slack thread route to the same session. New top-level messag
 
 Outbound `thread` must be the parent message's exact Slack `ts` string (for example, `1700000000.000100`), including all six digits after the decimal. Malformed IDs are rejected before a text post or file upload. Slack timestamps are message IDs, not decimals: do not round or pad a truncated ID.
 
+Editing an observed message to add a bot mention can trigger a response once. Retry deliveries and the matching `message` / `app_mention` pair are still deduplicated; further edits to an already-mentioned message do not trigger another response while its identity remains in the adapter's bounded dedupe cache. Edit-only `message_changed` envelopes are not routed independently.
+
+Suppressed retries still associate their timestamp and client-message identities with the same cached delivery, so a resend under another timestamp cannot trigger a second mentioned delivery.
+
 ## Slash commands
 
 `/help`, `/stop`, `/reload`, `/restart`. Thread `!cmd` syntax also works.

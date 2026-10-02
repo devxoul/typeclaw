@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'bun:test'
+import { describe, expect, spyOn, test } from 'bun:test'
 
 import type { SlackBotClient, SlackBotListener, SlackFile, SlackMessage } from 'agent-messenger/slackbot'
 
@@ -1002,6 +1002,76 @@ describe('slack-bot promoteAppMentionToMessage', () => {
       isBotMention: true,
       isDm: false,
     })
+  })
+})
+
+describe('slack-bot edited mention ingress', () => {
+  test('routes an added mention once across concurrent message/app_mention deliveries', async () => {
+    const listener = new FakeSlackBotListener()
+    const routed: Array<{ text: string; isBotMention: boolean }> = []
+    const errors: string[] = []
+    const firstRoute = Promise.withResolvers<void>()
+    const router = lifecycleRouter()
+    router.route = async (payload) => {
+      routed.push(payload)
+      firstRoute.resolve()
+    }
+    const adapter = createSlackBotAdapter({
+      router,
+      configRef: () => channelsSchema.parse({ 'slack-bot': {} })['slack-bot']!,
+      token: 'xoxb-test',
+      appToken: 'xapp-test',
+      logger: {
+        info: () => {},
+        warn: () => {},
+        error: (message) => {
+          errors.push(message)
+        },
+      },
+      createClient: () =>
+        ({
+          login: async () => {},
+          testAuth: async () => ({ user_id: 'UBOT', team_id: 'T0ACME' }),
+        }) as unknown as SlackBotClient,
+      createListener: () => listener as unknown as SlackBotListener,
+      fetchImpl: (async () =>
+        new Response(JSON.stringify({ ok: false, error: 'missing_scope' }))) as unknown as typeof fetch,
+    })
+    const original = {
+      type: 'message',
+      channel: 'C0CHANNEL',
+      channel_type: 'channel',
+      user: 'UALICE',
+      ts: '1700000000.000100',
+      client_msg_id: 'cmid-1',
+      text: '질문입니다',
+    }
+    const emit = (source: string, event: unknown): void => listener.emit(source, { ack: () => {}, event })
+    const fetchSpy = spyOn(globalThis, 'fetch').mockImplementation(
+      (async () => new Response(JSON.stringify({ ok: false, error: 'missing_scope' }))) as unknown as typeof fetch,
+    )
+    try {
+      await adapter.start()
+      emit('message', original)
+      await firstRoute.promise
+      const edited = { ...original, text: '<@UBOT> 질문입니다' }
+      emit('message', {
+        type: 'message',
+        subtype: 'message_changed',
+        channel: original.channel,
+        ts: '1700000001.000100',
+        message: edited,
+      })
+      emit('app_mention', { ...edited, type: 'app_mention' })
+      emit('message', edited)
+      emit('app_mention', { ...edited, type: 'app_mention' })
+      await adapter.stop()
+      expect(errors).toEqual([])
+      expect(routed.map(({ isBotMention }) => isBotMention)).toEqual([false, true])
+      expect(routed[1]?.text).toContain('질문입니다')
+    } finally {
+      fetchSpy.mockRestore()
+    }
   })
 })
 

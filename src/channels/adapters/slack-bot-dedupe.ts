@@ -4,48 +4,80 @@ export const SLACK_DEDUPE_CAPACITY = 256
 
 export type SlackDedupeMatch = 'client_msg_id' | 'channel_ts'
 
-export type SlackDedupeKeys = {
-  channelTs: string
-  clientMsgId: string | null
-}
+type DedupeEvent = Pick<SlackInboundMessageEvent, 'channel' | 'ts' | 'client_msg_id' | 'text'>
+type Delivery = { text: string | undefined; mentioned: boolean }
 
 export type SlackDedupe = {
-  check: (event: Pick<SlackInboundMessageEvent, 'channel' | 'ts' | 'client_msg_id'>) => SlackDedupeMatch | null
-  mark: (event: Pick<SlackInboundMessageEvent, 'channel' | 'ts' | 'client_msg_id'>) => void
+  // A suppressed delivery still associates its retry identities synchronously.
+  check: (event: DedupeEvent, isBotMention?: boolean) => SlackDedupeMatch | null
+  mark: (event: DedupeEvent, isBotMention?: boolean) => void
 }
 
-// Two parallel insertion-ordered Sets. `client_msg_id` is the primary key
-// because it is stable across Slack-side resends of the same user gesture
-// (observed in the wild: a single Slack mention surfaced as two `message`
-// events ~21s apart with different `ts` values, identical text, and — per
-// Slack's API contract — identical `client_msg_id`). `channel:ts` is the
-// fallback because it is the only key available for events Slack does not
-// stamp with `client_msg_id` (bot messages, system messages, and historically
-// `app_mention` envelopes).
+// Keep both retry identities: client_msg_id survives Slack resends with a fresh
+// ts, while channel:ts also covers app_mention envelopes without client_msg_id.
+// An identity may promote from observation to mention only on changed raw text.
+// Once mentioned, further edits cannot re-engage it while either ring retains it.
 export function createSlackDedupe(capacity: number = SLACK_DEDUPE_CAPACITY): SlackDedupe {
-  const tsRing = new Set<string>()
-  const clientMsgIdRing = new Set<string>()
+  const tsRing = new Map<string, Delivery>()
+  const clientMsgIdRing = new Map<string, Delivery>()
 
-  const remember = (ring: Set<string>, key: string): void => {
-    if (ring.has(key)) return
-    if (ring.size >= capacity) {
-      const oldest = ring.values().next().value
+  const remember = (ring: Map<string, Delivery>, key: string, delivery: Delivery): void => {
+    if (!ring.has(key) && ring.size >= capacity) {
+      const oldest = ring.keys().next().value
       if (oldest !== undefined) ring.delete(oldest)
     }
-    ring.add(key)
+    ring.set(key, delivery)
+  }
+  const isDuplicate = (previous: Delivery | undefined, event: DedupeEvent, mentioned: boolean): boolean =>
+    previous !== undefined &&
+    !(
+      mentioned &&
+      !previous.mentioned &&
+      previous.text !== undefined &&
+      event.text !== undefined &&
+      previous.text !== event.text
+    )
+
+  const associate = (event: DedupeEvent): Delivery => {
+    const key = `${event.channel}:${event.ts}`
+    const cmid = event.client_msg_id
+    const byTs = tsRing.get(key)
+    const byClient = cmid ? clientMsgIdRing.get(cmid) : undefined
+    const delivery = byClient ?? byTs ?? { text: event.text, mentioned: false }
+    if (byTs !== undefined && byTs !== delivery) {
+      if (byTs.mentioned && !delivery.mentioned) delivery.text = byTs.text
+      delivery.mentioned ||= byTs.mentioned
+      // Earlier resends can leave several timestamp aliases. Reconcile all of
+      // them, not only the two keys on this envelope. Scans are bounded by the
+      // ring capacities and needed only when two distinct records converge.
+      for (const [alias, previous] of tsRing) {
+        if (previous === byTs) tsRing.set(alias, delivery)
+      }
+      for (const [alias, previous] of clientMsgIdRing) {
+        if (previous === byTs) clientMsgIdRing.set(alias, delivery)
+      }
+    }
+    remember(tsRing, key, delivery)
+    if (cmid) remember(clientMsgIdRing, cmid, delivery)
+    return delivery
   }
 
   return {
-    check: (event) => {
+    check: (event, mentioned = false) => {
       const cmid = event.client_msg_id
-      if (cmid !== undefined && cmid !== '' && clientMsgIdRing.has(cmid)) return 'client_msg_id'
-      if (tsRing.has(`${event.channel}:${event.ts}`)) return 'channel_ts'
-      return null
+      const match =
+        cmid && isDuplicate(clientMsgIdRing.get(cmid), event, mentioned)
+          ? 'client_msg_id'
+          : isDuplicate(tsRing.get(`${event.channel}:${event.ts}`), event, mentioned)
+            ? 'channel_ts'
+            : null
+      if (match !== null) associate(event)
+      return match
     },
-    mark: (event) => {
-      remember(tsRing, `${event.channel}:${event.ts}`)
-      const cmid = event.client_msg_id
-      if (cmid !== undefined && cmid !== '') remember(clientMsgIdRing, cmid)
+    mark: (event, mentioned = false) => {
+      const delivery = associate(event)
+      delivery.mentioned ||= mentioned
+      if (mentioned) delivery.text = event.text
     },
   }
 }
