@@ -67,6 +67,7 @@ import type { SessionOrigin } from './session-origin'
 import {
   createPinnedSnapshotBudgetForTests,
   enforceAndPinToolFiles,
+  type PinnedToolFiles,
   TOOL_INPUT_MAX_BYTES,
   TOOL_INPUT_MAX_COUNT,
   writeToolOutputNoFollow,
@@ -2617,6 +2618,153 @@ describe('wrapSystemTool', () => {
             await rm(outside, { force: true })
           }
         }
+      }
+    },
+  )
+
+  test.skipIf(process.platform !== 'linux')(
+    'builtin search reports omitted workspace links while finding regular source files',
+    async () => {
+      const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-workspace-links-'))
+      const app = path.join(agentDir, 'packages', 'app')
+      const shared = path.join(agentDir, 'packages', 'shared')
+      await mkdir(path.join(app, 'node_modules'), { recursive: true })
+      await mkdir(path.join(app, 'browser-profile'))
+      await mkdir(path.join(app, 'venv', 'bin'), { recursive: true })
+      await mkdir(shared)
+      await writeFile(path.join(app, 'index.ts'), 'visible needle')
+      await writeFile(path.join(shared, 'index.ts'), 'shared needle')
+      await writeFile(path.join(agentDir, '.env'), 'private needle')
+      await mkdir(path.join(agentDir, 'memory'))
+      await writeFile(path.join(agentDir, 'memory', 'notes.txt'), 'role private needle')
+      await symlink(shared, path.join(app, 'node_modules', 'shared'))
+      await symlink(shared, path.join(app, 'dir-link'))
+      await symlink(path.join(app, 'missing'), path.join(app, 'dangling'))
+      await symlink('/tmp/browser-socket', path.join(app, 'browser-profile', 'SingletonSocket'))
+      await symlink('/usr/bin/python3', path.join(app, 'venv', 'bin', 'python'))
+      await symlink(path.join(agentDir, '.env'), path.join(app, 'private-link'))
+      await symlink(path.join(agentDir, 'memory', 'notes.txt'), path.join(app, 'role-private-link'))
+      try {
+        const guest: SessionOrigin = {
+          kind: 'subagent',
+          subagent: 'workspace-search',
+          parentSessionId: 'parent',
+          spawnedByRole: 'guest',
+        }
+        const tools = buildBuiltinPiToolOverrides({
+          agentDir,
+          sessionId: 'workspace-links',
+          hooks: createHookBus(),
+          getOrigin: () => guest,
+          permissions: createPermissionService(),
+        })
+        for (const name of ['grep', 'find', 'ls']) {
+          const tool = tools.find((candidate) => candidate.name === name)
+          if (tool === undefined) throw new Error(`missing ${name} builtin`)
+          const args =
+            name === 'grep'
+              ? { path: 'packages', pattern: 'visible needle' }
+              : name === 'find'
+                ? { path: 'packages', pattern: '**/index.ts' }
+                : { path: 'packages' }
+          const result = await tool.execute('c', args as never, undefined, undefined, {} as never)
+          const text = result.content.map((part) => (part.type === 'text' ? part.text : '')).join('\n')
+          expect(text).toContain(name === 'grep' ? 'visible needle' : name === 'find' ? 'app/index.ts' : 'app')
+          expect(text).toContain('omitted')
+          expect(text).toContain('node_modules/shared')
+          expect(text).toContain('venv/bin/python')
+          expect(text).toContain('SingletonSocket')
+          expect(text).not.toContain('private-link')
+          expect(text).not.toContain('private needle')
+          expect(text).not.toContain('role-private-link')
+          expect(text).not.toContain('role private needle')
+        }
+        const read = tools.find((candidate) => candidate.name === 'read')
+        if (read === undefined) throw new Error('missing read builtin')
+        await expect(read.execute('c', { path: '.env' } as never, undefined, undefined, {} as never)).rejects.toThrow()
+      } finally {
+        await rm(agentDir, { recursive: true, force: true })
+      }
+    },
+  )
+
+  test.skipIf(process.platform !== 'linux')(
+    'a large set of omitted links reports the total without unbounded names',
+    async () => {
+      const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-link-report-bound-'))
+      const tree = path.join(agentDir, 'packages')
+      await mkdir(tree)
+      await writeFile(path.join(tree, 'match.ts'), 'needle')
+      for (let i = 0; i < 15; i++) await symlink('match.ts', path.join(tree, `link-${String(i).padStart(2, '0')}`))
+      try {
+        const ls = buildBuiltinPiToolOverrides({
+          agentDir,
+          sessionId: 'link-report-bound',
+          hooks: createHookBus(),
+        }).find((tool) => tool.name === 'ls')
+        if (ls === undefined) throw new Error('missing ls builtin')
+        const result = await ls.execute('c', { path: 'packages' } as never, undefined, undefined, {} as never)
+        const text = result.content.map((part) => (part.type === 'text' ? part.text : '')).join('\n')
+        expect(text).toContain('match.ts')
+        expect(text).toContain('omitted 15 symbolic links')
+        expect(text).toContain('and 3 more')
+        expect(text.match(/"link-\d{2}"/g)).toHaveLength(12)
+      } finally {
+        await rm(agentDir, { recursive: true, force: true })
+      }
+    },
+  )
+
+  test.skipIf(process.platform !== 'linux')(
+    'explicit dependency roots retain nested packages and ordinary .git files',
+    async () => {
+      const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-explicit-dependency-'))
+      const pkg = path.join(agentDir, 'node_modules', 'pkg')
+      await mkdir(path.join(pkg, 'node_modules', 'dep'), { recursive: true })
+      await writeFile(path.join(pkg, 'node_modules', 'dep', 'index.js'), 'nested package')
+      await writeFile(path.join(pkg, '.git'), 'gitdir: ../../metadata')
+      try {
+        const tools = buildBuiltinPiToolOverrides({
+          agentDir,
+          sessionId: 'explicit-dependency',
+          hooks: createHookBus(),
+        })
+        for (const name of ['find', 'ls']) {
+          const tool = tools.find((candidate) => candidate.name === name)
+          if (tool === undefined) throw new Error(`missing ${name} builtin`)
+          const args =
+            name === 'find'
+              ? { path: 'node_modules/pkg', pattern: 'node_modules/**/*.js' }
+              : { path: 'node_modules/pkg' }
+          const result = await tool.execute('c', args as never, undefined, undefined, {} as never)
+          const text = result.content.map((part) => (part.type === 'text' ? part.text : '')).join('\n')
+          expect(text).toContain(name === 'find' ? 'node_modules/dep/index.js' : 'node_modules')
+          if (name === 'ls') expect(text).toContain('.git')
+        }
+      } finally {
+        await rm(agentDir, { recursive: true, force: true })
+      }
+    },
+  )
+
+  test.skipIf(process.platform !== 'linux')(
+    'a workspace search never follows a nested link into a private file',
+    async () => {
+      const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-workspace-private-link-'))
+      const app = path.join(agentDir, 'packages', 'app')
+      await mkdir(app, { recursive: true })
+      await writeFile(path.join(agentDir, '.env'), 'private credential')
+      await writeFile(path.join(app, 'index.ts'), 'needle')
+      await symlink(path.join(agentDir, '.env'), path.join(app, 'credential'))
+      const args: Record<string, unknown> = { path: path.join(agentDir, 'packages') }
+      let pinned: PinnedToolFiles | undefined
+      try {
+        pinned = await enforceAndPinToolFiles({ tool: 'grep', args, agentDir })
+        expect(await readdir(path.join(args.path as string, 'app'))).toEqual(['index.ts'])
+        expect(await readFile(path.join(args.path as string, 'app', 'index.ts'), 'utf8')).toBe('needle')
+      } finally {
+        await pinned?.cleanup()
+        await rm(agentDir, { recursive: true, force: true })
       }
     },
   )
