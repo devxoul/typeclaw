@@ -65,6 +65,7 @@ import {
   createDiscordRemoveReactionCallback,
   encodeDiscordReactionRef,
 } from './discord-bot-reactions'
+import { createDiscordOwnReactionCallbacks } from './discord-bot-reactions'
 import { enrichDiscordMessageReferences } from './discord-bot-reference'
 import {
   ackInteraction,
@@ -1106,6 +1107,7 @@ export function createDiscordBotAdapter(options: DiscordBotAdapterOptions): Disc
 
   const reactionCallback = createDiscordReactionCallback({ client })
   const removeReactionCallback = createDiscordRemoveReactionCallback({ client })
+  const ownReaction = createDiscordOwnReactionCallbacks({ client, identity: async () => (await client.testAuth()).id })
   const editMessageCallback = createDiscordEditMessageCallback({ client })
 
   const interactionHandler = createInteractionHandler({
@@ -1269,6 +1271,8 @@ export function createDiscordBotAdapter(options: DiscordBotAdapterOptions): Disc
       options.router.registerOutbound('discord-bot', outboundCallback)
       options.router.registerReaction('discord-bot', reactionCallback)
       options.router.registerRemoveReaction('discord-bot', removeReactionCallback)
+      options.router.registerPrepareOwnReaction('discord-bot', ownReaction.prepare)
+      options.router.registerRemoveOwnReaction('discord-bot', ownReaction.remove)
       options.router.registerTyping('discord-bot', typingCallback)
       options.router.setTypingCapability('discord-bot', true)
       options.router.registerChannelNameResolver('discord-bot', channelResolver)
@@ -1290,6 +1294,8 @@ export function createDiscordBotAdapter(options: DiscordBotAdapterOptions): Disc
         options.router.unregisterOutbound('discord-bot', outboundCallback)
         options.router.unregisterReaction('discord-bot', reactionCallback)
         options.router.unregisterRemoveReaction('discord-bot', removeReactionCallback)
+        options.router.unregisterPrepareOwnReaction('discord-bot', ownReaction.prepare)
+        options.router.unregisterRemoveOwnReaction('discord-bot', ownReaction.remove)
         options.router.unregisterTyping('discord-bot', typingCallback)
         options.router.setTypingCapability('discord-bot', false)
         options.router.unregisterChannelNameResolver('discord-bot', channelResolver)
@@ -1356,6 +1362,8 @@ export function createDiscordBotAdapter(options: DiscordBotAdapterOptions): Disc
       options.router.unregisterOutbound('discord-bot', outboundCallback)
       options.router.unregisterReaction('discord-bot', reactionCallback)
       options.router.unregisterRemoveReaction('discord-bot', removeReactionCallback)
+      options.router.unregisterPrepareOwnReaction('discord-bot', ownReaction.prepare)
+      options.router.unregisterRemoveOwnReaction('discord-bot', ownReaction.remove)
       options.router.unregisterTyping('discord-bot', typingCallback)
       options.router.setTypingCapability('discord-bot', false)
       options.router.unregisterChannelNameResolver('discord-bot', channelResolver)

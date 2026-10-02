@@ -209,6 +209,39 @@ export type ReactionCallback = (req: ReactionRequest) => Promise<ReactionResult>
 
 export type RemoveReactionCallback = (req: RemoveReactionRequest) => Promise<ReactionResult>
 
+export type OwnReactionTarget = {
+  // Authenticated platform actor identity, not a credential/token hash.
+  accountIdentity: string
+  // Canonical message target, not the per-reaction-instance removal ref.
+  target: ReactionRef
+  // Canonical platform emoji: aliases resolve before persisting the tuple.
+  emoji: string
+}
+
+export type PrepareOwnReactionCallback = (req: ReactionRequest) => Promise<OwnReactionTarget | null>
+
+export type RemoveOwnReactionRequest = {
+  adapter: AdapterId
+  workspace: string
+  chat: string
+  thread?: string | null
+  target: ReactionRef
+  emoji: string
+  expectedAccountIdentity: string
+}
+
+export type RemoveOwnReactionResult =
+  | { ok: true }
+  | {
+      ok: false
+      code: 'unsupported' | 'transient' | 'rate-limit' | 'permission' | 'identity'
+      error: string
+      // Suggested retry delay in milliseconds.
+      retryAfter?: number
+    }
+
+export type RemoveOwnReactionCallback = (req: RemoveOwnReactionRequest) => Promise<RemoveOwnReactionResult>
+
 // File on disk that the agent wants to attach to an outbound message. The
 // agent runs inside a container with /agent bind-mounted from the host;
 // `path` should be an absolute path the container can `readFile`. The

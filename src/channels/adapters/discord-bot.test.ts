@@ -2221,6 +2221,10 @@ class FakeDiscordBotRouter {
     unregisterReaction: () => this.unregistered.push('reaction'),
     registerRemoveReaction: () => this.registered.push('removeReaction'),
     unregisterRemoveReaction: () => this.unregistered.push('removeReaction'),
+    registerPrepareOwnReaction: () => {},
+    unregisterPrepareOwnReaction: () => {},
+    registerRemoveOwnReaction: () => {},
+    unregisterRemoveOwnReaction: () => {},
     registerTyping: () => this.registered.push('typing'),
     unregisterTyping: () => this.unregistered.push('typing'),
     setTypingCapability: (_adapter: string, supported: boolean) =>

@@ -10,6 +10,10 @@ Part of the [channel adapters](/docs/reference/channel-adapters) family.
 
 Transport: **gateway intents** (no public URL required). Setup walkthrough: [Add a channel](/docs/guides/add-a-channel).
 
+## Own-reaction cleanup
+
+Temporary waiting cleanup addresses the original channel/message and canonical emoji through the own-user `/@me` reaction endpoint. It never uses bulk reaction deletion. The expected authenticated account must still match; a changed identity blocks cleanup. Replies do not await cleanup transport, and protected acknowledgments survive temporary cleanup and reboot. The same contract applies to the [Discord user adapter](/docs/reference/discord).
+
 ## Auth
 
 One token, stored in [`secrets.json`](/docs/reference/secrets-json):

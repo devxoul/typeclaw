@@ -41,6 +41,7 @@ import { createSlackChannelResolver } from './slack-channel-resolver'
 import { classifyInbound, type InboundDropReason, type SlackConversationType, splitSlackFiles } from './slack-classify'
 import { createSlackUserEditMessageCallback } from './slack-edit'
 import { createSlackReactionCallback, createSlackRemoveReactionCallback } from './slack-reactions'
+import { createSlackOwnReactionCallbacks } from './slack-reactions'
 import { invalidSlackThreadTs } from './slack-thread-ts'
 
 export type SlackAdapterLogger = {
@@ -252,6 +253,13 @@ export function createSlackAdapter(options: SlackAdapterOptions): SlackAdapter {
   })
   const reactionCallback = createSlackReactionCallback({ client })
   const removeReactionCallback = createSlackRemoveReactionCallback({ client })
+  const ownReaction = createSlackOwnReactionCallbacks({
+    client,
+    identity: async () => {
+      const self = await client.testAuth()
+      return self.team_id && self.user_id ? `${self.team_id}:${self.user_id}` : null
+    },
+  })
   const editMessageCallback = createSlackUserEditMessageCallback({ client })
 
   const resolveConversationType = async (event: SlackRTMMessageEvent): Promise<SlackConversationType | undefined> => {
@@ -395,6 +403,8 @@ export function createSlackAdapter(options: SlackAdapterOptions): SlackAdapter {
       options.router.registerMembership('slack', membershipResolver)
       options.router.registerReaction('slack', reactionCallback)
       options.router.registerRemoveReaction('slack', removeReactionCallback)
+      options.router.registerPrepareOwnReaction('slack', ownReaction.prepare)
+      options.router.registerRemoveOwnReaction('slack', ownReaction.remove)
       options.router.registerEditMessage('slack', editMessageCallback)
 
       const rollbackStart = (reason: string, cause: Error): never => {
@@ -407,6 +417,8 @@ export function createSlackAdapter(options: SlackAdapterOptions): SlackAdapter {
         options.router.unregisterMembership('slack', membershipResolver)
         options.router.unregisterReaction('slack', reactionCallback)
         options.router.unregisterRemoveReaction('slack', removeReactionCallback)
+        options.router.unregisterPrepareOwnReaction('slack', ownReaction.prepare)
+        options.router.unregisterRemoveOwnReaction('slack', ownReaction.remove)
         options.router.unregisterEditMessage('slack', editMessageCallback)
         clearTimeout(startupTimer)
         listener?.stop()
@@ -441,6 +453,8 @@ export function createSlackAdapter(options: SlackAdapterOptions): SlackAdapter {
       options.router.unregisterMembership('slack', membershipResolver)
       options.router.unregisterReaction('slack', reactionCallback)
       options.router.unregisterRemoveReaction('slack', removeReactionCallback)
+      options.router.unregisterPrepareOwnReaction('slack', ownReaction.prepare)
+      options.router.unregisterRemoveOwnReaction('slack', ownReaction.remove)
       options.router.unregisterEditMessage('slack', editMessageCallback)
       listener?.stop()
       listener = null

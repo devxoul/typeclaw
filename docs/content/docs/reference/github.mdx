@@ -14,6 +14,10 @@ Transport: **webhook delivery** (public URL required). Setup walkthrough: [Add a
 The `github` adapter needs a public URL to receive webhook events. Set `channels.github.webhookUrl` in `typeclaw.json`, or configure a tunnel entry with `for: { kind: 'channel', name: 'github' }`. Without one, webhook registration is skipped and no events arrive. See [Add a tunnel](/docs/guides/first-tunnel).
 </Callout>
 
+## Own-reaction cleanup
+
+Waiting cleanup reads every reaction page before deleting anything, matches the exact emoji and authenticated numeric actor, and deletes only that actor's matching reaction IDs. Both PAT and App authentication resolve the actor through `getSelf`; login aliases are not ownership evidence. A later-page error does not prove absence, and account rotation blocks the original cleanup. Replies do not await cleanup transport. Protected review acknowledgments that share the engagement emoji survive temporary cleanup and reboot.
+
 ## Auth
 
 Two modes. Both require `channels.github.webhookSecret` in [`secrets.json`](/docs/reference/secrets-json).

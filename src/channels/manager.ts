@@ -735,6 +735,11 @@ export function createChannelManager(options: ChannelManagerOptions): ChannelMan
     const now = recoveryNow()
     for (const [name, entry] of live) {
       if (entry.adapter.isConnected()) {
+        void router
+          .recoverWaitingReactions(name)
+          .catch((err) =>
+            logger.warn(`[channels] waiting reaction cleanup failed adapter="${name}": ${describeError(err)}`),
+          )
         entry.disconnectedSinceMs = null
         entry.nextRecoveryRestartAtMs = null
         entry.recoveryRestartAttempts = 0

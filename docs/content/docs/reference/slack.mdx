@@ -19,6 +19,10 @@ This is the **user-account** Slack adapter (`slack`). It signs in as your own Sl
   account you are comfortable putting at risk.
 </Callout>
 
+## Own-reaction cleanup
+
+Durable waiting cleanup uses `reactions.remove` for the original channel/message timestamp and normalized emoji, removing only this authenticated user account's reaction. Already absent succeeds; a changed account blocks the old cleanup. Replies do not await cleanup transport. Protected acknowledgments survive temporary cleanup and reboot; see [waiting reaction ownership](/docs/internals/engagement#waiting-reaction-ownership).
+
 ## Auth
 
 QR-code login. `typeclaw channel add slack` prompts for the QR data URL copied from the Slack desktop app's "Sign in on mobile" screen; the resulting token + cookie session is stored in `secrets.json#channels.slack` as one or more account records.

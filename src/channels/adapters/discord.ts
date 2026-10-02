@@ -44,6 +44,7 @@ import {
 } from './discord-classify'
 import { createDiscordUserEditMessageCallback } from './discord-edit'
 import { createDiscordReactionCallback, createDiscordRemoveReactionCallback } from './discord-reactions'
+import { createDiscordOwnReactionCallbacks } from './discord-reactions'
 
 export type DiscordAdapterLogger = {
   info: (msg: string) => void
@@ -233,6 +234,7 @@ export function createDiscordAdapter(options: DiscordAdapterOptions): DiscordAda
   })
   const reactionCallback = createDiscordReactionCallback({ client })
   const removeReactionCallback = createDiscordRemoveReactionCallback({ client })
+  const ownReaction = createDiscordOwnReactionCallbacks({ client, identity: async () => (await client.testAuth()).id })
   const editMessageCallback = createDiscordUserEditMessageCallback({ client })
 
   const handleMessage = async (event: DiscordGatewayMessageCreateEvent): Promise<void> => {
@@ -425,6 +427,8 @@ export function createDiscordAdapter(options: DiscordAdapterOptions): DiscordAda
     router.registerMembership('discord', membershipResolver)
     router.registerReaction('discord', reactionCallback)
     router.registerRemoveReaction('discord', removeReactionCallback)
+    router.registerPrepareOwnReaction('discord', ownReaction.prepare)
+    router.registerRemoveOwnReaction('discord', ownReaction.remove)
     router.registerEditMessage('discord', editMessageCallback)
   }
 
@@ -438,6 +442,8 @@ export function createDiscordAdapter(options: DiscordAdapterOptions): DiscordAda
     router.unregisterMembership('discord', membershipResolver)
     router.unregisterReaction('discord', reactionCallback)
     router.unregisterRemoveReaction('discord', removeReactionCallback)
+    router.unregisterPrepareOwnReaction('discord', ownReaction.prepare)
+    router.unregisterRemoveOwnReaction('discord', ownReaction.remove)
     router.unregisterEditMessage('discord', editMessageCallback)
   }
 }

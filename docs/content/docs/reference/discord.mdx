@@ -19,6 +19,10 @@ This is the **user-account** Discord adapter (`discord`). It signs in as your ow
   user account, and only on an account you are comfortable putting at risk.
 </Callout>
 
+## Own-reaction cleanup
+
+Durable waiting cleanup removes only this authenticated user's reaction through the `/@me` endpoint, using the original channel/message and canonical emoji. It never bulk-deletes reactions. A changed account blocks the old cleanup, and replies do not await cleanup transport. Protected acknowledgments survive temporary cleanup and reboot; see [waiting reaction ownership](/docs/internals/engagement#waiting-reaction-ownership).
+
 ## Auth
 
 QR-code login. `typeclaw channel add discord` opens a remote-auth flow; you scan the code from the Discord mobile app, and the resulting user-token session is stored in `secrets.json#channels.discord` as one or more account records.

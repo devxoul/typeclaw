@@ -9,6 +9,7 @@ import type {
 } from '@/channels/types'
 
 import { describeError } from '../describe-error'
+import { createOwnReactionCallbacks } from './own-reactions'
 
 // The reactable target on Slack: a message is addressed by its channel id plus
 // the message `ts`. The classifier stamps this because `ts` is the inbound's
@@ -146,6 +147,7 @@ function classifySlackError(code: string | null): ReactionErrorCode {
       return 'not-found'
     case 'ratelimited':
     case 'rate_limited':
+    case 'slack_webapi_rate_limited_error':
       return 'rate-limited'
     default:
       return 'transient'
@@ -162,4 +164,20 @@ function parseRecord(value: string): Record<string, unknown> | null {
   return typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)
     ? (parsed as Record<string, unknown>)
     : null
+}
+
+export function createSlackOwnReactionCallbacks(deps: {
+  client: Pick<SlackBotClient, 'removeReaction'>
+  identity: () => string | null | Promise<string | null>
+}) {
+  return createOwnReactionCallbacks({
+    adapter: 'slack-bot',
+    identity: deps.identity,
+    decode: decodeSlackReactionRef,
+    encode: encodeSlackReactionRef,
+    emoji: normalizeEmoji,
+    remove: (target, emoji) => deps.client.removeReaction(target.channel, target.ts, emoji),
+    classify: (error) => classifySlackError(slackErrorCode(error)),
+    absent: (error) => slackErrorCode(error) === 'no_reaction',
+  })
 }

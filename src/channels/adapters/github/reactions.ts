@@ -4,6 +4,9 @@ import type {
   ReactionErrorCode,
   ReactionRef,
   ReactionResult,
+  PrepareOwnReactionCallback,
+  RemoveOwnReactionCallback,
+  RemoveOwnReactionResult,
 } from '@/channels/types'
 
 import { describeError } from '../../describe-error'
@@ -274,4 +277,101 @@ function classifyStatus(status: number): ReactionErrorCode {
   if (status === 404) return 'not-found'
   if (status === 429) return 'rate-limited'
   return 'transient'
+}
+
+export function createGithubOwnReactionCallbacks(deps: {
+  token: (context?: GithubAuthContext) => Promise<string>
+  getSelf: () => Promise<{ id: number }>
+  authType: GithubAuthType
+  fetchImpl?: typeof fetch
+}): { prepare: PrepareOwnReactionCallback; remove: RemoveOwnReactionCallback } {
+  const fetchImpl = deps.fetchImpl ?? fetch
+  const prepare: PrepareOwnReactionCallback = async (req) => {
+    const target = decodeGithubReactionRef(req.reactionRef)
+    const emoji = REACTION_CONTENT[req.emoji.replace(/^:|:$/g, '')]
+    if (req.adapter !== 'github' || target === null || emoji === undefined) return null
+    const self = await deps.getSelf()
+    if (!Number.isSafeInteger(self.id) || self.id <= 0) return null
+    return { accountIdentity: String(self.id), target: encodeGithubReactionRef(target), emoji }
+  }
+  const remove: RemoveOwnReactionCallback = async (req) => {
+    const target = decodeGithubReactionRef(req.target)
+    const emoji = REACTION_CONTENT[req.emoji.replace(/^:|:$/g, '')]
+    if (req.adapter !== 'github' || target === null || emoji === undefined)
+      return { ok: false, code: 'unsupported', error: 'invalid GitHub reaction target or emoji' }
+    try {
+      const self = await deps.getSelf()
+      if (!Number.isSafeInteger(self.id) || self.id <= 0 || String(self.id) !== req.expectedAccountIdentity)
+        return { ok: false, code: 'identity', error: 'authenticated GitHub actor changed or unavailable' }
+      const token = await deps.token({ repoSlug: `${target.owner}/${target.repo}` })
+      const endpoint = reactionEndpoint(target)
+      let next: string | null = `${endpoint}?per_page=100`
+      const visited = new Set<string>()
+      const ownIds = new Set<number>()
+      // Finish enumeration before deleting: a failed later page must leave every reaction intact.
+      while (next !== null) {
+        if (visited.has(next)) return { ok: false, code: 'transient', error: 'cyclic GitHub reaction pagination' }
+        visited.add(next)
+        const response: Response = await fetchImpl(next, { headers: githubJsonHeaders(token) })
+        if (response.status === 404)
+          return { ok: false, code: 'permission', error: 'GitHub reaction target inaccessible' }
+        if (!response.ok) return await ownReactionHttpError(response)
+        const rows: unknown = await response.json()
+        if (!Array.isArray(rows)) return { ok: false, code: 'transient', error: 'invalid GitHub reaction page' }
+        for (const row of rows) {
+          if (typeof row !== 'object' || row === null)
+            return { ok: false, code: 'transient', error: 'invalid GitHub reaction row' }
+          const reaction = row as { id?: unknown; content?: unknown; user?: { id?: unknown } | null }
+          if (reaction.content === emoji && reaction.user?.id === self.id) {
+            if (typeof reaction.id !== 'number' || !Number.isSafeInteger(reaction.id) || reaction.id <= 0)
+              return { ok: false, code: 'transient', error: 'invalid GitHub reaction id' }
+            ownIds.add(reaction.id)
+          }
+        }
+        const link: string | null = response.headers.get('link')
+        const match: RegExpMatchArray | null | undefined = link
+          ?.split(',')
+          .map((part) => part.trim())
+          .find((part) => /;\s*rel="next"/.test(part))
+          ?.match(/^<([^>]+)>/)
+        next = match?.[1] ?? null
+        if (next !== null) {
+          const url = new URL(next)
+          if (url.origin !== new URL(GITHUB_API_BASE).origin || url.pathname !== new URL(endpoint).pathname)
+            return { ok: false, code: 'transient', error: 'invalid GitHub reaction pagination destination' }
+        }
+      }
+      for (const id of ownIds) {
+        const response = await fetchImpl(`${endpoint}/${id}`, { method: 'DELETE', headers: githubJsonHeaders(token) })
+        if (response.status !== 204 && response.status !== 404) return await ownReactionHttpError(response)
+      }
+      return { ok: true }
+    } catch (error) {
+      return { ok: false, code: 'transient', error: describeError(error) }
+    }
+  }
+  return { prepare, remove }
+}
+
+async function ownReactionHttpError(response: Response): Promise<RemoveOwnReactionResult> {
+  const text = await response.text().catch(() => '')
+  const rateLimited =
+    response.status === 429 ||
+    (response.status === 403 &&
+      (response.headers.get('x-ratelimit-remaining') === '0' ||
+        response.headers.has('retry-after') ||
+        /rate limit/i.test(text)))
+  const retry = Number(response.headers.get('retry-after'))
+  return {
+    ok: false,
+    code: rateLimited
+      ? 'rate-limit'
+      : response.status === 401 || response.status === 403 || response.status === 404
+        ? 'permission'
+        : 'transient',
+    error: `GitHub API ${response.status}: ${text}`,
+    ...(rateLimited && response.headers.has('retry-after') && Number.isFinite(retry) && retry >= 0
+      ? { retryAfter: retry * 1000 }
+      : {}),
+  }
 }
