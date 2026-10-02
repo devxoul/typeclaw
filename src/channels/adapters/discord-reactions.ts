@@ -9,6 +9,7 @@ import type {
 } from '@/channels/types'
 
 import { describeError } from '../describe-error'
+import { createOwnReactionCallbacks } from './own-reactions'
 
 export type DiscordReactionTarget = { channel: string; message: string }
 export type DiscordReactionRemovalTarget = { channel: string; message: string; emoji: string }
@@ -134,4 +135,20 @@ function parseRecord(value: string): Record<string, unknown> | null {
   return typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)
     ? (parsed as Record<string, unknown>)
     : null
+}
+
+export function createDiscordOwnReactionCallbacks(deps: {
+  client: Pick<DiscordClient, 'removeReaction'>
+  identity: () => string | null | Promise<string | null>
+}) {
+  return createOwnReactionCallbacks({
+    adapter: 'discord',
+    identity: deps.identity,
+    decode: decodeDiscordReactionRef,
+    encode: encodeDiscordReactionRef,
+    emoji: (emoji) => resolveEmoji(emoji) ?? (Object.values(EMOJI_UNICODE).includes(emoji) ? emoji : null),
+    remove: (target, emoji) => deps.client.removeReaction(target.channel, target.message, emoji),
+    classify: classifyDiscordError,
+    absent: (error) => classifyDiscordError(error) === 'not-found',
+  })
 }

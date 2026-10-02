@@ -9,6 +9,7 @@ import type {
 } from '@/channels/types'
 
 import { describeError } from '../describe-error'
+import { createOwnReactionCallbacks } from './own-reactions'
 
 // The reactable target on Discord: a message is addressed by its channel id
 // plus the message id. The classifier stamps this because both values are on
@@ -161,4 +162,20 @@ function parseRecord(value: string): Record<string, unknown> | null {
   return typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)
     ? (parsed as Record<string, unknown>)
     : null
+}
+
+export function createDiscordOwnReactionCallbacks(deps: {
+  client: Pick<DiscordBotClient, 'removeReaction'>
+  identity: () => string | null | Promise<string | null>
+}) {
+  return createOwnReactionCallbacks({
+    adapter: 'discord-bot',
+    identity: deps.identity,
+    decode: decodeDiscordReactionRef,
+    encode: encodeDiscordReactionRef,
+    emoji: (emoji) => resolveEmoji(emoji) ?? (Object.values(EMOJI_UNICODE).includes(emoji) ? emoji : null),
+    remove: (target, emoji) => deps.client.removeReaction(target.channel, target.message, emoji),
+    classify: classifyDiscordError,
+    absent: (error) => classifyDiscordError(error) === 'not-found',
+  })
 }

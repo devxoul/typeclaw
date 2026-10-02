@@ -61,6 +61,7 @@ import {
   createSlackRemoveReactionCallback,
   encodeSlackReactionRef,
 } from './slack-bot-reactions'
+import { createSlackOwnReactionCallbacks } from './slack-bot-reactions'
 import { enrichSlackReferenceContext } from './slack-bot-reference'
 import {
   buildSlashAckPayload,
@@ -1225,6 +1226,13 @@ export function createSlackBotAdapter(options: SlackBotAdapterOptions): SlackBot
 
   const reactionCallback = createSlackReactionCallback({ client })
   const removeReactionCallback = createSlackRemoveReactionCallback({ client })
+  const ownReaction = createSlackOwnReactionCallbacks({
+    client,
+    identity: async () => {
+      const self = await client.testAuth()
+      return self.team_id && self.user_id ? `${self.team_id}:${self.user_id}` : null
+    },
+  })
   const editMessageCallback = createSlackEditMessageCallback({ token: options.token, fetchImpl })
 
   const dedupe = createSlackDedupe()
@@ -1444,6 +1452,8 @@ export function createSlackBotAdapter(options: SlackBotAdapterOptions): SlackBot
       options.router.registerOutbound('slack-bot', outboundCallback)
       options.router.registerReaction('slack-bot', reactionCallback)
       options.router.registerRemoveReaction('slack-bot', removeReactionCallback)
+      options.router.registerPrepareOwnReaction('slack-bot', ownReaction.prepare)
+      options.router.registerRemoveOwnReaction('slack-bot', ownReaction.remove)
       options.router.registerTyping('slack-bot', typingCallback)
       options.router.setTypingCapability('slack-bot', true)
       options.router.registerChannelNameResolver('slack-bot', channelResolver)
@@ -1465,6 +1475,8 @@ export function createSlackBotAdapter(options: SlackBotAdapterOptions): SlackBot
         options.router.unregisterOutbound('slack-bot', outboundCallback)
         options.router.unregisterReaction('slack-bot', reactionCallback)
         options.router.unregisterRemoveReaction('slack-bot', removeReactionCallback)
+        options.router.unregisterPrepareOwnReaction('slack-bot', ownReaction.prepare)
+        options.router.unregisterRemoveOwnReaction('slack-bot', ownReaction.remove)
         options.router.unregisterTyping('slack-bot', typingCallback)
         options.router.setTypingCapability('slack-bot', false)
         options.router.unregisterChannelNameResolver('slack-bot', channelResolver)
@@ -1492,6 +1504,8 @@ export function createSlackBotAdapter(options: SlackBotAdapterOptions): SlackBot
       options.router.unregisterOutbound('slack-bot', outboundCallback)
       options.router.unregisterReaction('slack-bot', reactionCallback)
       options.router.unregisterRemoveReaction('slack-bot', removeReactionCallback)
+      options.router.unregisterPrepareOwnReaction('slack-bot', ownReaction.prepare)
+      options.router.unregisterRemoveOwnReaction('slack-bot', ownReaction.remove)
       options.router.unregisterTyping('slack-bot', typingCallback)
       options.router.setTypingCapability('slack-bot', false)
       options.router.unregisterChannelNameResolver('slack-bot', channelResolver)

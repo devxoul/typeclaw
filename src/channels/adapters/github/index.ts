@@ -23,6 +23,7 @@ import {
   parseListHooksPermissionStatus,
 } from './permission-guidance'
 import { createGithubReactionCallback, createGithubRemoveReactionCallback } from './reactions'
+import { createGithubOwnReactionCallbacks } from './reactions'
 import { loadReconcileCooldownStore, type ReconcileCooldownStore } from './reconcile-cooldown-store'
 import { reconcileOpenPrs } from './reconcile-open-prs'
 import { createRecoveredGuidLog, recoverFailedGithubDeliveries } from './recover-failed-deliveries'
@@ -157,6 +158,12 @@ export function createGithubAdapter(options: GithubAdapterOptions): GithubAdapte
     logger,
     fetchImpl,
   })
+  const ownReaction = createGithubOwnReactionCallbacks({
+    token: authToken,
+    getSelf: () => auth.getSelf(),
+    authType: options.secrets.auth.type,
+    fetchImpl,
+  })
   const reaction = createGithubReactionCallback({
     token: authToken,
     authType: options.secrets.auth.type,
@@ -246,6 +253,8 @@ export function createGithubAdapter(options: GithubAdapterOptions): GithubAdapte
       options.router.registerOutbound('github', outbound)
       options.router.registerReaction('github', reaction)
       options.router.registerRemoveReaction('github', removeReaction)
+      options.router.registerPrepareOwnReaction('github', ownReaction.prepare)
+      options.router.registerRemoveOwnReaction('github', ownReaction.remove)
       options.router.registerTyping('github', typing)
       options.router.registerHistory('github', history)
       options.router.registerMembership('github', membership)
@@ -263,6 +272,8 @@ export function createGithubAdapter(options: GithubAdapterOptions): GithubAdapte
         options.router.unregisterOutbound('github', outbound)
         options.router.unregisterReaction('github', reaction)
         options.router.unregisterRemoveReaction('github', removeReaction)
+        options.router.unregisterPrepareOwnReaction('github', ownReaction.prepare)
+        options.router.unregisterRemoveOwnReaction('github', ownReaction.remove)
         options.router.unregisterTyping('github', typing)
         options.router.unregisterHistory('github', history)
         options.router.unregisterMembership('github', membership)
@@ -452,6 +463,8 @@ export function createGithubAdapter(options: GithubAdapterOptions): GithubAdapte
       options.router.unregisterOutbound('github', outbound)
       options.router.unregisterReaction('github', reaction)
       options.router.unregisterRemoveReaction('github', removeReaction)
+      options.router.unregisterPrepareOwnReaction('github', ownReaction.prepare)
+      options.router.unregisterRemoveOwnReaction('github', ownReaction.remove)
       options.router.unregisterTyping('github', typing)
       options.router.unregisterHistory('github', history)
       options.router.unregisterMembership('github', membership)

@@ -27,6 +27,10 @@ CLI: `typeclaw channel add slack-bot` (interactive), `typeclaw channel set slack
   for the full scope list.
 </Callout>
 
+## Own-reaction cleanup
+
+The adapter removes only the authenticated account's reaction with `reactions.remove`, using the original channel, message timestamp, and normalized emoji. `no_reaction` is successful absence. Account rotation blocks cleanup belonging to the old identity; replies do not await cleanup transport. Protected acknowledgments survive temporary cleanup and reboot. The same own-removal contract applies to the [Slack user adapter](/docs/reference/slack).
+
 ## Capabilities
 
 | Feature                  | Supported | Notes                                                                                                                                                                                                   |

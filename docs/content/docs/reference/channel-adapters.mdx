@@ -21,6 +21,19 @@ Adapters come in two shapes. **Bot adapters** authenticate as a platform bot/app
 | [`kakaotalk`](/docs/reference/kakaotalk)       | sub-device login (email + password, stored encrypted)                                          | LOCO protocol     | no          | survives 7-day token expiry via host-side renewal cron     |
 | [`teams`](/docs/reference/teams)               | device-code login (AAD)                                                                        | trouter WebSocket | no          | user-account adapter; ~60-90min tokens, `reauth` to rotate |
 
+## Own-reaction cleanup
+
+Waiting indicators are durable router-owned effects, separate from model-requested reactions. Adapters expose `removeOwnReaction(target, emoji, expectedAccountIdentity)` with typed success, unsupported, transient, rate-limit, permission, and identity outcomes. Already absent counts as success. Cleanup never deletes another actor's reaction, and replies do not await its transport; a changed authenticated account blocks the original cleanup instead of redirecting it. Recovery yields between bounded filesystem batches and retires settled records rather than repeatedly rewriting history.
+
+| Adapter                  | Own-reaction removal                                                                                          |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------- |
+| `slack`, `slack-bot`     | Canonical channel/message timestamp and emoji; `reactions.remove`; `no_reaction` succeeds                     |
+| `discord`, `discord-bot` | Canonical channel/message and emoji; own-user `/@me` endpoint only, never bulk deletion                       |
+| `github`                 | Paginated exact-emoji reactions owned by the authenticated numeric actor, for both PAT and App authentication |
+| All others               | Explicitly unsupported; no broader deletion fallback                                                          |
+
+Old-epoch temporary owners are released on boot. Protected review/deferred-work acknowledgments sharing the engagement emoji survive reboot and temporary cleanup. Their durable conversation-scoped identity lets a later genuine reply in the same conversation retire them after restart; another conversation's reply does not. See [waiting reaction ownership](/docs/internals/engagement#waiting-reaction-ownership) for storage, generation, and recovery boundaries.
+
 ## `channels.<adapter>` shape
 
 ```json

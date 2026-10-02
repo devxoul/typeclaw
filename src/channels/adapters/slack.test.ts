@@ -112,6 +112,10 @@ function router(): ChannelRouter & {
     unregisterReaction: (adapter: string) => unregistered.push(`reaction:${adapter}`),
     registerRemoveReaction: (adapter: string) => registered.push(`remove-reaction:${adapter}`),
     unregisterRemoveReaction: (adapter: string) => unregistered.push(`remove-reaction:${adapter}`),
+    registerPrepareOwnReaction: () => {},
+    unregisterPrepareOwnReaction: () => {},
+    registerRemoveOwnReaction: () => {},
+    unregisterRemoveOwnReaction: () => {},
     registerEditMessage: (adapter: string) => registered.push(`edit:${adapter}`),
     unregisterEditMessage: (adapter: string) => unregistered.push(`edit:${adapter}`),
   }

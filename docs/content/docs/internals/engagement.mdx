@@ -104,6 +104,16 @@ After a terminal `channel_reply` promises more work without `more_work_this_turn
 
 This exception uses the existing stuck-child backstop. Once it expires, willingness recovery resumes. Ordinary empty-turn recovery remains scoped to the logical turn that started the child; unrelated later turns still recover, and real prose is still delivered while a child runs.
 
+## Waiting reaction ownership
+
+The router, not a returned reaction-instance ID, owns temporary engagement eyes and continuation hourglasses. `src/channels/waiting-reactions.ts` synchronizes one JSON record per authenticated account, canonical target, and emoji under `channels/waiting-reactions/` before calling the adapter to add it. Preparation captures the authenticated adapter's add capability, so an adapter replacement cannot add as a different account under the old tuple. Owners carry a boot epoch and generation; tuple lanes serialize adds and removals and recheck current ownership before transport. A stale callback can release only its captured owner.
+
+At boot, cleanup releases old-epoch **temporary** owners and ensures that the original account's reaction is absent where the adapter supports own-reaction removal. A new owner on the same tuple preserves or restores presence. Review and deferred-work acknowledgments use protected owners with a durable identity covering conversation, canonical target, emoji, and acknowledgment kind: temporary cleanup and reboot never retire them merely because their epoch is old. A later genuine reply in that conversation retires matching acknowledgment owners, including those from a previous runtime, using their captured identities and generations. Acknowledgments acquired after that reply's retirement decision are not swept into it. When an acknowledgment replaces an engagement indicator on the same tuple, durable ownership conversion avoids removing protected presence.
+
+Adapters own canonical target, emoji, authenticated identity, and own-actor removal semantics. Identity changes block cleanup rather than deleting a different account's reaction. Unsupported adapters and permission, rate-limit, or transient failures leave a recoverable cleanup record. The router does not await cleanup transport before replies or interruption notices. Filesystem work still shares the event loop: recovery yields between bounded batches, does not rewrite unchanged records, and retires ensured-absent records once no owner or live reservation references them. Missing files make stale releases no-ops; a new owner creates a fresh capability. Protected and unresolved records remain retained.
+
+If intent storage fails, the waiting add is skipped. JSON replacement synchronizes the file and parent directory on POSIX. Windows development compatibility keeps file synchronization but explicitly skips unsupported directory synchronization; it does not promise power-loss durability. Other synchronization errors propagate. This assumes one runtime writing an agent directory, not concurrent runtimes or remote-call fencing.
+
 ## Rules of thumb
 
 - **`decideEngagement` is pure.** Inputs in, `engage`/`observe` out. No I/O, no side effects — the router owns buffering, broadcasting, and membership warming.

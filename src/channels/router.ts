@@ -127,6 +127,11 @@ import type {
   MessageGetCallback,
   RemoveReactionCallback,
   RemoveReactionRequest,
+  OwnReactionTarget,
+  PrepareOwnReactionCallback,
+  RemoveOwnReactionCallback,
+  RemoveOwnReactionRequest,
+  RemoveOwnReactionResult,
   OutboundCallback,
   OutboundMessage,
   QuoteAnchorSource,
@@ -149,6 +154,7 @@ import type {
   TypingCallback,
 } from './types'
 import { channelKeyId } from './types'
+import { createWaitingReactionCoordinator, type WaitingReactionHandle } from './waiting-reactions'
 
 export const INITIAL_DEBOUNCE_MS = 600
 export const HOT_DEBOUNCE_MS = 1500
@@ -763,7 +769,7 @@ type QueuedInbound = {
   authorIsBot: boolean
   externalMessageId: string
   reactionRef?: ReactionRef
-  engageReaction?: Promise<ReactionRef | null>
+  engageReaction?: WaitingReactionHandle
   isBotMention: boolean
   isBotMentionOnly?: boolean
   replyToBotMessageId: string | null
@@ -985,11 +991,9 @@ type LiveSession = {
   // stop clear ALL of them, not just the latest. An anchor is added when its
   // 'tick' dispatches and removed when its 'stop' clear dispatches.
   dirtyTypingThreads: Set<string>
-  // One engage-:eyes:-add promise per inbound coalesced into THIS turn, each
-  // resolving to its removable per-instance ref (or null). A debounced turn can
-  // batch several inbounds that each got their own :eyes:, so every entry is
-  // removed after the reply. Empty on turns with no reactable inbound.
-  currentTurnEngageReactions: Array<Promise<ReactionRef | null>>
+  // Captured durable owners for this coalesced turn. Releasing one owner
+  // cannot remove another turn's or a protected acknowledgment's presence.
+  currentTurnEngageReactions: WaitingReactionHandle[]
   // Model-requested `channel_react` reactions for THIS turn, held until the turn
   // ends. Flushed to the adapter only if the agent actually replied this turn;
   // discarded on silence (skip_response / empty / errored turns) so the bot never
@@ -999,32 +1003,12 @@ type LiveSession = {
   // deliberately deferred to a background child. Explicit NO_REPLY and
   // skip_response turns do not arm it: opting out must leave no reaction behind.
   // Stamped with `turnSeq` so a stale flag from a crashed turn cannot leak into
-  // the next one. Fired after the transient engage :eyes: is dropped because
-  // adapters may collapse a same-actor same-emoji reaction into one toggle.
+  // the next one. Tuple arbitration preserves protected acknowledgment
+  // presence when temporary engagement ownership is retired.
   silentAckTurn: { turnSeq: number; reason: SilentAckReason } | null
-  // One silent-ack-:eyes:-add promise per PERSISTENT ack `reactOnSilentAck` has
-  // planted on a trigger message, each resolving to its removable ref (or null).
-  // Mirrors `currentTurnEngageReactions`: the PROMISE is pushed synchronously at
-  // arm time, so a later replied-turn cleanup that snapshots this array always
-  // sees every in-flight add and awaits it before removing — storing only the
-  // resolved ref raced (cleanup could snapshot an empty array, then a slow add
-  // append its ref afterward, stranding the :eyes:). Cross-turn state on purpose:
-  // the mark means output is external or deferred, and once the same sticky
-  // conversation gets a genuine reply it reads as stale — so it is retired on
-  // the next replied turn (see dropSilentAckReactions).
-  // Conversation-scoped, NOT per-trigger-message: coalescing means the silent
-  // turn's trigger (message N) and the eventual reply's trigger (message N+1)
-  // routinely differ, so exact-message scoping would strand the mark. NOT reset
-  // in drain's outer per-turn finally. On teardown the entries are dropped
-  // WITHOUT removing the reactions, unlike the transient engage :eyes: which
-  // teardown must strip.
-  activeSilentAckReactions: Array<Promise<ReactionRef | null>>
-  // One add promise per willingness status posted by the agent, resolving to
-  // the removable reaction-instance ref. Cross-turn state on purpose: the
-  // hourglass stays visible until a substantive result, fallback, explicit
-  // silence, stop, or teardown retires every outstanding promise. Storing the
-  // promise synchronously prevents cleanup racing a slow reaction add.
-  activeContinuationReactions: Array<Promise<ReactionRef | null>>
+  // Temporary continuation indicators are owned across turns until result,
+  // silence, stop, teardown, or recovery explicitly releases their owner.
+  activeContinuationReactions: WaitingReactionHandle[]
   lastTurnAuthorIds: Set<string>
   // Mirror of currentTurnAuthorId at end-of-turn (the LAST speaker of the
   // prior batch), preserved across the drain finally-block which resets
@@ -1451,6 +1435,12 @@ export type ChannelRouter = {
   registerRemoveReaction: (adapter: ChannelKey['adapter'], cb: RemoveReactionCallback) => void
   unregisterRemoveReaction: (adapter: ChannelKey['adapter'], cb: RemoveReactionCallback) => void
   removeReaction: (req: RemoveReactionRequest) => Promise<ReactionResult>
+  registerPrepareOwnReaction: (adapter: ChannelKey['adapter'], cb: PrepareOwnReactionCallback) => void
+  unregisterPrepareOwnReaction: (adapter: ChannelKey['adapter'], cb: PrepareOwnReactionCallback) => void
+  registerRemoveOwnReaction: (adapter: ChannelKey['adapter'], cb: RemoveOwnReactionCallback) => void
+  unregisterRemoveOwnReaction: (adapter: ChannelKey['adapter'], cb: RemoveOwnReactionCallback) => void
+  removeOwnReaction: (req: RemoveOwnReactionRequest) => Promise<RemoveOwnReactionResult>
+  recoverWaitingReactions: (adapter?: ChannelKey['adapter']) => Promise<void>
   registerTyping: (adapter: ChannelKey['adapter'], cb: TypingCallback) => void
   unregisterTyping: (adapter: ChannelKey['adapter'], cb: TypingCallback) => void
   // Deliberately separate from registerTyping: github registers a no-op typing
@@ -1734,6 +1724,7 @@ export type AliasesProvider = () => readonly string[]
 
 export type CreateChannelRouterOptions = {
   agentDir: string
+  bootEpoch?: string
   configForAdapter: ConfigForAdapter
   configuredAliases?: AliasesProvider
   createSessionForChannel?: CreateSessionForChannel
@@ -1939,6 +1930,8 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   const outboundCallbacks = new Map<ChannelKey['adapter'], Set<OutboundCallback>>()
   const reactionCallbacks = new Map<ChannelKey['adapter'], Set<ReactionCallback>>()
   const removeReactionCallbacks = new Map<ChannelKey['adapter'], Set<RemoveReactionCallback>>()
+  const prepareOwnReactionCallbacks = new Map<ChannelKey['adapter'], Set<PrepareOwnReactionCallback>>()
+  const removeOwnReactionCallbacks = new Map<ChannelKey['adapter'], Set<RemoveOwnReactionCallback>>()
   const typingCallbacks = new Map<ChannelKey['adapter'], Set<TypingCallback>>()
   const typingCapableAdapters = new Set<ChannelKey['adapter']>()
   const typingHeartbeatIntervals = new Map<ChannelKey['adapter'], number>()
@@ -2342,7 +2335,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     logger.error(
       `[channels] ${channelKeyId(pending.key)}: reload handoff retention policy discarded ${count} queued item(s): ${reason}. ${recovery}`,
     )
-    await dropPendingReloadHandoffEngageReactions(pending)
+    void dropPendingReloadHandoffEngageReactions(pending)
     const result = await send(
       {
         adapter: pending.key.adapter,
@@ -2782,7 +2775,6 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         currentTurnEngageReactions: [],
         pendingTurnReactions: [],
         silentAckTurn: null,
-        activeSilentAckReactions: [],
         activeContinuationReactions: [],
         // `lastTurnAuthorId` (string, used for `lastInboundAuthorId` in
         // origin) and `lastTurnAuthorIds` (Set, used by
@@ -4344,13 +4336,9 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           // also silence, skip_response, an empty turn, or a provider error
           // (observe-after-engage). Leaving it only on the reply path stranded the
           // ack permanently on messages the agent looked at but never answered.
-          const dropDone = dropEngageReactions(live, engageAddPromises)
-          // A turn whose output landed outside the channel or was deferred to a
-          // background child leaves a persistent :eyes:. On a typing-less adapter
-          // it reuses the transient engage reaction's message/emoji/actor, so wait
-          // for that removal to reach the adapter before adding the persistent one.
-          if (live.silentAckTurn?.turnSeq === live.turnSeq) await dropDone
-          else void dropDone
+          // Tuple lanes order removal before protected acknowledgment addition,
+          // without making transport cleanup a barrier for the next response.
+          void dropEngageReactions(live, engageAddPromises)
           reactOnSilentAck(live)
           // Held channel_react reactions apply only when the agent posted a
           // genuine reply this turn — NOT an empty-turn fallback or provider-
@@ -4900,11 +4888,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     }
   }
 
-  const enqueue = (
-    live: LiveSession,
-    event: InboundMessage,
-    engageReaction: Promise<ReactionRef | null> | null,
-  ): void => {
+  const enqueue = (live: LiveSession, event: InboundMessage, engageReaction: WaitingReactionHandle | null): void => {
     clearQueuedEngageReactions(live)
     live.promptQueue.push({
       text: event.text,
@@ -5053,6 +5037,69 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     return lastError ?? { ok: false, error: 'no reaction removal callback handled request', code: 'unsupported' }
   }
 
+  // Canonical preparation captures the adapter instance that authenticated it.
+  // Reload may replace registration while identity lookup is still in flight.
+  const preparedReactionAdds = new WeakMap<OwnReactionTarget, ReactionCallback>()
+  const prepareOwnReaction = async (req: ReactionRequest): Promise<OwnReactionTarget | null> => {
+    const adds = Array.from(reactionCallbacks.get(req.adapter) ?? [])
+    // The manager has one live adapter per type. Do not guess account ownership
+    // if an external caller installs ambiguous waiting-add capabilities.
+    if (adds.length !== 1) return null
+    const add = adds[0]!
+    for (const cb of Array.from(prepareOwnReactionCallbacks.get(req.adapter) ?? [])) {
+      const target = await cb(req).catch(() => null)
+      if (target) {
+        preparedReactionAdds.set(target, add)
+        return target
+      }
+    }
+    return null
+  }
+  const addPreparedWaitingReaction = async (
+    req: ReactionRequest,
+    prepared: OwnReactionTarget,
+  ): Promise<ReactionResult> => {
+    const add = preparedReactionAdds.get(prepared)
+    if (!add) return { ok: false, code: 'unsupported', error: 'authenticated waiting-add capability unavailable' }
+    return add(req).catch((err): ReactionResult => ({ ok: false, code: 'transient', error: describeError(err) }))
+  }
+  const removeOwnReaction = async (req: RemoveOwnReactionRequest): Promise<RemoveOwnReactionResult> => {
+    for (const cb of removeOwnReactionCallbacks.get(req.adapter) ?? []) {
+      const result = await cb(req).catch(
+        (): RemoveOwnReactionResult => ({ ok: false, code: 'transient', error: 'own reaction cleanup failed' }),
+      )
+      if (result.ok || result.code !== 'unsupported') return result
+    }
+    return { ok: false, code: 'unsupported', error: 'own reaction cleanup unsupported' }
+  }
+  const waitingReactions = createWaitingReactionCoordinator({
+    agentDir: options.agentDir,
+    epoch: options.bootEpoch,
+    add: addPreparedWaitingReaction,
+    prepare: prepareOwnReaction,
+    remove: removeOwnReaction,
+  })
+  const recoverWaitingReactions = (adapter?: ChannelKey['adapter']): Promise<void> => waitingReactions.recover(adapter)
+  const registerPrepareOwnReaction = (adapter: ChannelKey['adapter'], cb: PrepareOwnReactionCallback): void => {
+    const callbacks = prepareOwnReactionCallbacks.get(adapter) ?? new Set<PrepareOwnReactionCallback>()
+    callbacks.add(cb)
+    prepareOwnReactionCallbacks.set(adapter, callbacks)
+  }
+  const unregisterPrepareOwnReaction = (adapter: ChannelKey['adapter'], cb: PrepareOwnReactionCallback): void => {
+    prepareOwnReactionCallbacks.get(adapter)?.delete(cb)
+  }
+  const registerRemoveOwnReaction = (adapter: ChannelKey['adapter'], cb: RemoveOwnReactionCallback): void => {
+    const callbacks = removeOwnReactionCallbacks.get(adapter) ?? new Set<RemoveOwnReactionCallback>()
+    callbacks.add(cb)
+    removeOwnReactionCallbacks.set(adapter, callbacks)
+    void recoverWaitingReactions(adapter).catch((err) =>
+      logger.warn(`[channels] waiting reaction recovery failed: ${describeError(err)}`),
+    )
+  }
+  const unregisterRemoveOwnReaction = (adapter: ChannelKey['adapter'], cb: RemoveOwnReactionCallback): void => {
+    removeOwnReactionCallbacks.get(adapter)?.delete(cb)
+  }
+
   // Best-effort acknowledgment: drop an :eyes: on the triggering inbound the
   // moment we decide to engage — but ONLY when the channel has no visible
   // "typing…" indicator. Where typing renders (slack/discord/telegram) the
@@ -5063,10 +5110,9 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   // supporting reactions, a transient API error) can NEVER block engagement,
   // enqueueing, or the agent's actual reply. No reactionRef = nothing reactable
   // (synthetic inbounds, reaction-less adapters) = silent skip.
-  const autoReactOnEngage = (event: InboundMessage): Promise<ReactionRef | null> | null => {
-    if (event.reactionRef === undefined) return null
-    if (typingCapableAdapters.has(event.adapter)) return null
-    const addResult = react({
+  const autoReactOnEngage = (event: InboundMessage): WaitingReactionHandle | null => {
+    if (event.reactionRef === undefined || typingCapableAdapters.has(event.adapter)) return null
+    return waitingReactions.acquire({
       adapter: event.adapter,
       workspace: event.workspace,
       chat: event.chat,
@@ -5074,28 +5120,12 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       reactionRef: event.reactionRef,
       emoji: ENGAGE_REACTION_EMOJI,
     })
-    const addReactionRef = addResult.then((r) => (r.ok ? (r.reactionRef ?? null) : null)).catch(() => null)
-    void addResult
-      .then((result) => {
-        if (!result.ok && result.code !== 'unsupported') {
-          logger.info(`[channels] engage-react failed adapter=${event.adapter} chat=${event.chat}: ${result.error}`)
-        }
-      })
-      .catch((err) => {
-        logger.info(`[channels] engage-react threw adapter=${event.adapter} chat=${event.chat}: ${describeError(err)}`)
-      })
-    return addReactionRef
   }
 
-  // Returns a promise that settles only once every engage removal has REACHED
-  // the adapter, not merely been scheduled. The silent-ack path awaits this so
-  // its persistent :eyes: is added strictly AFTER the transient one is removed
-  // (see reactOnSilentAck). Fire-and-forget callers just `void` the result.
-  const dropEngageReactions = (live: LiveSession, addPromises: Array<Promise<ReactionRef | null>>): Promise<void> => {
-    return Promise.all(addPromises.map((addPromise) => dropOneEngageReaction(live.key, addPromise))).then(
-      () => undefined,
-    )
-  }
+  // Awaitable for scoped effect callers, never a response/notice barrier.
+  // A protected successor may retain presence without a remote toggle.
+  const dropEngageReactions = (live: LiveSession, owners: WaitingReactionHandle[]): Promise<void> =>
+    Promise.all(owners.map((owner) => dropOneEngageReaction(live.key, owner))).then(() => undefined)
 
   // Only the LAST engaging inbound of a coalesced batch should carry the eager
   // :eyes:. Called from enqueue() before the new inbound is pushed to roll the
@@ -5103,43 +5133,20 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   // overwrite) is load-bearing: a newer engaging inbound that has no reactionRef
   // must still strip the previous :eyes: rather than leave it stranded.
   const clearQueuedEngageReactions = (live: LiveSession): void => {
-    const addPromises = live.promptQueue.flatMap((m) => (m.engageReaction !== undefined ? [m.engageReaction] : []))
-    if (addPromises.length === 0) return
+    const owners = live.promptQueue.flatMap((m) => (m.engageReaction !== undefined ? [m.engageReaction] : []))
+    if (owners.length === 0) return
     for (const item of live.promptQueue) delete item.engageReaction
-    void dropEngageReactions(live, addPromises)
+    void dropEngageReactions(live, owners)
   }
 
   const dropPendingReloadHandoffEngageReactions = (pending: PendingReloadHandoff): Promise<void> => {
-    const addPromises = pending.inbounds.flatMap((item) =>
-      item.engageReaction !== undefined ? [item.engageReaction] : [],
-    )
+    const owners = pending.inbounds.flatMap((item) => (item.engageReaction !== undefined ? [item.engageReaction] : []))
     for (const item of pending.inbounds) delete item.engageReaction
-    return Promise.all(addPromises.map((addPromise) => dropOneEngageReaction(pending.key, addPromise))).then(
-      () => undefined,
-    )
+    return Promise.all(owners.map((owner) => dropOneEngageReaction(pending.key, owner))).then(() => undefined)
   }
 
-  const dropOneEngageReaction = (key: ChannelKey, addPromise: Promise<ReactionRef | null>): Promise<void> => {
-    return addPromise
-      .then((reactionRef) => {
-        if (reactionRef === null) return undefined
-        return removeReaction({
-          adapter: key.adapter,
-          workspace: key.workspace,
-          chat: key.chat,
-          thread: key.thread,
-          reactionRef,
-        })
-      })
-      .then((result) => {
-        if (result && !result.ok && result.code !== 'unsupported' && result.code !== 'not-found') {
-          logger.info(`[channels] engage-unreact failed adapter=${key.adapter} chat=${key.chat}: ${result.error}`)
-        }
-      })
-      .catch((err) => {
-        logger.info(`[channels] engage-unreact threw adapter=${key.adapter} chat=${key.chat}: ${describeError(err)}`)
-      })
-  }
+  const dropOneEngageReaction = (_key: ChannelKey, owner: WaitingReactionHandle): Promise<void> =>
+    waitingReactions.release(owner)
 
   const unregisterOutbound = (adapter: ChannelKey['adapter'], cb: OutboundCallback): void => {
     outboundCallbacks.get(adapter)?.delete(cb)
@@ -6578,11 +6585,10 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
 
   const tearDownLive = async (live: LiveSession): Promise<void> => {
     live.destroyed = true
-    // A teardown before the queued/in-flight turn ever replies would otherwise
-    // strand its eager :eyes: forever (dropEngageReactions only runs after a
-    // successful send). Remove both the queued and current-turn acks here.
+    // Release queued and in-flight temporary owners even if teardown occurs
+    // before the turn-end cleanup. Protected acknowledgments remain intact.
     clearQueuedEngageReactions(live)
-    dropEngageReactions(live, live.currentTurnEngageReactions)
+    void dropEngageReactions(live, live.currentTurnEngageReactions)
     live.currentTurnEngageReactions = []
     void dropContinuationReactions(live)
     if (live.debounceTimer) clearTimeout(live.debounceTimer)
@@ -7431,130 +7437,41 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     live.silentAckTurn = null
     const reactionRef = live.currentTurnReactionRef
     if (reactionRef === null) return
-    const addResult = react({
-      adapter: live.key.adapter,
-      workspace: live.key.workspace,
-      chat: live.key.chat,
-      thread: live.key.thread,
-      reactionRef,
-      emoji: ENGAGE_REACTION_EMOJI,
-    })
-    void addResult
-      .then((result) => {
-        if (!result.ok && result.code !== 'unsupported') {
-          logger.info(
-            `[channels] silent-ack-react failed reason=${reason} adapter=${live.key.adapter} chat=${live.key.chat}: ${result.error}`,
-          )
-        }
-      })
-      .catch((err) => {
-        logger.info(
-          `[channels] silent-ack-react threw reason=${reason} adapter=${live.key.adapter} chat=${live.key.chat}: ${describeError(err)}`,
-        )
-      })
-    // Register the add promise (not its resolved ref) SYNCHRONOUSLY, so a later
-    // replied-turn cleanup can never race ahead of a still-in-flight add.
-    live.activeSilentAckReactions.push(addResult.then((r) => (r.ok ? (r.reactionRef ?? null) : null)).catch(() => null))
+    waitingReactions.acquire(
+      {
+        adapter: live.key.adapter,
+        workspace: live.key.workspace,
+        chat: live.key.chat,
+        thread: live.key.thread,
+        reactionRef,
+        emoji: ENGAGE_REACTION_EMOJI,
+      },
+      true,
+      { conversation: live.key, kind: reason },
+    )
   }
 
-  // Retire every persistent silent-ack :eyes: outstanding in this live session
-  // once the agent posts a genuine reply. Snapshot-and-clear the promise array
-  // BEFORE awaiting, so a
-  // concurrent later silent turn appending a fresh add is never swept by this
-  // in-flight cleanup. Each entry is AWAITED to its resolved ref before removal,
-  // so an add still in flight when the reply lands is still retired. Failures are
-  // logged, never retried: stale emoji cleanup must never block routing.
-  const dropSilentAckReactions = (live: LiveSession): Promise<void> => {
-    const addPromises = live.activeSilentAckReactions
-    if (addPromises.length === 0) return Promise.resolve()
-    live.activeSilentAckReactions = []
-    return Promise.all(
-      addPromises.map((addPromise) =>
-        addPromise
-          .then((reactionRef) => {
-            if (reactionRef === null) return undefined
-            return removeReaction({
-              adapter: live.key.adapter,
-              workspace: live.key.workspace,
-              chat: live.key.chat,
-              thread: live.key.thread,
-              reactionRef,
-            })
-          })
-          .then((result) => {
-            if (result && !result.ok && result.code !== 'unsupported' && result.code !== 'not-found') {
-              logger.info(
-                `[channels] silent-ack-unreact failed adapter=${live.key.adapter} chat=${live.key.chat}: ${result.error}`,
-              )
-            }
-          })
-          .catch((err) => {
-            logger.info(
-              `[channels] silent-ack-unreact threw adapter=${live.key.adapter} chat=${live.key.chat}: ${describeError(err)}`,
-            )
-          }),
-      ),
-    ).then(() => undefined)
-  }
+  // The genuine-reply decision retires conversation-scoped acknowledgments,
+  // including owners persisted by an earlier runtime. Cleanup cannot use this.
+  const dropSilentAckReactions = (live: LiveSession): Promise<void> => waitingReactions.retireAcknowledgments(live.key)
 
   const reactOnContinuationWillingness = (live: LiveSession, reactionRef: ReactionRef): void => {
-    const addResult = react({
-      adapter: live.key.adapter,
-      workspace: live.key.workspace,
-      chat: live.key.chat,
-      thread: live.key.thread,
-      reactionRef,
-      emoji: CONTINUATION_REACTION_EMOJI,
-    })
-    void addResult
-      .then((result) => {
-        if (!result.ok && result.code !== 'unsupported') {
-          logger.info(
-            `[channels] continuation-react failed adapter=${live.key.adapter} chat=${live.key.chat}: ${result.error}`,
-          )
-        }
-      })
-      .catch((err) => {
-        logger.info(
-          `[channels] continuation-react threw adapter=${live.key.adapter} chat=${live.key.chat}: ${describeError(err)}`,
-        )
-      })
     live.activeContinuationReactions.push(
-      addResult.then((result) => (result.ok ? (result.reactionRef ?? null) : null)).catch(() => null),
+      waitingReactions.acquire({
+        adapter: live.key.adapter,
+        workspace: live.key.workspace,
+        chat: live.key.chat,
+        thread: live.key.thread,
+        reactionRef,
+        emoji: CONTINUATION_REACTION_EMOJI,
+      }),
     )
   }
 
   const dropContinuationReactions = (live: LiveSession): Promise<void> => {
-    const addPromises = live.activeContinuationReactions
-    if (addPromises.length === 0) return Promise.resolve()
+    const owners = live.activeContinuationReactions
     live.activeContinuationReactions = []
-    return Promise.all(
-      addPromises.map((addPromise) =>
-        addPromise
-          .then((reactionRef) => {
-            if (reactionRef === null) return undefined
-            return removeReaction({
-              adapter: live.key.adapter,
-              workspace: live.key.workspace,
-              chat: live.key.chat,
-              thread: live.key.thread,
-              reactionRef,
-            })
-          })
-          .then((result) => {
-            if (result && !result.ok && result.code !== 'unsupported' && result.code !== 'not-found') {
-              logger.info(
-                `[channels] continuation-unreact failed adapter=${live.key.adapter} chat=${live.key.chat}: ${result.error}`,
-              )
-            }
-          })
-          .catch((err) => {
-            logger.info(
-              `[channels] continuation-unreact threw adapter=${live.key.adapter} chat=${live.key.chat}: ${describeError(err)}`,
-            )
-          }),
-      ),
-    ).then(() => undefined)
+    return Promise.all(owners.map((owner) => waitingReactions.release(owner))).then(() => undefined)
   }
 
   return {
@@ -7572,6 +7489,12 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     registerRemoveReaction,
     unregisterRemoveReaction,
     removeReaction,
+    registerPrepareOwnReaction,
+    unregisterPrepareOwnReaction,
+    registerRemoveOwnReaction,
+    unregisterRemoveOwnReaction,
+    removeOwnReaction,
+    recoverWaitingReactions,
     registerTyping,
     unregisterTyping,
     setTypingCapability,

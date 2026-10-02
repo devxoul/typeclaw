@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { mkdir, mkdtemp, rm, writeFile as writeFileFs } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile as writeFileFs } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { basename, join } from 'node:path'
 
@@ -120,7 +120,8 @@ import type {
   HistoryCallback,
   InboundMessage,
   ListChannelsArgs,
-  RemoveReactionRequest,
+  RemoveOwnReactionRequest,
+  RemoveOwnReactionResult,
   OutboundMessage,
   ReactionRequest,
   ReactionRef,
@@ -1423,7 +1424,7 @@ describe('ChannelRouter session lifecycle', () => {
     const logs: string[] = []
     const nowRef = { value: 1000 }
     const notices: string[] = []
-    const removed: RemoveReactionRequest[] = []
+    const removed: RemoveOwnReactionRequest[] = []
     const { router, sessions } = makeRouter(dir, {
       factoryCalls,
       failSessionCreationAt: [2],
@@ -1435,11 +1436,16 @@ describe('ChannelRouter session lifecycle', () => {
       notices.push(message.text ?? '')
       return { ok: true }
     })
+    router.registerPrepareOwnReaction('discord-bot', async (req) => ({
+      accountIdentity: 'test-account',
+      target: req.reactionRef,
+      emoji: req.emoji,
+    }))
     router.registerReaction('discord-bot', async () => ({
       ok: true,
       reactionRef: { adapter: 'discord-bot', value: 'retained-reaction' },
     }))
-    router.registerRemoveReaction('discord-bot', async (request) => {
+    router.registerRemoveOwnReaction('discord-bot', async (request) => {
       removed.push(request)
       return { ok: true }
     })
@@ -1472,7 +1478,11 @@ describe('ChannelRouter session lifecycle', () => {
     expect(notices[0]!).toContain('could not replay 1 queued item(s)')
     expect(notices[0]!).toContain("reload({ scope: 'providers' })")
     expect(removed).toHaveLength(1)
-    expect(removed[0]!.reactionRef).toEqual({ adapter: 'discord-bot', value: 'retained-reaction' })
+    expect(removed[0]).toMatchObject({
+      target: { adapter: 'discord-bot', value: 'queued-message' },
+      emoji: 'eyes',
+      expectedAccountIdentity: 'test-account',
+    })
   })
 
   test('failed reload handoff also retains observed context and system reminders', async () => {
@@ -3168,6 +3178,11 @@ describe('ChannelRouter auto-react on engage', () => {
     const dir = await tempDir()
     const { router } = makeRouter(dir)
     const captured: ReactionRequest[] = []
+    router.registerPrepareOwnReaction('discord-bot', async (req) => ({
+      accountIdentity: 'test-account',
+      target: req.reactionRef,
+      emoji: req.emoji,
+    }))
     router.registerReaction('discord-bot', async (req) => {
       captured.push(req)
       return { ok: true }
@@ -3184,6 +3199,11 @@ describe('ChannelRouter auto-react on engage', () => {
     const dir = await tempDir()
     const { router } = makeRouter(dir)
     let called = false
+    router.registerPrepareOwnReaction('discord-bot', async (req) => ({
+      accountIdentity: 'test-account',
+      target: req.reactionRef,
+      emoji: req.emoji,
+    }))
     router.registerReaction('discord-bot', async () => {
       called = true
       return { ok: true }
@@ -3199,6 +3219,11 @@ describe('ChannelRouter auto-react on engage', () => {
     const dir = await tempDir()
     const { router } = makeRouter(dir)
     let called = false
+    router.registerPrepareOwnReaction('discord-bot', async (req) => ({
+      accountIdentity: 'test-account',
+      target: req.reactionRef,
+      emoji: req.emoji,
+    }))
     router.registerReaction('discord-bot', async () => {
       called = true
       return { ok: true }
@@ -3215,6 +3240,11 @@ describe('ChannelRouter auto-react on engage', () => {
     const dir = await tempDir()
     const { router } = makeRouter(dir)
     const captured: ReactionRequest[] = []
+    router.registerPrepareOwnReaction('discord-bot', async (req) => ({
+      accountIdentity: 'test-account',
+      target: req.reactionRef,
+      emoji: req.emoji,
+    }))
     router.registerReaction('discord-bot', async (req) => {
       captured.push(req)
       return { ok: true }
@@ -3233,6 +3263,11 @@ describe('ChannelRouter auto-react on engage', () => {
     const dir = await tempDir()
     const { router } = makeRouter(dir)
     const captured: ReactionRequest[] = []
+    router.registerPrepareOwnReaction('discord-bot', async (req) => ({
+      accountIdentity: 'test-account',
+      target: req.reactionRef,
+      emoji: req.emoji,
+    }))
     router.registerReaction('discord-bot', async (req) => {
       captured.push(req)
       return { ok: true }
@@ -3250,6 +3285,11 @@ describe('ChannelRouter auto-react on engage', () => {
   test('a throwing reaction callback never blocks engagement (session still created, reply still sends)', async () => {
     const dir = await tempDir()
     const { router, sessions } = makeRouter(dir)
+    router.registerPrepareOwnReaction('discord-bot', async (req) => ({
+      accountIdentity: 'test-account',
+      target: req.reactionRef,
+      emoji: req.emoji,
+    }))
     router.registerReaction('discord-bot', async () => {
       throw new Error('reaction api exploded')
     })
@@ -3454,6 +3494,11 @@ describe('ChannelRouter react on disengage', () => {
     // engage :eyes: added during route() is not captured)
     await router.route(inbound({ reactionRef: REACTION_REF }))
     sessions[0]!.onPrompt = async () => {
+      router.registerPrepareOwnReaction('discord-bot', async (req) => ({
+        accountIdentity: 'test-account',
+        target: req.reactionRef,
+        emoji: req.emoji,
+      }))
       router.registerReaction('discord-bot', async (req) => {
         captured.push(req)
         return { ok: true }
@@ -3476,6 +3521,11 @@ describe('ChannelRouter react on disengage', () => {
     const dir = await tempDir()
     const { router } = makeRouter(dir)
     let called = false
+    router.registerPrepareOwnReaction('discord-bot', async (req) => ({
+      accountIdentity: 'test-account',
+      target: req.reactionRef,
+      emoji: req.emoji,
+    }))
     router.registerReaction('discord-bot', async () => {
       called = true
       return { ok: true }
@@ -3494,6 +3544,11 @@ describe('ChannelRouter react on disengage', () => {
 
     await router.route(inbound())
     sessions[0]!.onPrompt = async () => {
+      router.registerPrepareOwnReaction('discord-bot', async (req) => ({
+        accountIdentity: 'test-account',
+        target: req.reactionRef,
+        emoji: req.emoji,
+      }))
       router.registerReaction('discord-bot', async () => {
         called = true
         return { ok: true }
@@ -3513,6 +3568,11 @@ describe('ChannelRouter react on disengage', () => {
     await router.route(inbound({ reactionRef: REACTION_REF }))
     let cleared: { keyId: string; cleared: number } | null = null
     sessions[0]!.onPrompt = async () => {
+      router.registerPrepareOwnReaction('discord-bot', async (req) => ({
+        accountIdentity: 'test-account',
+        target: req.reactionRef,
+        emoji: req.emoji,
+      }))
       router.registerReaction('discord-bot', async () => {
         throw new Error('reaction api exploded')
       })
@@ -3550,6 +3610,11 @@ describe('ChannelRouter reaction cleanup on deliberate silence', () => {
     const { router, sessions } = makeRouter(dir)
     router.setTypingCapability('discord-bot', true)
     const captured: ReactionRequest[] = []
+    router.registerPrepareOwnReaction('discord-bot', async (req) => ({
+      accountIdentity: 'test-account',
+      target: req.reactionRef,
+      emoji: req.emoji,
+    }))
     router.registerReaction('discord-bot', async (req) => {
       captured.push(req)
       return { ok: true }
@@ -3609,6 +3674,11 @@ describe('ChannelRouter reaction cleanup on deliberate silence', () => {
     const { router, sessions } = makeRouter(dir)
     router.setTypingCapability('discord-bot', true)
     let called = false
+    router.registerPrepareOwnReaction('discord-bot', async (req) => ({
+      accountIdentity: 'test-account',
+      target: req.reactionRef,
+      emoji: req.emoji,
+    }))
     router.registerReaction('discord-bot', async () => {
       called = true
       return { ok: true }
@@ -3629,6 +3699,11 @@ describe('ChannelRouter reaction cleanup on deliberate silence', () => {
     const { router, sessions } = makeRouter(dir)
     router.setTypingCapability('discord-bot', true)
     const captured: ReactionRequest[] = []
+    router.registerPrepareOwnReaction('discord-bot', async (req) => ({
+      accountIdentity: 'test-account',
+      target: req.reactionRef,
+      emoji: req.emoji,
+    }))
     router.registerReaction('discord-bot', async (req) => {
       captured.push(req)
       return { ok: true }
@@ -3650,6 +3725,11 @@ describe('ChannelRouter reaction cleanup on deliberate silence', () => {
     const { router, sessions } = makeRouter(dir)
     router.setTypingCapability('discord-bot', true)
     let called = false
+    router.registerPrepareOwnReaction('discord-bot', async (req) => ({
+      accountIdentity: 'test-account',
+      target: req.reactionRef,
+      emoji: req.emoji,
+    }))
     router.registerReaction('discord-bot', async () => {
       called = true
       return { ok: true }
@@ -3670,11 +3750,16 @@ describe('ChannelRouter reaction cleanup on deliberate silence', () => {
     const engageInstanceRef: ReactionRef = { adapter: 'discord-bot', value: 'engage-instance' }
     const events: string[] = []
     const { router, sessions } = makeRouter(dir)
+    router.registerPrepareOwnReaction('discord-bot', async (req) => ({
+      accountIdentity: 'test-account',
+      target: req.reactionRef,
+      emoji: req.emoji,
+    }))
     router.registerReaction('discord-bot', async (req) => {
       events.push(`add-${req.emoji}`)
       return { ok: true, reactionRef: engageInstanceRef }
     })
-    router.registerRemoveReaction('discord-bot', async () => {
+    router.registerRemoveOwnReaction('discord-bot', async () => {
       events.push('remove-eyes')
       return { ok: true }
     })
@@ -3697,6 +3782,11 @@ describe('ChannelRouter reaction cleanup on deliberate silence', () => {
     const { router, sessions } = makeRouter(dir)
     router.setTypingCapability('discord-bot', true)
     let called = false
+    router.registerPrepareOwnReaction('discord-bot', async (req) => ({
+      accountIdentity: 'test-account',
+      target: req.reactionRef,
+      emoji: req.emoji,
+    }))
     router.registerReaction('discord-bot', async () => {
       called = true
       return { ok: true }
@@ -3718,6 +3808,11 @@ describe('ChannelRouter reaction cleanup on deliberate silence', () => {
     const { router, sessions } = makeRouter(dir)
     router.setTypingCapability('discord-bot', true)
     let called = false
+    router.registerPrepareOwnReaction('discord-bot', async (req) => ({
+      accountIdentity: 'test-account',
+      target: req.reactionRef,
+      emoji: req.emoji,
+    }))
     router.registerReaction('discord-bot', async () => {
       called = true
       return { ok: true }
@@ -3740,6 +3835,11 @@ describe('ChannelRouter reaction cleanup on deliberate silence', () => {
       const { router, sessions } = makeRouter(dir)
       router.setTypingCapability('discord-bot', true)
       const captured: ReactionRequest[] = []
+      router.registerPrepareOwnReaction('discord-bot', async (req) => ({
+        accountIdentity: 'test-account',
+        target: req.reactionRef,
+        emoji: req.emoji,
+      }))
       router.registerReaction('discord-bot', async (req) => {
         captured.push(req)
         return { ok: true }
@@ -3761,6 +3861,11 @@ describe('ChannelRouter reaction cleanup on deliberate silence', () => {
     const { router, sessions } = makeRouter(dir)
     router.setTypingCapability('discord-bot', true)
     const captured: ReactionRequest[] = []
+    router.registerPrepareOwnReaction('discord-bot', async (req) => ({
+      accountIdentity: 'test-account',
+      target: req.reactionRef,
+      emoji: req.emoji,
+    }))
     router.registerReaction('discord-bot', async (req) => {
       captured.push(req)
       return { ok: true }
@@ -3788,6 +3893,11 @@ describe('ChannelRouter reaction cleanup on deliberate silence', () => {
     const { router, sessions } = makeRouter(dir)
     router.setTypingCapability('discord-bot', true)
     let called = false
+    router.registerPrepareOwnReaction('discord-bot', async (req) => ({
+      accountIdentity: 'test-account',
+      target: req.reactionRef,
+      emoji: req.emoji,
+    }))
     router.registerReaction('discord-bot', async () => {
       called = true
       return { ok: true }
@@ -3811,6 +3921,11 @@ describe('ChannelRouter reaction cleanup on deliberate silence', () => {
     const { router, sessions } = makeRouter(dir)
     router.setTypingCapability('discord-bot', true)
     const captured: ReactionRequest[] = []
+    router.registerPrepareOwnReaction('discord-bot', async (req) => ({
+      accountIdentity: 'test-account',
+      target: req.reactionRef,
+      emoji: req.emoji,
+    }))
     router.registerReaction('discord-bot', async (req) => {
       captured.push(req)
       return { ok: true }
@@ -3839,12 +3954,18 @@ describe('ChannelRouter persistent output acknowledgements', () => {
     const added: ReactionRequest[] = []
     const removed: ReactionRef[] = []
     router.setTypingCapability('github', true)
+    router.registerPrepareOwnReaction('github', async (req) => ({
+      accountIdentity: 'test-account',
+      target: req.reactionRef,
+      emoji: req.emoji,
+    }))
     router.registerReaction('github', async (req) => {
       added.push(req)
       return { ok: true, reactionRef: acknowledgementRef }
     })
-    router.registerRemoveReaction('github', async (req) => {
-      removed.push(req.reactionRef)
+    router.registerRemoveOwnReaction('github', async (req) => {
+      expect(req).toMatchObject({ emoji: 'eyes', expectedAccountIdentity: 'test-account' })
+      removed.push(req.target)
       return { ok: true }
     })
     router.registerOutbound('github', async () => ({ ok: true }))
@@ -3873,26 +3994,184 @@ describe('ChannelRouter persistent output acknowledgements', () => {
     await router.__testing!.flushDebounce(key)
 
     await waitFor(() => removed.length === 1)
-    expect(removed).toEqual([acknowledgementRef])
+    expect(removed).toEqual([triggerRef])
   })
 
-  test('adds a persistent acknowledgement after removing a typing-less engage reaction', async () => {
+  test('a fresh router retires a prior-runtime review acknowledgement only for the replying conversation', async () => {
+    const dir = await tempDir()
+    const original = makeRouter(dir)
+    const key: ChannelKey = { adapter: 'github', workspace: 'acme/repo', chat: 'pr:672', thread: null }
+    const target: ReactionRef = { adapter: 'github', value: 'prior-runtime-review-request' }
+    const journalDir = join(dir, 'channels', 'waiting-reactions')
+    let present = false
+    original.router.setTypingCapability('github', true)
+    original.router.registerPrepareOwnReaction('github', async (req) => ({
+      accountIdentity: 'test-account',
+      target: req.reactionRef,
+      emoji: req.emoji,
+    }))
+    original.router.registerReaction('github', async () => {
+      present = true
+      return { ok: true }
+    })
+    await original.router.route(inbound({ ...key, reactionRef: target }))
+    original.sessions[0]!.onPrompt = () => {
+      original.router.noteGithubReviewOutput({
+        sessionId: 'ses_fake_1',
+        workspace: key.workspace,
+        prNumber: 672,
+        state: 'APPROVE',
+      })
+      original.sessions[0]!.setAssistantText('')
+    }
+    await original.router.__testing!.flushDebounce(key)
+    await waitFor(() => present)
+    await original.router.recoverWaitingReactions('github')
+    const journalFiles = (await readdir(journalDir)).filter((name) => name.endsWith('.json'))
+    expect(journalFiles).toHaveLength(1)
+
+    // Simulate loss of the runtime, not an orderly release of its in-memory handles.
+    const rebooted = makeRouter(dir)
+    const removed: RemoveOwnReactionRequest[] = []
+    rebooted.router.registerRemoveOwnReaction('github', async (req) => {
+      expect(req).toMatchObject({ target, emoji: 'eyes', expectedAccountIdentity: 'test-account' })
+      removed.push(req)
+      present = false
+      return { ok: true }
+    })
+    rebooted.router.registerOutbound('github', async () => ({ ok: true }))
+    await rebooted.router.recoverWaitingReactions('github')
+    expect(present).toBe(true)
+
+    const otherKey = { ...key, thread: 'review:another-conversation' }
+    await rebooted.router.route(inbound({ ...otherKey, externalMessageId: 'other-reply' }))
+    rebooted.sessions[0]!.onPrompt = async () => {
+      await rebooted.router.send({ ...otherKey, text: 'Reply in a different conversation.' })
+      rebooted.sessions[0]!.setAssistantText('Reply in a different conversation.')
+    }
+    await rebooted.router.__testing!.flushDebounce(otherKey)
+    await rebooted.router.recoverWaitingReactions('github')
+    expect(present).toBe(true)
+    expect(removed).toEqual([])
+    expect((await readdir(journalDir)).filter((name) => name.endsWith('.json'))).toEqual(journalFiles)
+
+    await rebooted.router.route(inbound({ ...key, externalMessageId: 'same-conversation-reply' }))
+    rebooted.sessions[1]!.onPrompt = async () => {
+      await rebooted.router.send({ ...key, text: 'Review complete.' })
+      rebooted.sessions[1]!.setAssistantText('Review complete.')
+    }
+    await rebooted.router.__testing!.flushDebounce(key)
+    await waitFor(async () => !present && (await readdir(journalDir)).every((name) => !name.endsWith('.json')))
+    expect(removed).toHaveLength(1)
+    await rebooted.router.recoverWaitingReactions('github')
+    expect(present).toBe(false)
+    expect(removed).toHaveLength(1)
+  })
+
+  test('a genuine reply retires a deferred acknowledgement left by an exited independent process', async () => {
+    const dir = await tempDir()
+    const key: ChannelKey = { adapter: 'discord-bot', workspace: 'g1', chat: 'c1', thread: null }
+    const target: ReactionRef = { adapter: 'discord-bot', value: 'deferred-request' }
+    const remotePath = join(dir, 'remote-own-reaction.json')
+    const journalDir = join(dir, 'channels', 'waiting-reactions')
+    const coordinatorPath = join(import.meta.dir, 'waiting-reactions.ts')
+    const child = Bun.spawn(
+      [
+        process.execPath,
+        '-e',
+        `
+      import { writeFile } from 'node:fs/promises';
+      import { createWaitingReactionCoordinator } from ${JSON.stringify(coordinatorPath)};
+      const key = ${JSON.stringify(key)};
+      const target = ${JSON.stringify(target)};
+      const coordinator = createWaitingReactionCoordinator({
+        agentDir: ${JSON.stringify(dir)},
+        epoch: 'exited-acknowledgement-runtime',
+        prepare: async (req) => ({ accountIdentity: 'test-account', target: req.reactionRef, emoji: req.emoji }),
+        add: async (_req, prepared) => {
+          await writeFile(${JSON.stringify(remotePath)}, JSON.stringify(prepared));
+          return { ok: true };
+        },
+        remove: async () => { throw new Error('the old runtime must not remove its acknowledgement'); },
+      });
+      await coordinator.acquire(
+        { ...key, reactionRef: target, emoji: 'eyes' },
+        true,
+        { conversation: key, kind: 'awaiting_background_child' },
+      ).ready;
+    `,
+      ],
+      { stdout: 'pipe', stderr: 'pipe' },
+    )
+    const [exitCode, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()])
+    expect({ exitCode, stderr }).toEqual({ exitCode: 0, stderr: '' })
+    expect(JSON.parse(await readFile(remotePath, 'utf8'))).toEqual({
+      accountIdentity: 'test-account',
+      target,
+      emoji: 'eyes',
+    })
+
+    const { router, sessions } = makeRouter(dir)
+    const removed: RemoveOwnReactionRequest[] = []
+    router.registerRemoveOwnReaction('discord-bot', async (req) => {
+      const remote = JSON.parse(await readFile(remotePath, 'utf8'))
+      expect(req).toMatchObject({
+        target: remote.target,
+        emoji: remote.emoji,
+        expectedAccountIdentity: remote.accountIdentity,
+      })
+      removed.push(req)
+      await rm(remotePath)
+      return { ok: true }
+    })
+    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+    await router.recoverWaitingReactions('discord-bot')
+    expect(removed).toEqual([])
+    expect(await Bun.file(remotePath).exists()).toBe(true)
+    await router.tearDownAllLive()
+    await router.recoverWaitingReactions('discord-bot')
+    expect(await Bun.file(remotePath).exists()).toBe(true)
+
+    await router.route(inbound({ externalMessageId: 'reply-after-process-exit' }))
+    sessions[0]!.onPrompt = async () => {
+      await router.send({ ...key, text: 'The deferred work is complete.' })
+      sessions[0]!.setAssistantText('The deferred work is complete.')
+    }
+    await router.__testing!.flushDebounce(key)
+    await waitFor(
+      async () =>
+        !(await Bun.file(remotePath).exists()) && (await readdir(journalDir)).every((name) => !name.endsWith('.json')),
+    )
+    expect(removed).toHaveLength(1)
+    await router.recoverWaitingReactions('discord-bot')
+    expect(removed).toHaveLength(1)
+  })
+
+  test('temporary cleanup and reboot preserve an already acknowledged target', async () => {
     const dir = await tempDir()
     const { router, sessions } = makeRouter(dir)
     const key: ChannelKey = { adapter: 'github', workspace: 'acme/repo', chat: 'pr:672', thread: null }
     const triggerRef: ReactionRef = { adapter: 'github', value: 'review-request' }
-    const acknowledgementRef: ReactionRef = { adapter: 'github', value: 'review-ack' }
-    const events: string[] = []
-    router.registerReaction('github', async (req) => {
-      events.push(`add-${req.emoji}`)
-      return { ok: true, reactionRef: acknowledgementRef }
+    let present = false
+    const removed: RemoveOwnReactionRequest[] = []
+    router.registerPrepareOwnReaction('github', async (req) => ({
+      accountIdentity: 'test-account',
+      target: req.reactionRef,
+      emoji: 'eyes',
+    }))
+    router.registerReaction('github', async () => {
+      present = true
+      return { ok: true, reactionRef: { adapter: 'github', value: 'unrelated-instance' } }
     })
-    router.registerRemoveReaction('github', async () => {
-      events.push('remove-eyes')
+    router.registerRemoveOwnReaction('github', async (req) => {
+      expect(req).toMatchObject({ emoji: 'eyes', expectedAccountIdentity: 'test-account' })
+      removed.push(req)
+      present = false
       return { ok: true }
     })
 
     await router.route(inbound({ ...key, isBotMention: true, reactionRef: triggerRef }))
+    await waitFor(() => present)
     sessions[0]!.onPrompt = () => {
       router.noteGithubReviewOutput({
         sessionId: 'ses_fake_1',
@@ -3903,9 +4182,28 @@ describe('ChannelRouter persistent output acknowledgements', () => {
       sessions[0]!.setAssistantText('')
     }
     await router.__testing!.flushDebounce(key)
+    await router.recoverWaitingReactions('github')
+    expect(present).toBe(true)
+    const removalsBeforeTemporary = removed.length
 
-    await waitFor(() => events.length === 3)
-    expect(events).toEqual(['add-eyes', 'remove-eyes', 'add-eyes'])
+    await router.route(inbound({ ...key, externalMessageId: 'm2', reactionRef: triggerRef }))
+    sessions[0]!.onPrompt = () => sessions[0]!.setAssistantText('NO_REPLY')
+    await router.__testing!.flushDebounce(key)
+    await router.tearDownAllLive()
+    await router.recoverWaitingReactions('github')
+    expect(present).toBe(true)
+    expect(removed).toHaveLength(removalsBeforeTemporary)
+
+    const rebooted = makeRouter(dir).router
+    rebooted.registerRemoveOwnReaction('github', async (req) => {
+      expect(req).toMatchObject({ emoji: 'eyes', expectedAccountIdentity: 'test-account' })
+      removed.push(req)
+      present = false
+      return { ok: true }
+    })
+    await rebooted.recoverWaitingReactions('github')
+    expect(present).toBe(true)
+    expect(removed).toHaveLength(removalsBeforeTemporary)
   })
 
   test('removes a slow persistent acknowledgement when a later reply races its add', async () => {
@@ -3920,13 +4218,19 @@ describe('ChannelRouter persistent output acknowledgements', () => {
     })
     let addCount = 0
     router.setTypingCapability('github', true)
+    router.registerPrepareOwnReaction('github', async (req) => ({
+      accountIdentity: 'test-account',
+      target: req.reactionRef,
+      emoji: req.emoji,
+    }))
     router.registerReaction('github', async () => {
       addCount++
       await addGate
       return { ok: true, reactionRef: acknowledgementRef }
     })
-    router.registerRemoveReaction('github', async (req) => {
-      removed.push(req.reactionRef)
+    router.registerRemoveOwnReaction('github', async (req) => {
+      expect(req).toMatchObject({ emoji: 'eyes', expectedAccountIdentity: 'test-account' })
+      removed.push(req.target)
       return { ok: true }
     })
     router.registerOutbound('github', async () => ({ ok: true }))
@@ -3955,7 +4259,7 @@ describe('ChannelRouter persistent output acknowledgements', () => {
     releaseAdd!()
 
     await waitFor(() => removed.length === 1)
-    expect(removed).toEqual([acknowledgementRef])
+    expect(removed).toEqual([{ adapter: 'github', value: 'review-request' }])
   })
 
   test('a later reply removes all outstanding persistent acknowledgements', async () => {
@@ -3969,14 +4273,20 @@ describe('ChannelRouter persistent output acknowledgements', () => {
     const removed: ReactionRef[] = []
     let addCount = 0
     router.setTypingCapability('github', true)
+    router.registerPrepareOwnReaction('github', async (req) => ({
+      accountIdentity: 'test-account',
+      target: req.reactionRef,
+      emoji: req.emoji,
+    }))
     router.registerReaction('github', async () => {
       const reactionRef = acknowledgementRefs[addCount]
       if (!reactionRef) throw new Error('unexpected persistent acknowledgement')
       addCount++
       return { ok: true, reactionRef }
     })
-    router.registerRemoveReaction('github', async (req) => {
-      removed.push(req.reactionRef)
+    router.registerRemoveOwnReaction('github', async (req) => {
+      expect(req).toMatchObject({ emoji: 'eyes', expectedAccountIdentity: 'test-account' })
+      removed.push(req.target)
       return { ok: true }
     })
     router.registerOutbound('github', async () => ({ ok: true }))
@@ -4011,7 +4321,79 @@ describe('ChannelRouter persistent output acknowledgements', () => {
     await router.__testing!.flushDebounce(key)
 
     await waitFor(() => removed.length === 2)
-    expect(removed).toEqual(acknowledgementRefs)
+    expect(removed).toEqual([
+      { adapter: 'github', value: 'review-request-1' },
+      { adapter: 'github', value: 'review-request-2' },
+    ])
+  })
+})
+
+describe('ChannelRouter waiting reaction account continuity', () => {
+  test('adapter replacement during preparation cannot add as the replacement account under the old durable tuple', async () => {
+    const dir = await tempDir()
+    const { router } = makeRouter(dir)
+    const actors = new Set<string>()
+    let finishPreparation!: () => void
+    let preparationStarted!: () => void
+    const started = new Promise<void>((resolve) => {
+      preparationStarted = resolve
+    })
+    const finish = new Promise<void>((resolve) => {
+      finishPreparation = resolve
+    })
+    const target: ReactionRef = { adapter: 'discord-bot', value: 'account-race-target' }
+    const addA = async () => {
+      actors.add('A')
+      return { ok: true as const }
+    }
+    const addB = async () => {
+      actors.add('B')
+      return { ok: true as const }
+    }
+    const prepareA = async (req: ReactionRequest) => {
+      preparationStarted()
+      await finish
+      return { accountIdentity: 'A', target: req.reactionRef, emoji: req.emoji }
+    }
+    router.registerReaction('discord-bot', addA)
+    router.registerPrepareOwnReaction('discord-bot', prepareA)
+    await router.route(inbound({ reactionRef: target }))
+    await started
+    router.unregisterReaction('discord-bot', addA)
+    router.unregisterPrepareOwnReaction('discord-bot', prepareA)
+    router.registerReaction('discord-bot', addB)
+    router.registerPrepareOwnReaction('discord-bot', async (req) => ({
+      accountIdentity: 'B',
+      target: req.reactionRef,
+      emoji: req.emoji,
+    }))
+    const removeB = async (req: RemoveOwnReactionRequest): Promise<RemoveOwnReactionResult> => {
+      if (req.expectedAccountIdentity !== 'B') return { ok: false, code: 'identity', error: 'account changed' }
+      actors.delete('B')
+      return { ok: true }
+    }
+    router.registerRemoveOwnReaction('discord-bot', removeB)
+    finishPreparation()
+    await waitFor(() => actors.size > 0)
+    expect([...actors]).toEqual(['A'])
+    const recordDirectory = join(dir, 'channels', 'waiting-reactions')
+    const files = await readdir(recordDirectory)
+    const record = JSON.parse(
+      await readFile(join(recordDirectory, files.find((name) => name.endsWith('.json'))!), 'utf8'),
+    )
+    expect(record.prepared.accountIdentity).toBe('A')
+    await router.tearDownAllLive()
+    await router.recoverWaitingReactions('discord-bot')
+    expect([...actors]).toEqual(['A'])
+    router.unregisterRemoveOwnReaction('discord-bot', removeB)
+    router.registerRemoveOwnReaction('discord-bot', async (req) => {
+      if (req.expectedAccountIdentity !== 'A') return { ok: false, code: 'identity', error: 'wrong account' }
+      actors.delete('A')
+      return { ok: true }
+    })
+    await router.recoverWaitingReactions('discord-bot')
+    expect([...actors]).toEqual([])
+    await router.stop()
   })
 })
 
@@ -4025,6 +4407,11 @@ describe('ChannelRouter model react only when replying', () => {
     const { router, sessions } = makeRouter(dir)
     router.setTypingCapability('discord-bot', true)
     const added: ReactionRequest[] = []
+    router.registerPrepareOwnReaction('discord-bot', async (req) => ({
+      accountIdentity: 'test-account',
+      target: req.reactionRef,
+      emoji: req.emoji,
+    }))
     router.registerReaction('discord-bot', async (req) => {
       added.push(req)
       return { ok: true }
@@ -4057,6 +4444,11 @@ describe('ChannelRouter model react only when replying', () => {
     const { router, sessions } = makeRouter(dir)
     router.setTypingCapability('discord-bot', true)
     const emojis: string[] = []
+    router.registerPrepareOwnReaction('discord-bot', async (req) => ({
+      accountIdentity: 'test-account',
+      target: req.reactionRef,
+      emoji: req.emoji,
+    }))
     router.registerReaction('discord-bot', async (req) => {
       emojis.push(req.emoji)
       return { ok: true }
@@ -4108,9 +4500,14 @@ describe('ChannelRouter drop-eyes-after-reply', () => {
   test('removes the engage-added eyes reaction after a successful reply', async () => {
     const dir = await tempDir()
     const { router, sessions } = makeRouter(dir)
-    const removed: RemoveReactionRequest[] = []
+    const removed: RemoveOwnReactionRequest[] = []
+    router.registerPrepareOwnReaction('discord-bot', async (req) => ({
+      accountIdentity: 'test-account',
+      target: req.reactionRef,
+      emoji: '👀',
+    }))
     router.registerReaction('discord-bot', async () => ({ ok: true, reactionRef: INSTANCE_REF }))
-    router.registerRemoveReaction('discord-bot', async (req) => {
+    router.registerRemoveOwnReaction('discord-bot', async (req) => {
       removed.push(req)
       return { ok: true }
     })
@@ -4123,7 +4520,13 @@ describe('ChannelRouter drop-eyes-after-reply', () => {
     await router.__testing!.flushDebounce(KEY)
 
     await waitFor(() => removed.length === 1)
-    expect(removed[0]).toMatchObject({ adapter: 'discord-bot', chat: 'c1', reactionRef: INSTANCE_REF })
+    expect(removed[0]).toMatchObject({
+      adapter: 'discord-bot',
+      chat: 'c1',
+      target: TARGET_REF,
+      emoji: '👀',
+      expectedAccountIdentity: 'test-account',
+    })
   })
 
   test('rolls the eager eyes onto only the last inbound when several coalesce into one turn', async () => {
@@ -4135,12 +4538,18 @@ describe('ChannelRouter drop-eyes-after-reply', () => {
       'msg-b': { adapter: 'discord-bot', value: 'instance-b' },
       'msg-c': { adapter: 'discord-bot', value: 'instance-c' },
     }
-    const removed: RemoveReactionRequest[] = []
-    router.registerReaction('discord-bot', async (req) => ({
-      ok: true,
-      reactionRef: instanceFor[req.reactionRef.value]!,
+    const removed: RemoveOwnReactionRequest[] = []
+    const added: string[] = []
+    router.registerPrepareOwnReaction('discord-bot', async (req) => ({
+      accountIdentity: 'test-account',
+      target: req.reactionRef,
+      emoji: req.emoji,
     }))
-    router.registerRemoveReaction('discord-bot', async (req) => {
+    router.registerReaction('discord-bot', async (req) => {
+      added.push(req.reactionRef.value)
+      return { ok: true, reactionRef: instanceFor[req.reactionRef.value]! }
+    })
+    router.registerRemoveOwnReaction('discord-bot', async (req) => {
       removed.push(req)
       return { ok: true }
     })
@@ -4149,17 +4558,20 @@ describe('ChannelRouter drop-eyes-after-reply', () => {
     // when all three arrive before the debounce flush, each newer one supersedes
     // the previous ack, so the earlier eyes are removed before the turn even runs
     await router.route(inbound({ reactionRef: { adapter: 'discord-bot', value: 'msg-a' } }))
+    await waitFor(() => added.includes('msg-a'))
     await router.route(inbound({ reactionRef: { adapter: 'discord-bot', value: 'msg-b' } }))
+    await waitFor(() => added.includes('msg-b'))
     await router.route(inbound({ reactionRef: { adapter: 'discord-bot', value: 'msg-c' } }))
+    await waitFor(() => added.includes('msg-c'))
 
     // then only the last message's eyes survives into the turn; the first two are
     // already rolled off before any reply is produced
     await waitFor(
       () =>
         removed
-          .map((r) => r.reactionRef.value)
+          .map((r) => r.target.value)
           .sort()
-          .join(',') === 'instance-a,instance-b',
+          .join(',') === 'msg-a,msg-b',
     )
 
     sessions[0]!.onPrompt = async () => {
@@ -4169,16 +4581,25 @@ describe('ChannelRouter drop-eyes-after-reply', () => {
 
     // and the surviving last-message eyes is removed after the reply lands
     await waitFor(() => removed.length === 3)
-    expect(removed.map((r) => r.reactionRef.value).sort()).toEqual(['instance-a', 'instance-b', 'instance-c'])
+    expect(removed.map((r) => r.target.value).sort()).toEqual(['msg-a', 'msg-b', 'msg-c'])
   })
 
   test('a later reactionRef-less inbound still rolls off the previous eager eyes', async () => {
     // given an engaging inbound that gets an eager :eyes:
     const dir = await tempDir()
     const { router, sessions } = makeRouter(dir)
-    const removed: RemoveReactionRequest[] = []
-    router.registerReaction('discord-bot', async () => ({ ok: true, reactionRef: INSTANCE_REF }))
-    router.registerRemoveReaction('discord-bot', async (req) => {
+    const removed: RemoveOwnReactionRequest[] = []
+    let added = false
+    router.registerPrepareOwnReaction('discord-bot', async (req) => ({
+      accountIdentity: 'test-account',
+      target: req.reactionRef,
+      emoji: req.emoji,
+    }))
+    router.registerReaction('discord-bot', async () => {
+      added = true
+      return { ok: true, reactionRef: INSTANCE_REF }
+    })
+    router.registerRemoveOwnReaction('discord-bot', async (req) => {
       removed.push(req)
       return { ok: true }
     })
@@ -4186,11 +4607,12 @@ describe('ChannelRouter drop-eyes-after-reply', () => {
 
     // when a newer engaging inbound with NO reactionRef coalesces in
     await router.route(inbound({ reactionRef: TARGET_REF }))
+    await waitFor(() => added)
     await router.route(inbound({ externalMessageId: 'm2' }))
 
     // then the previous eyes is stripped even though the new inbound is unreactable
     await waitFor(() => removed.length === 1)
-    expect(removed[0]).toMatchObject({ reactionRef: INSTANCE_REF })
+    expect(removed[0]).toMatchObject({ target: TARGET_REF, emoji: 'eyes', expectedAccountIdentity: 'test-account' })
 
     sessions[0]!.onPrompt = async () => {
       await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: 'reply' })
@@ -4202,30 +4624,45 @@ describe('ChannelRouter drop-eyes-after-reply', () => {
     // given an engaged inbound whose turn never replies before teardown
     const dir = await tempDir()
     const { router } = makeRouter(dir)
-    const removed: RemoveReactionRequest[] = []
-    router.registerReaction('discord-bot', async () => ({ ok: true, reactionRef: INSTANCE_REF }))
-    router.registerRemoveReaction('discord-bot', async (req) => {
+    const removed: RemoveOwnReactionRequest[] = []
+    let added = false
+    router.registerPrepareOwnReaction('discord-bot', async (req) => ({
+      accountIdentity: 'test-account',
+      target: req.reactionRef,
+      emoji: req.emoji,
+    }))
+    router.registerReaction('discord-bot', async () => {
+      added = true
+      return { ok: true, reactionRef: INSTANCE_REF }
+    })
+    router.registerRemoveOwnReaction('discord-bot', async (req) => {
       removed.push(req)
       return { ok: true }
     })
 
     await router.route(inbound({ reactionRef: TARGET_REF }))
+    await waitFor(() => added)
 
     // when the session is destroyed before the queued turn drains
     await router.tearDownAllLive()
 
     // then the stranded eager :eyes: is removed rather than left on the message
     await waitFor(() => removed.length === 1)
-    expect(removed[0]).toMatchObject({ reactionRef: INSTANCE_REF })
+    expect(removed[0]).toMatchObject({ target: TARGET_REF, emoji: 'eyes', expectedAccountIdentity: 'test-account' })
   })
 
   test('detaches the engage reaction when the turn observes after engaging (no reply)', async () => {
     // given an engaging inbound that gets the eager :eyes: ack
     const dir = await tempDir()
     const { router, sessions } = makeRouter(dir)
-    const removed: RemoveReactionRequest[] = []
+    const removed: RemoveOwnReactionRequest[] = []
+    router.registerPrepareOwnReaction('discord-bot', async (req) => ({
+      accountIdentity: 'test-account',
+      target: req.reactionRef,
+      emoji: req.emoji,
+    }))
     router.registerReaction('discord-bot', async () => ({ ok: true, reactionRef: INSTANCE_REF }))
-    router.registerRemoveReaction('discord-bot', async (req) => {
+    router.registerRemoveOwnReaction('discord-bot', async (req) => {
       removed.push(req)
       return { ok: true }
     })
@@ -4240,14 +4677,25 @@ describe('ChannelRouter drop-eyes-after-reply', () => {
     // then the eager :eyes: is detached rather than left stranded on a message
     // the agent never answered
     await waitFor(() => removed.length === 1)
-    expect(removed[0]).toMatchObject({ adapter: 'discord-bot', chat: 'c1', reactionRef: INSTANCE_REF })
+    expect(removed[0]).toMatchObject({
+      adapter: 'discord-bot',
+      chat: 'c1',
+      target: TARGET_REF,
+      emoji: 'eyes',
+      expectedAccountIdentity: 'test-account',
+    })
   })
 
   test('orders removal after the in-flight add resolves', async () => {
     const dir = await tempDir()
     const { router, sessions } = makeRouter(dir)
-    const removed: RemoveReactionRequest[] = []
+    const removed: RemoveOwnReactionRequest[] = []
     let resolveAdd: ((ref: ReactionRef) => void) | undefined
+    router.registerPrepareOwnReaction('discord-bot', async (req) => ({
+      accountIdentity: 'test-account',
+      target: req.reactionRef,
+      emoji: req.emoji,
+    }))
     router.registerReaction(
       'discord-bot',
       async () =>
@@ -4255,13 +4703,14 @@ describe('ChannelRouter drop-eyes-after-reply', () => {
           resolveAdd = (ref) => resolve({ ok: true, reactionRef: ref })
         }),
     )
-    router.registerRemoveReaction('discord-bot', async (req) => {
+    router.registerRemoveOwnReaction('discord-bot', async (req) => {
       removed.push(req)
       return { ok: true }
     })
     router.registerOutbound('discord-bot', async () => ({ ok: true }))
 
     await router.route(inbound({ reactionRef: TARGET_REF }))
+    await waitFor(() => resolveAdd !== undefined)
     sessions[0]!.onPrompt = async () => {
       await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: 'reply' })
     }
@@ -4270,15 +4719,20 @@ describe('ChannelRouter drop-eyes-after-reply', () => {
 
     resolveAdd!(INSTANCE_REF)
     await waitFor(() => removed.length === 1)
-    expect(removed[0]!.reactionRef).toEqual(INSTANCE_REF)
+    expect(removed[0]).toMatchObject({ target: TARGET_REF, emoji: 'eyes', expectedAccountIdentity: 'test-account' })
   })
 
-  test('does not remove when add succeeds without a removable instance ref', async () => {
+  test('removes a prepared own reaction even when add omits an instance ref', async () => {
     const dir = await tempDir()
     const { router, sessions } = makeRouter(dir)
     let removed = false
+    router.registerPrepareOwnReaction('discord-bot', async (req) => ({
+      accountIdentity: 'test-account',
+      target: req.reactionRef,
+      emoji: req.emoji,
+    }))
     router.registerReaction('discord-bot', async () => ({ ok: true }))
-    router.registerRemoveReaction('discord-bot', async () => {
+    router.registerRemoveOwnReaction('discord-bot', async () => {
       removed = true
       return { ok: true }
     })
@@ -4290,15 +4744,21 @@ describe('ChannelRouter drop-eyes-after-reply', () => {
     }
     await router.__testing!.flushDebounce(KEY)
 
-    expect(removed).toBe(false)
+    await waitFor(() => removed)
+    expect(removed).toBe(true)
   })
 
   test('does not remove when add fails unsupported', async () => {
     const dir = await tempDir()
     const { router, sessions } = makeRouter(dir)
     let removed = false
+    router.registerPrepareOwnReaction('discord-bot', async (req) => ({
+      accountIdentity: 'test-account',
+      target: req.reactionRef,
+      emoji: req.emoji,
+    }))
     router.registerReaction('discord-bot', async () => ({ ok: false, error: 'nope', code: 'unsupported' }))
-    router.registerRemoveReaction('discord-bot', async () => {
+    router.registerRemoveOwnReaction('discord-bot', async () => {
       removed = true
       return { ok: true }
     })
@@ -4313,13 +4773,21 @@ describe('ChannelRouter drop-eyes-after-reply', () => {
     expect(removed).toBe(false)
   })
 
-  test('treats not-found and unsupported removal failures as non-noisy', async () => {
+  test('treats unsupported own-removal failures as non-noisy', async () => {
     const dir = await tempDir()
     const logs: string[] = []
     const { router, sessions } = makeRouter(dir, { logs })
+    router.registerPrepareOwnReaction('discord-bot', async (req) => ({
+      accountIdentity: 'test-account',
+      target: req.reactionRef,
+      emoji: req.emoji,
+    }))
     router.registerReaction('discord-bot', async () => ({ ok: true, reactionRef: INSTANCE_REF }))
-    router.registerRemoveReaction('discord-bot', async () => ({ ok: false, error: 'already gone', code: 'not-found' }))
-    router.registerRemoveReaction('discord-bot', async () => ({ ok: false, error: 'unsupported', code: 'unsupported' }))
+    router.registerRemoveOwnReaction('discord-bot', async () => ({
+      ok: false,
+      error: 'unsupported',
+      code: 'unsupported',
+    }))
     router.registerOutbound('discord-bot', async () => ({ ok: true }))
 
     await router.route(inbound({ reactionRef: TARGET_REF }))
@@ -4331,6 +4799,69 @@ describe('ChannelRouter drop-eyes-after-reply', () => {
 
     expect(logs.some((m) => m.includes('engage-unreact'))).toBe(false)
   })
+
+  for (const code of ['rate-limit', 'permission', 'unsupported'] as const) {
+    for (const output of ['response', 'notice'] as const) {
+      test(`${output} is not delayed by pending ${code} own-reaction cleanup`, async () => {
+        const dir = await tempDir()
+        const { router, sessions } = makeRouter(dir)
+        const sent: string[] = []
+        let added = false
+        let removing = false
+        const cleanup = Promise.withResolvers<void>()
+        router.registerPrepareOwnReaction('discord-bot', async (req) => ({
+          accountIdentity: 'test-account',
+          target: req.reactionRef,
+          emoji: 'eyes',
+        }))
+        router.registerReaction('discord-bot', async () => {
+          added = true
+          return { ok: true }
+        })
+        router.registerRemoveOwnReaction('discord-bot', async () => {
+          removing = true
+          await cleanup.promise
+          return { ok: false, code, error: code === 'rate-limit' ? 'HTTP 429' : code }
+        })
+        router.registerOutbound('discord-bot', async (msg) => {
+          sent.push(msg.text ?? '')
+          return { ok: true }
+        })
+        await router.route(inbound({ reactionRef: TARGET_REF }))
+        await waitFor(() => added)
+        sessions[0]!.onPrompt = async () => {
+          await router.send({ ...KEY, text: 'First answer.' })
+          sessions[0]!.setAssistantText('First answer.')
+        }
+        let firstTurnDone = false
+        const firstTurn = router.__testing!.flushDebounce(KEY).then(() => {
+          firstTurnDone = true
+        })
+        try {
+          await waitFor(() => removing)
+          await waitFor(() => firstTurnDone, { timeoutMs: 1000 })
+          if (output === 'response') {
+            sessions[0]!.onPrompt = async () => {
+              await router.send({ ...KEY, text: 'Second answer.' })
+              sessions[0]!.setAssistantText('Second answer.')
+            }
+            await router.route(inbound({ externalMessageId: 'm2' }))
+            const secondTurn = router.__testing!.flushDebounce(KEY)
+            await waitFor(() => sent.includes('Second answer.'), { timeoutMs: 1000 })
+            await secondTurn
+          } else {
+            await router.route(inbound({ externalMessageId: 'm-stop', text: '/stop' }))
+            await waitFor(() => sent.includes('Stopped the current turn.'), { timeoutMs: 1000 })
+          }
+          expect(sent).toContain(output === 'response' ? 'Second answer.' : 'Stopped the current turn.')
+        } finally {
+          cleanup.resolve()
+          await firstTurn
+          await router.tearDownAllLive()
+        }
+      })
+    }
+  }
 
   test('removeReaction dispatcher mirrors react() unsupported and transient behavior', async () => {
     const dir = await tempDir()
@@ -15823,6 +16354,11 @@ describe('ChannelRouter continuation willingness reaction', () => {
     const added: ReactionRequest[] = []
     router.setTypingCapability('discord-bot', true)
     router.registerOutbound('discord-bot', async () => ({ ok: true, reactionRef: TARGET_REF }))
+    router.registerPrepareOwnReaction('discord-bot', async (req) => ({
+      accountIdentity: 'test-account',
+      target: req.reactionRef,
+      emoji: req.emoji,
+    }))
     router.registerReaction('discord-bot', async (req) => {
       added.push(req)
       return { ok: true, reactionRef: INSTANCE_REF }
@@ -15849,15 +16385,26 @@ describe('ChannelRouter continuation willingness reaction', () => {
     const removed: ReactionRef[] = []
     router.setTypingCapability('discord-bot', true)
     router.registerOutbound('discord-bot', async () => ({ ok: true, reactionRef: TARGET_REF }))
-    router.registerReaction('discord-bot', async () => ({ ok: true, reactionRef: INSTANCE_REF }))
-    router.registerRemoveReaction('discord-bot', async (req) => {
-      removed.push(req.reactionRef)
+    router.registerPrepareOwnReaction('discord-bot', async (req) => ({
+      accountIdentity: 'test-account',
+      target: req.reactionRef,
+      emoji: req.emoji,
+    }))
+    let added = false
+    router.registerReaction('discord-bot', async () => {
+      added = true
+      return { ok: true, reactionRef: INSTANCE_REF }
+    })
+    router.registerRemoveOwnReaction('discord-bot', async (req) => {
+      expect(req).toMatchObject({ emoji: CONTINUATION_REACTION_EMOJI, expectedAccountIdentity: 'test-account' })
+      removed.push(req.target)
       return { ok: true }
     })
 
     await router.route(inbound({ text: 'tell me the result too' }))
     sessions[0]!.onPrompt = async () => {
       await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: WILLINGNESS_REPLY })
+      await waitFor(() => added)
       await router.send({
         adapter: 'discord-bot',
         workspace: 'g1',
@@ -15868,7 +16415,7 @@ describe('ChannelRouter continuation willingness reaction', () => {
     await router.__testing!.flushDebounce(KEY)
 
     await waitFor(() => removed.length === 1)
-    expect(removed).toEqual([INSTANCE_REF])
+    expect(removed).toEqual([TARGET_REF])
   })
 
   test('retires the hourglass when the promised turn falls back', async () => {
@@ -15881,9 +16428,19 @@ describe('ChannelRouter continuation willingness reaction', () => {
         ? { ok: false, error: 'fallback delivery failed' }
         : { ok: true, reactionRef: TARGET_REF },
     )
-    router.registerReaction('discord-bot', async () => ({ ok: true, reactionRef: INSTANCE_REF }))
-    router.registerRemoveReaction('discord-bot', async (req) => {
-      removed.push(req.reactionRef)
+    router.registerPrepareOwnReaction('discord-bot', async (req) => ({
+      accountIdentity: 'test-account',
+      target: req.reactionRef,
+      emoji: req.emoji,
+    }))
+    let added = false
+    router.registerReaction('discord-bot', async () => {
+      added = true
+      return { ok: true, reactionRef: INSTANCE_REF }
+    })
+    router.registerRemoveOwnReaction('discord-bot', async (req) => {
+      expect(req).toMatchObject({ emoji: CONTINUATION_REACTION_EMOJI, expectedAccountIdentity: 'test-account' })
+      removed.push(req.target)
       return { ok: true }
     })
 
@@ -15893,6 +16450,7 @@ describe('ChannelRouter continuation willingness reaction', () => {
       attempt++
       if (attempt === 1) {
         await sendTerminalWillingness(sessions[0]!, router)
+        await waitFor(() => added)
         return
       }
       sessions[0]!.setAssistantText('NO_REPLY')
@@ -15900,7 +16458,7 @@ describe('ChannelRouter continuation willingness reaction', () => {
     await router.__testing!.flushDebounce(KEY)
 
     await waitFor(() => removed.length === 1)
-    expect(removed).toEqual([INSTANCE_REF])
+    expect(removed).toEqual([TARGET_REF])
   })
 
   test('retires the hourglass on a final NO_REPLY', async () => {
@@ -15909,21 +16467,32 @@ describe('ChannelRouter continuation willingness reaction', () => {
     const removed: ReactionRef[] = []
     router.setTypingCapability('discord-bot', true)
     router.registerOutbound('discord-bot', async () => ({ ok: true, reactionRef: TARGET_REF }))
-    router.registerReaction('discord-bot', async () => ({ ok: true, reactionRef: INSTANCE_REF }))
-    router.registerRemoveReaction('discord-bot', async (req) => {
-      removed.push(req.reactionRef)
+    router.registerPrepareOwnReaction('discord-bot', async (req) => ({
+      accountIdentity: 'test-account',
+      target: req.reactionRef,
+      emoji: req.emoji,
+    }))
+    let added = false
+    router.registerReaction('discord-bot', async () => {
+      added = true
+      return { ok: true, reactionRef: INSTANCE_REF }
+    })
+    router.registerRemoveOwnReaction('discord-bot', async (req) => {
+      expect(req).toMatchObject({ emoji: CONTINUATION_REACTION_EMOJI, expectedAccountIdentity: 'test-account' })
+      removed.push(req.target)
       return { ok: true }
     })
 
     await router.route(inbound({ text: 'please check' }))
     sessions[0]!.onPrompt = async () => {
       await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: WILLINGNESS_REPLY })
+      await waitFor(() => added)
       sessions[0]!.setAssistantText('NO_REPLY')
     }
     await router.__testing!.flushDebounce(KEY)
 
     await waitFor(() => removed.length === 1)
-    expect(removed).toEqual([INSTANCE_REF])
+    expect(removed).toEqual([TARGET_REF])
   })
 
   test('does not react when the send result omits a reaction target ref', async () => {
@@ -15932,6 +16501,11 @@ describe('ChannelRouter continuation willingness reaction', () => {
     const added: ReactionRequest[] = []
     router.setTypingCapability('discord-bot', true)
     router.registerOutbound('discord-bot', async () => ({ ok: true }))
+    router.registerPrepareOwnReaction('discord-bot', async (req) => ({
+      accountIdentity: 'test-account',
+      target: req.reactionRef,
+      emoji: req.emoji,
+    }))
     router.registerReaction('discord-bot', async (req) => {
       added.push(req)
       return { ok: true, reactionRef: INSTANCE_REF }
@@ -15952,8 +16526,9 @@ describe('ChannelRouter continuation willingness reaction', () => {
     const removed: ReactionRef[] = []
     router.setTypingCapability('discord-bot', true)
     router.registerOutbound('discord-bot', async () => ({ ok: true, reactionRef: TARGET_REF }))
-    router.registerRemoveReaction('discord-bot', async (req) => {
-      removed.push(req.reactionRef)
+    router.registerRemoveOwnReaction('discord-bot', async (req) => {
+      expect(req).toMatchObject({ emoji: CONTINUATION_REACTION_EMOJI, expectedAccountIdentity: 'test-account' })
+      removed.push(req.target)
       return { ok: true }
     })
 
@@ -15983,24 +16558,33 @@ describe('ChannelRouter continuation willingness reaction', () => {
     const dir = await tempDir()
     const { router, sessions } = makeRouter(dir)
     const removed: ReactionRef[] = []
+    let addStarted = false
     let releaseAdd: (() => void) | undefined
     const addGate = new Promise<void>((resolve) => {
       releaseAdd = resolve
     })
     router.setTypingCapability('discord-bot', true)
     router.registerOutbound('discord-bot', async () => ({ ok: true, reactionRef: TARGET_REF }))
+    router.registerPrepareOwnReaction('discord-bot', async (req) => ({
+      accountIdentity: 'test-account',
+      target: req.reactionRef,
+      emoji: req.emoji,
+    }))
     router.registerReaction('discord-bot', async () => {
+      addStarted = true
       await addGate
       return { ok: true, reactionRef: INSTANCE_REF }
     })
-    router.registerRemoveReaction('discord-bot', async (req) => {
-      removed.push(req.reactionRef)
+    router.registerRemoveOwnReaction('discord-bot', async (req) => {
+      expect(req).toMatchObject({ emoji: CONTINUATION_REACTION_EMOJI, expectedAccountIdentity: 'test-account' })
+      removed.push(req.target)
       return { ok: true }
     })
 
     await router.route(inbound({ text: 'please check' }))
     sessions[0]!.onPrompt = async () => {
       await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: WILLINGNESS_REPLY })
+      await waitFor(() => addStarted)
       await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: 'That check is done.' })
     }
     await router.__testing!.flushDebounce(KEY)
@@ -16008,7 +16592,7 @@ describe('ChannelRouter continuation willingness reaction', () => {
 
     releaseAdd!()
     await waitFor(() => removed.length === 1)
-    expect(removed).toEqual([INSTANCE_REF])
+    expect(removed).toEqual([TARGET_REF])
   })
 
   test('one substantive result retires every pending willingness status', async () => {
@@ -16016,6 +16600,7 @@ describe('ChannelRouter continuation willingness reaction', () => {
     const { router, sessions } = makeRouter(dir)
     const removed: ReactionRef[] = []
     let outboundCount = 0
+    let addedCount = 0
     router.setTypingCapability('discord-bot', true)
     router.registerOutbound('discord-bot', async () => {
       outboundCount++
@@ -16024,19 +16609,27 @@ describe('ChannelRouter continuation willingness reaction', () => {
         reactionRef: { adapter: 'discord-bot', value: `outbound-${outboundCount}` },
       }
     })
-    router.registerReaction('discord-bot', async (req) => ({
-      ok: true,
-      reactionRef: { adapter: 'discord-bot', value: `instance-${req.reactionRef.value}` },
+    router.registerPrepareOwnReaction('discord-bot', async (req) => ({
+      accountIdentity: 'test-account',
+      target: req.reactionRef,
+      emoji: req.emoji,
     }))
-    router.registerRemoveReaction('discord-bot', async (req) => {
-      removed.push(req.reactionRef)
+    router.registerReaction('discord-bot', async (req) => {
+      addedCount++
+      return { ok: true, reactionRef: { adapter: 'discord-bot', value: `instance-${req.reactionRef.value}` } }
+    })
+    router.registerRemoveOwnReaction('discord-bot', async (req) => {
+      expect(req).toMatchObject({ emoji: CONTINUATION_REACTION_EMOJI, expectedAccountIdentity: 'test-account' })
+      removed.push(req.target)
       return { ok: true }
     })
 
     await router.route(inbound({ text: 'keep me posted' }))
     sessions[0]!.onPrompt = async () => {
       await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: WILLINGNESS_REPLY })
+      await waitFor(() => addedCount === 1)
       await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: "I'll check the logs too." })
+      await waitFor(() => addedCount === 2)
       await router.send({
         adapter: 'discord-bot',
         workspace: 'g1',
@@ -16047,7 +16640,7 @@ describe('ChannelRouter continuation willingness reaction', () => {
     await router.__testing!.flushDebounce(KEY)
 
     await waitFor(() => removed.length === 2)
-    expect(removed.map((ref) => ref.value).sort()).toEqual(['instance-outbound-1', 'instance-outbound-2'])
+    expect(removed.map((ref) => ref.value).sort()).toEqual(['outbound-1', 'outbound-2'])
   })
 })
 
@@ -18931,6 +19524,11 @@ describe('ChannelRouter background-child await suppression', () => {
     const reactions: ReactionRequest[] = []
     const { router, sessions } = makeRouter(dir, { logs, newestRunningChildSubagentStartedAt: runningChild })
     router.setTypingCapability('discord-bot', true)
+    router.registerPrepareOwnReaction('discord-bot', async (req) => ({
+      accountIdentity: 'test-account',
+      target: req.reactionRef,
+      emoji: req.emoji,
+    }))
     router.registerReaction('discord-bot', async (req) => {
       reactions.push(req)
       return { ok: true }
