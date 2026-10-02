@@ -117,6 +117,10 @@ describe('createChannelSendTool', () => {
       text: 'hi',
     })
     expect(result.details).toEqual({ ok: true })
+    const block = result.content[0]
+    if (block?.type !== 'text') throw new Error('Expected text receipt')
+    expect(block.text).not.toContain('message_id=')
+    expect(block.text).not.toContain('message_ids=')
   })
 
   test('passes preview suppression to the router for an outbound post', async () => {
@@ -157,12 +161,24 @@ describe('createChannelSendTool', () => {
     expect(result.details).toMatchObject({ ok: true })
   })
 
-  test('surfaces messageId and messageIds from the router result in details', async () => {
-    const tool = createChannelSendTool({
-      router: fakeRouter(async () => ({ ok: true, messageId: '1700.0001', messageIds: ['1700.0001', '1700.0002'] })),
-    })
+  test.each([
+    { label: 'single', ids: { messageId: '1700000000.000100' }, receipt: 'message_id="1700000000.000100"' },
+    {
+      label: 'split',
+      ids: { messageId: '1700000000.000100', messageIds: ['1700000000.000100', '1700000000.000101'] },
+      receipt: 'message_ids=["1700000000.000100","1700000000.000101"]',
+    },
+  ])('shows $label posted ids to the model inside the fenced receipt', async ({ ids, receipt }) => {
+    const tool = createChannelSendTool({ router: fakeRouter(async () => ({ ok: true, ...ids })) })
     const result = await runTool(tool, { adapter: 'slack-bot', workspace: 'T0', chat: 'C0', text: 'hi' })
-    expect(result.details).toEqual({ ok: true, messageId: '1700.0001', messageIds: ['1700.0001', '1700.0002'] })
+    const block = result.content[0]
+    if (block?.type !== 'text') throw new Error('Expected text receipt')
+    const content = block.text
+    expect(result.details).toEqual({ ok: true, ...ids })
+    expect(content).toContain('message_id="1700000000.000100"')
+    expect(content).toContain(receipt)
+    expect(content.indexOf(receipt)).toBeGreaterThan(content.indexOf('**[SYSTEM MESSAGE — not from a human]**'))
+    expect(content.indexOf(receipt)).toBeLessThan(content.indexOf('**Do not acknowledge or reply to it.**'))
   })
 
   test('forwards an optional thread when provided', async () => {

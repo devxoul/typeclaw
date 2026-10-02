@@ -125,6 +125,12 @@ Not every adapter backs every mode. When an adapter hasn't registered a capabili
 
 Only the two first-class bot adapters (`slack-bot`, `discord-bot`) back the `message` and `list` modes. `telegram-bot` backs none — the Bot API has no server-side history read, so even `history` is unavailable there and the agent relies on its live context buffer instead.
 
+## Outbound delivery receipts
+
+On a successful `channel_send` or `channel_reply`, the agent sees an already-delivered message echo inside a system-message fence. When the adapter reports native message identifiers, that same fenced receipt includes `message_id="..."` (an adapter-reported posted-message id) and, when reported, `message_ids=["...", "..."]` containing reported posted-message ids in send order. Some adapters do not return ids for every attachment post or any ids at all; absent ids are omitted from the receipt.
+
+Preserve the exact string, including leading or trailing zeroes. To continue the same conversation, use `channel_reply` or reuse the existing `thread`/root coordinates with `channel_send`. A returned id can start a thread only when that adapter accepts a message id as `thread` (for example, a new top-level Slack post); a reply's new Slack `ts` is not its parent thread root, while Discord threads, Telegram topics, and GitHub review threads have their own coordinates. The receipt is tool feedback, not a new chat message to answer.
+
 ## Message editing
 
 `channel_edit` replaces the text of a message the agent already posted, in place. The agent passes the `message_id` a prior `channel_send` returned, plus the same `adapter`/`workspace`/`chat`, and the new `text`. It's for fixing a typo, correcting a wrong answer, or appending a result to a status message — not for continuing a conversation. The agent can only edit messages it authored; editing someone else's returns `code: "permission-denied"`.

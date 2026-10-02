@@ -55,11 +55,12 @@ export function createChannelSendTool({
       'For Discord guild channels, workspace is the guild id; for Slack team channels, workspace is ' +
       'the team id (e.g. "T0ACME"). For DMs on either platform, workspace is the literal "@dm". ' +
       'On failure (no adapter registered, or the adapter-level send failed), the call returns ' +
-      '{ ok: false, error }. On success it returns { ok: true } and, when the platform reports it, ' +
-      '`messageId` (the posted message id, e.g. a Slack thread ts or Discord/Telegram message id) plus ' +
-      '`messageIds` (every id in send order when the post was split into multiple messages; `messageId` is ' +
-      'the reply anchor — usually the first message). Pass `messageId` back as `thread` on a later send to ' +
-      'post follow-ups into the same thread. Some adapters do not report an id, in which case both are absent. ' +
+      '{ ok: false, error }. On success it returns { ok: true } and, when reported, `messageId` ' +
+      '(an adapter-reported id of a posted message) and `messageIds` (reported posted-message ids in ' +
+      'send order). To continue the same conversation, reuse its existing `thread`/root coordinates ' +
+      'or use `channel_reply`. A returned id starts a thread only where the adapter accepts a message ' +
+      'id as `thread` (e.g. a new top-level Slack post); other adapters use different thread ids. ' +
+      'Some adapters do not report ids. ' +
       'There is no auto-reply: the only way for an agent to post is via this tool.',
     parameters: Type.Object({
       adapter: Type.Union(
@@ -355,7 +356,10 @@ export function createChannelSendTool({
       // rationale (PR #481 self-reply loop).
       if (result.ok) {
         const echo = renderOutboundEcho(bodyText, attachments)
-        const receipt = `posted to ${params.adapter}:${params.workspace}/${params.chat}: ${echo}`
+        const receipt =
+          `posted to ${params.adapter}:${params.workspace}/${params.chat}: ${echo}` +
+          (result.messageId !== undefined ? `\nmessage_id=${JSON.stringify(result.messageId)}` : '') +
+          (result.messageIds !== undefined ? `\nmessage_ids=${JSON.stringify(result.messageIds)}` : '')
         const hints: string[] = []
         const consecutive = consecutiveSendHint(
           router.getConsecutiveSendCount({
