@@ -7,6 +7,15 @@ export type ChannelKey = {
   chat: string
   thread: string | null
 }
+// Matches the router's existing self-identity fallback and persisted background
+// account identity. Adapters with platform-specific resolvers retain those IDs.
+export function fallbackChannelAccountIdentity(
+  adapter: AdapterId,
+  workspace: string,
+  userId: string | null | undefined,
+): string | undefined {
+  return userId == null ? undefined : `${adapter}:${workspace}:${userId}`
+}
 
 // Inbound (non-text) media that the user attached to a channel message.
 // The classifier produces these alongside `InboundMessage.text`; the router
@@ -63,6 +72,13 @@ export type GithubReviewThreadCloseout = {
   deferUntil?: { kind: 'review-state-unknown'; expiresAt: number }
 }
 
+export type RouteReceipt =
+  | { kind: 'accepted'; inputId: string; generation: number }
+  | { kind: 'duplicate'; inputId: string; outcome?: 'delivered' | 'intentionally-suppressed' }
+  | { kind: 'observed' }
+  | { kind: 'denied' }
+  | { kind: 'control' }
+
 export type InboundMessage = {
   adapter: AdapterId
   workspace: string
@@ -93,6 +109,12 @@ export type InboundMessage = {
   // resolve `attachment_id` → ref without the agent ever seeing the ref.
   attachments?: readonly InboundAttachment[]
   externalMessageId: string
+  // Authenticated adapter account, never a credential or its fingerprint.
+  accountIdentity?: string
+  eventKind?: string
+  revision?: string
+  // Local receipt identity when upstream supplies no stable event identity.
+  receiptId?: string
   authorId: string
   authorName: string
   // Set true when the inbound is from another bot (NOT this typeclaw
@@ -262,6 +284,7 @@ export type SendOptions =
       sessionId?: string
       turnId?: string
       claimGeneration?: number
+      expectedAccountIdentity?: string
       coveredIds?: readonly string[]
     }
   | { accounting: 'recovery'; deliveryId: string; coveredIds: readonly string[]; expectedAccountIdentity: string }
@@ -663,6 +686,8 @@ export type SubmitReviewRequest = {
   // The commit the review describes. When set, the submitter refuses to post
   // unless the PR head is still exactly this commit.
   expectedHeadSha?: string
+  expectedAccountIdentity?: string
+  sourceSessionId?: string
 }
 
 export type SubmitReviewResult =

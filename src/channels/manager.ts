@@ -29,6 +29,8 @@ import { createWebexBotAdapter, type WebexBotAdapter } from './adapters/webex-bo
 import type { BackgroundObligationStore } from './background-obligations'
 import { describeError } from './describe-error'
 import type { GithubTokenBridge } from './github-token-bridge'
+import type { InboundJournal } from './inbound-journal'
+import type { RecoveryOutbox } from './recovery-outbox'
 import {
   createChannelRouter,
   type ChannelRouter,
@@ -100,6 +102,8 @@ export type ChannelManagerOptions = {
   createWebexAdapter?: typeof createWebexAdapter
   createWebexBotAdapter?: typeof createWebexBotAdapter
   backgroundObligations?: BackgroundObligationStore
+  inboundJournal?: InboundJournal
+  recoveryOutbox?: RecoveryOutbox
   // Wake-up gate: forwarded to the router, which calls
   // `permissions.has(origin, 'channel.respond')` BEFORE creating a
   // session for any inbound. Optional here to keep direct manager-level
@@ -249,6 +253,8 @@ export function createChannelManager(options: ChannelManagerOptions): ChannelMan
   const router = createChannelRouter({
     agentDir: options.agentDir,
     ...(options.backgroundObligations ? { backgroundObligations: options.backgroundObligations } : {}),
+    ...(options.inboundJournal ? { inboundJournal: options.inboundJournal } : {}),
+    ...(options.recoveryOutbox ? { recoveryOutbox: options.recoveryOutbox } : {}),
     configForAdapter: (adapter) => options.channelsConfigRef()[adapter],
     logger,
     ...(options.aliasesRef ? { configuredAliases: options.aliasesRef } : {}),

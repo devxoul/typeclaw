@@ -25,7 +25,11 @@ import {
   TYPECLAW_INTERNAL_BASH_WITHHOLD_ENV,
   wrapBuiltinToolDefinition,
 } from '@/agent/plugin-tools'
-import { __resetReviewObserverForTest, setReviewObserver } from '@/channels/github-review-turn-ledger'
+import {
+  __resetReviewObserverForTest,
+  setReviewCoverageCapture,
+  setReviewObserver,
+} from '@/channels/github-review-turn-ledger'
 import {
   __resetReviewVerdictGuardForTest,
   isGithubReviewRoundComplete,
@@ -126,6 +130,30 @@ function githubOriginBashEvent(command: string, workspace: string): ToolBeforeEv
 }
 
 const tokenResolver = (token: string) => async (): Promise<GithubTokenResolveResult> => ({ kind: 'token', token })
+
+test('review preflight rejects rotated minted actor and admits the original actor', async () => {
+  delete process.env.GH_TOKEN
+  delete process.env.GITHUB_TOKEN
+  setReviewCoverageCapture(async () => ({
+    expectedAccountIdentity: 'github:1',
+    inboundCoverage: [{ inputId: 'request-A', generation: 2 }],
+    backgroundCoverage: [],
+  }))
+  try {
+    let actor = 'github:2'
+    const before = await hookFor(async () => ({ kind: 'token', token: 'ghs_selected', accountIdentity: actor }))
+    const rejected = await before(bashEvent('gh api /repos/acme/widgets/pulls/5/reviews -f event=COMMENT'), hookCtx)
+    expect(rejected).toMatchObject({
+      block: true,
+      reason: expect.stringContaining('original GitHub review account identity changed'),
+    })
+    actor = 'github:1'
+    const allowed = await before(bashEvent('gh api /repos/acme/widgets/pulls/5/reviews -f event=COMMENT'), hookCtx)
+    expect(allowed).toBeUndefined()
+  } finally {
+    __resetReviewObserverForTest()
+  }
+})
 const unavailableResolver = async (): Promise<GithubTokenResolveResult> => ({
   kind: 'unavailable',
   reason: 'adapter down',

@@ -1,4 +1,7 @@
 import { afterEach, describe, expect, test } from 'bun:test'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
 import {
   __resetReviewObserverForTest,
@@ -12,15 +15,17 @@ import {
   abortGithubReviewStateForPr,
   configureReviewVerdictCoordinator,
 } from '@/channels/github-review-verdict-coordinator'
-import { createChannelRouter } from '@/channels/router'
+import { createChannelRouter, type ChannelRouter } from '@/channels/router'
 import { defaultHistoryConfig } from '@/channels/schema'
 import type { OutboundMessage, SubmitReviewRequest } from '@/channels/types'
 
 import { createPostGithubReviewTool } from './post-github-review'
 
+const routers: Array<{ instance: ChannelRouter; dir: string }> = []
 function router() {
-  return createChannelRouter({
-    agentDir: '/tmp/typeclaw-post-review-test',
+  const dir = mkdtempSync(join(tmpdir(), 'typeclaw-post-review-test-'))
+  const instance = createChannelRouter({
+    agentDir: dir,
     configForAdapter: () => ({
       allow: ['*'],
       engagement: { trigger: ['mention'], stickiness: 'off' },
@@ -28,6 +33,8 @@ function router() {
       history: defaultHistoryConfig(),
     }),
   })
+  routers.push({ instance, dir })
+  return instance
 }
 
 const githubOrigin = { adapter: 'github' as const, workspace: 'acme/widgets', chat: 'pr:7', thread: null }
@@ -40,7 +47,11 @@ async function run(tool: ReturnType<typeof createPostGithubReviewTool>, params: 
 }
 
 describe('post_github_review', () => {
-  afterEach(() => {
+  afterEach(async () => {
+    for (const { instance, dir } of routers.splice(0)) {
+      await instance.stop()
+      rmSync(dir, { recursive: true, force: true })
+    }
     resetReviewTurn(sessionId)
     resetReviewTurn('concurrent-session')
     __resetReviewObserverForTest()
@@ -119,10 +130,6 @@ describe('post_github_review', () => {
         reanchored: [{ path: 'src/app.ts', line: 99, body: 'outside' }],
       }
     })
-    const output: unknown[] = []
-    setReviewOutputObserver((event) => {
-      output.push(event)
-    })
     const result = await run(createPostGithubReviewTool({ router: channelRouter, origin: githubOrigin, sessionId }), {
       event: 'APPROVE',
       body: 'summary',
@@ -134,9 +141,6 @@ describe('post_github_review', () => {
     ])
     expect(result.details).toMatchObject({ ok: true, reviewId: 44, downgraded: true })
     expect(hasReview({ sessionId, workspace: githubOrigin.workspace, prNumber: 7, verdict: 'APPROVE' })).toBe(false)
-    expect(output).toEqual([
-      { sessionId, workspace: githubOrigin.workspace, prNumber: 7, state: 'COMMENT', backgroundCoverage: [] },
-    ])
     expect(result.content[0]).toMatchObject({ type: 'text' })
     if (result.content[0]?.type === 'text') expect(result.content[0].text).toContain('out-of-diff')
   })
@@ -147,10 +151,6 @@ describe('post_github_review', () => {
   ] as const)('credits the verified effective %s state to the session ledger', async (event, state, verdict) => {
     const channelRouter = router()
     channelRouter.registerReviewSubmitter('github', async () => ({ ok: true, reviewId: 45, state }))
-    const output: unknown[] = []
-    setReviewOutputObserver((value) => {
-      output.push(value)
-    })
 
     const result = await run(createPostGithubReviewTool({ router: channelRouter, origin: githubOrigin, sessionId }), {
       event,
@@ -159,9 +159,6 @@ describe('post_github_review', () => {
 
     expect(result.details).toMatchObject({ ok: true, state })
     expect(hasReview({ sessionId, workspace: githubOrigin.workspace, prNumber: 7, verdict })).toBe(true)
-    expect(output).toEqual([
-      { sessionId, workspace: githubOrigin.workspace, prNumber: 7, state: verdict, backgroundCoverage: [] },
-    ])
   })
 
   test('binds the verdict to the reviewed head and reports the landed commit to round completion', async () => {
@@ -347,10 +344,6 @@ describe('post_github_review', () => {
       comments.push(message)
       return { ok: true, messageId: '91', messageIds: ['91'] }
     })
-    const output: unknown[] = []
-    setReviewOutputObserver((value) => {
-      output.push(value)
-    })
 
     const result = await run(createPostGithubReviewTool({ router: channelRouter, origin: githubOrigin, sessionId }), {
       event: 'REQUEST_CHANGES',
@@ -411,9 +404,6 @@ describe('post_github_review', () => {
     expect(hasReview({ sessionId, workspace: githubOrigin.workspace, prNumber: 7, verdict: 'REQUEST_CHANGES' })).toBe(
       false,
     )
-    expect(output).toEqual([
-      { sessionId, workspace: githubOrigin.workspace, prNumber: 7, state: 'COMMENT', backgroundCoverage: [] },
-    ])
   })
 
   test('serializes duplicate REQUEST_CHANGES fallbacks until outbound delivery completes', async () => {

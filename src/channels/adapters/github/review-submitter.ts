@@ -27,6 +27,7 @@ export function invalidateGithubReviewSubmission(workspace: string, prNumber: nu
 export function createGithubReviewSubmitter(deps: {
   token: (context?: GithubAuthContext) => Promise<string>
   allowApprove: () => boolean
+  accountIdentity?: () => Promise<string | undefined>
   fetchImpl?: typeof fetch
 }): ReviewSubmitter {
   const fetchImpl = deps.fetchImpl ?? fetch
@@ -59,6 +60,9 @@ export function createGithubReviewSubmitter(deps: {
     const { inline, reanchored } = partitionComments(req.comments, stable.anchors)
     const downgraded = req.event === 'APPROVE' && !deps.allowApprove()
     const event = downgraded ? 'COMMENT' : req.event
+    if (req.expectedAccountIdentity !== undefined && (await deps.accountIdentity?.()) !== req.expectedAccountIdentity) {
+      return { ok: false, error: 'GitHub review account identity changed or unavailable', code: 'permission-denied' }
+    }
     if (currentReviewSubmissionGeneration(req.workspace, target.prNumber) !== submissionGeneration) {
       return {
         ok: false,

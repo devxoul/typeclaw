@@ -96,12 +96,26 @@ typeclaw channel reauth <adapter>   # replay the interactive login
 
 When a message arrives:
 
-1. The adapter publishes it to the in-process message stream with a `(adapter, workspace, chat, thread, authorId)` coordinate.
-2. The channel router gates the message on `channel.respond` permission ([/concepts/permissions-model](/docs/concepts/permissions-model)). No permission → silent drop.
-3. A session is created (or resumed) for that coordinate.
-4. Outgoing tool calls (`channel_send`, `channel_reply`, `channel_edit`) flow back through the adapter.
+1. The adapter routes the exact `(adapter, workspace, chat, thread)` coordinate with its authenticated account identity, external message identity, event kind and revision.
+2. The channel router gates response permission and engagement ([/concepts/permissions-model](/docs/concepts/permissions-model)); denied, observed and control traffic creates no response obligation.
+3. An engaged input is synced to the inbound journal before an `accepted {inputId, generation}` receipt, publication or queueing. A replay returns `duplicate {inputId, outcome}`; non-engaged classification returns `observed`, `denied` or `control`.
+4. The router claims stable queued IDs before prompting. Outgoing tool calls (`channel_send`, `channel_reply`, `channel_edit`) flow back through the adapter.
 
 The router never blocks on a slow adapter. Each adapter owns its own outbound queue.
+
+The receipt is a local admission boundary, not an exactly-once platform delivery
+promise. Ack-first transports, including GitHub webhooks, can acknowledge before
+durable routing; events the runtime never received while down depend on each
+platform's replay. Instagram advances its local checkpoint only after durable
+acceptance/duplicate or completed non-engaged classification, never after a
+routing write failure. A Slack mention-adding edit carries its own revision, and
+GitHub synthetic review rounds carry distinct round/commit identities.
+
+Interrupted accepted work transfers to a fixed runtime-notice outbox on boot;
+it is never automatically replayed. Notices are at least once, with a possible
+duplicate after remote success but before local receipt commit. Corrupt journal
+bytes are preserved and dependent background/inbound recovery is frozen pending
+operator repair. See [durable admission and recovery](/docs/internals/engagement#durable-inbound-admission-and-turn-ownership).
 
 `channel_send` and `channel_reply` accept optional `link_previews: false` to suppress link/media previews on `slack-bot` and web-page previews on `telegram-bot`. Omit it or set `true` to keep the platform default (not force previews on). Other adapters, including `discord-bot`, ignore the option; it does not disable previews there. The pinned Discord SDK does not support message flags, and bypassing it would lose rate-limit and retry handling. Slack file-upload captions do not expose preview controls in the upstream upload API, so use a text-only post when preview suppression is required.
 

@@ -11,15 +11,17 @@ import {
   guardGithubReviewRoundDismissal,
   releaseGithubReviewRoundDismissal,
 } from '@/channels/github-review-verdict-coordinator'
+import type { GithubTokenCredential } from '@/channels/github-token-bridge'
 import { hasEnvKey, readEnvFile } from '@/init/env-file'
 import { CORE_PERMISSIONS } from '@/permissions/builtins'
-import { definePlugin } from '@/plugin'
+import { definePlugin, type ToolBeforeEvent } from '@/plugin'
 
 import { createGithubEffectiveApprovalResolver, createGithubHeadShaResolver } from './effective-approval'
 import {
   analyzeGhCommand,
   canInjectPatIntoPassThroughGh,
   effectiveGhTokensForAuthenticatedUserEndpoint,
+  effectiveGhTokensForCommand,
   usesGhApiGraphqlEndpoint,
 } from './gh-command'
 import { detectReviewDismissal } from './gh-review-detect'
@@ -39,7 +41,9 @@ import {
 } from './git-command'
 import { buildGitCredentialEnv, type GitRepoCredential } from './git-credential-env'
 import { checkGraphqlAuthNudge } from './graphql-auth-nudge'
+import { verifyReviewTokenAccount } from './review-account'
 import {
+  capturedReviewAccountIdentity,
   commitReviewIfSucceeded,
   discardReviewCommand,
   dismissalMutationSucceeded,
@@ -82,6 +86,7 @@ export default definePlugin({
     const resolveTokenForRepo = ctx.github.resolveTokenForRepo
     const hasAppTokenResolver = ctx.github.hasAppTokenResolver
     const trustedGitTransportEnv: NodeJS.ProcessEnv = { ...process.env }
+    const reviewCredentials = new Map<string, GithubTokenCredential>()
 
     // Every model-driven bash masks the canonical credential files. A role may
     // still USE a PAT through this runtime-owned overlay, which injects one
@@ -284,7 +289,7 @@ export default definePlugin({
     // 'fall-through' means "not a repo-targeting gh command" so the caller can
     // try the git path on the same command (e.g. `git ... # gh` substrings).
     const handleGhCommand = async (params: {
-      event: { callId: string; sessionId: string; args: Record<string, unknown>; origin?: SessionOrigin }
+      event: Pick<ToolBeforeEvent, 'callId' | 'args' | 'origin' | 'sessionId'>
       command: string
     }): Promise<HookResult | 'fall-through'> => {
       const { event, command } = params
@@ -483,6 +488,7 @@ export default definePlugin({
 
       const result = await resolveTokenForRepo(decision.repoSlug)
       if (result.kind === 'unavailable') return blockAfterLease({ block: true, reason: result.reason })
+      reviewCredentials.set(event.callId, result)
       // Inject via the internal env overlay (delivered to the spawn / bwrap
       // --setenv by the bash wrapper) so the token never enters the command
       // string, where it could leak through logs or later hooks. When the repo
@@ -638,6 +644,38 @@ export default definePlugin({
 
           if (command.includes('gh')) {
             const ghResult = await handleGhCommand({ event, command })
+            const minted = reviewCredentials.get(event.callId)
+            reviewCredentials.delete(event.callId)
+            const expectedAccountIdentity = capturedReviewAccountIdentity(event.callId)
+            const blocked = typeof ghResult === 'object' && ghResult?.block === true
+            if (!blocked && expectedAccountIdentity !== undefined) {
+              const inherited = sandboxInheritedGhToken()
+              const rawOverlay = event.args[TYPECLAW_INTERNAL_BASH_ENV]
+              const overlay =
+                rawOverlay !== null && typeof rawOverlay === 'object' ? (rawOverlay as Record<string, string>) : {}
+              const tokens = effectiveGhTokensForCommand(String(event.args.command), {
+                ...(inherited !== undefined ? { [inherited.envName]: inherited.value } : {}),
+                ...overlay,
+              })
+              try {
+                if (tokens.length === 0) throw new Error('No authenticated review invocation')
+                for (const token of tokens) {
+                  if (
+                    !(await verifyReviewTokenAccount({
+                      token,
+                      expectedAccountIdentity,
+                      ...(minted !== undefined ? { minted } : {}),
+                    }))
+                  ) {
+                    throw new Error('original GitHub review account identity changed')
+                  }
+                }
+              } catch (error) {
+                discardReviewCommand(event.callId)
+                await verdictGuard.release({ callId: event.callId, outcome: 'failed' })
+                return { block: true, reason: `Cannot authorize review account: ${String(error)}` }
+              }
+            }
             if (ghResult !== 'fall-through') return ghResult
           }
 

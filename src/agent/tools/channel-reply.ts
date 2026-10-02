@@ -5,6 +5,7 @@ import type { BackgroundObligationRef } from '@/channels/background-obligations'
 import { checkCompletionClaim } from '@/channels/completion-claim'
 import { checkFalseReceipt } from '@/channels/github-false-receipt'
 import { evaluateRereviewGuard } from '@/channels/github-rereview-guard'
+import type { InboundRef } from '@/channels/inbound-journal'
 import {
   containsKimiToolDelimiter,
   isNoReplySignal,
@@ -299,6 +300,7 @@ export function createChannelReplyTool({
       }
 
       const backgroundCoverage = (await router.captureBackgroundResultCoverage?.(sessionId)) ?? []
+      const inboundCoverage = (await router.captureInboundResultCoverage?.(sessionId)) ?? []
       const result = await router.send({
         adapter: origin.adapter,
         workspace: origin.workspace,
@@ -342,10 +344,12 @@ export function createChannelReplyTool({
         messageId?: string
         messageIds?: readonly string[]
         backgroundCoverage?: BackgroundObligationRef[]
+        inboundCoverage?: InboundRef[]
       } = result.ok
         ? {
             ok: true,
             backgroundCoverage,
+            inboundCoverage,
             ...(keepTurnAlive ? { more_work_this_turn: true } : {}),
             ...(result.messageId !== undefined ? { messageId: result.messageId } : {}),
             ...(result.messageIds !== undefined ? { messageIds: result.messageIds } : {}),

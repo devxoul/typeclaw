@@ -129,8 +129,14 @@ export function createPostGithubReviewTool(options: {
       }
       let releaseAsLanded = false
       try {
-        const backgroundCoverage = (await router.captureBackgroundResultCoverage?.(sessionId)) ?? []
-        const result = await router.submitReview(request)
+        const coverage = await captureCoverage(router, sessionId)
+        const result = await router.submitReview({
+          ...request,
+          sourceSessionId: sessionId,
+          ...(coverage.expectedAccountIdentity !== undefined
+            ? { expectedAccountIdentity: coverage.expectedAccountIdentity }
+            : {}),
+        })
         if (!result.ok) {
           // A POST whose verification failed may already have landed. Keep the
           // short conservative shield, but never credit an unverified ledger.
@@ -147,7 +153,7 @@ export function createPostGithubReviewTool(options: {
           workspace: origin.workspace,
           prNumber,
           effective,
-          backgroundCoverage,
+          ...coverage,
           ...(result.commitSha !== undefined ? { commitSha: result.commitSha } : {}),
         })
 
@@ -186,7 +192,7 @@ async function postDuplicateRequestChangesComment(args: {
   comments: readonly ReviewFinding[]
   logger: ChannelToolLogger
 }) {
-  const backgroundCoverage = (await args.router.captureBackgroundResultCoverage?.(args.sessionId)) ?? []
+  const coverage = await captureCoverage(args.router, args.sessionId)
   const result = await args.router.send(
     {
       adapter: 'github',
@@ -195,7 +201,12 @@ async function postDuplicateRequestChangesComment(args: {
       thread: null,
       text: renderFallbackComment(args.body, args.comments),
     },
-    { accountingTarget: args.origin },
+    {
+      accountingTarget: args.origin,
+      ...(coverage.expectedAccountIdentity !== undefined
+        ? { expectedAccountIdentity: coverage.expectedAccountIdentity }
+        : {}),
+    },
   )
   if (!result.ok) return { landed: false, result: denied(args.logger, result.error, result.code) }
 
@@ -204,7 +215,7 @@ async function postDuplicateRequestChangesComment(args: {
     workspace: args.origin.workspace,
     prNumber: args.prNumber,
     state: 'COMMENT',
-    backgroundCoverage,
+    ...coverage,
   })
 
   const details: PostGithubReviewDetails = {
@@ -288,7 +299,8 @@ async function creditVerifiedReview(
       workspace: args.workspace,
       prNumber: args.prNumber,
       state: 'COMMENT',
-      backgroundCoverage: args.backgroundCoverage,
+      ...(args.inboundCoverage !== undefined ? { inboundCoverage: args.inboundCoverage } : {}),
+      ...(args.backgroundCoverage !== undefined ? { backgroundCoverage: args.backgroundCoverage } : {}),
     })
     return
   }
@@ -298,9 +310,19 @@ async function creditVerifiedReview(
     workspace: args.workspace,
     prNumber: args.prNumber,
     verdict: args.effective,
-    backgroundCoverage: args.backgroundCoverage,
+    ...(args.inboundCoverage !== undefined ? { inboundCoverage: args.inboundCoverage } : {}),
+    ...(args.backgroundCoverage !== undefined ? { backgroundCoverage: args.backgroundCoverage } : {}),
     ...(args.commitSha !== undefined ? { commitSha: args.commitSha } : {}),
   })
+}
+
+async function captureCoverage(router: ChannelRouter, sessionId: string): Promise<ReviewResultCoverage> {
+  const expectedAccountIdentity = await router.captureTurnAccountIdentity?.(sessionId)
+  return {
+    inboundCoverage: (await router.captureInboundResultCoverage?.(sessionId)) ?? [],
+    backgroundCoverage: (await router.captureBackgroundResultCoverage?.(sessionId)) ?? [],
+    ...(expectedAccountIdentity !== undefined ? { expectedAccountIdentity } : {}),
+  }
 }
 
 function denied(logger: ChannelToolLogger, error: string, code?: string) {

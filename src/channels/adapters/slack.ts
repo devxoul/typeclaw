@@ -35,6 +35,7 @@ import { chunkMarkdown } from '@/markdown'
 import type { SlackAccountRecord } from '@/secrets/schema'
 
 import { describeError } from '../describe-error'
+import { withOutboundAccount } from './outbound-account'
 import { downloadSlackAttachment, type SlackAttachmentFetch } from './slack-attachment-download'
 import { createSlackAuthorResolver } from './slack-author-resolver'
 import { slackTsToMillis } from './slack-bot-time'
@@ -260,7 +261,10 @@ export function createSlackAdapter(options: SlackAdapterOptions): SlackAdapter {
     historyCallback,
     selfUserIdRef: () => selfUserId,
   })
-  const outboundCallback = createSlackOutboundCallback({ client, logger, formatChannelTag })
+  const outboundCallback = withOutboundAccount(
+    createSlackOutboundCallback({ client, logger, formatChannelTag }),
+    (workspace) => recoveryCallbacks.cachedAccountIdentity?.(workspace),
+  )
   const fetchAttachmentCallback = createSlackFetchAttachmentCallback({
     client,
     logger,
@@ -300,6 +304,8 @@ export function createSlackAdapter(options: SlackAdapterOptions): SlackAdapter {
   }
 
   const handleMessage = async (event: SlackRTMMessageEvent): Promise<void> => {
+    const inboundTeamId = teamId
+    const inboundSelfId = selfUserId
     inflightInbounds++
     try {
       const tag = await formatChannelTag(event.channel)
@@ -307,8 +313,8 @@ export function createSlackAdapter(options: SlackAdapterOptions): SlackAdapter {
         `[slack] inbound id=${event.ts} author=${event.user ?? '(none)'} ${tag} text_len=${(event.text ?? '').length}`,
       )
       const verdict = classifyInbound(event, options.configRef(), {
-        teamId,
-        selfUserId,
+        teamId: inboundTeamId,
+        selfUserId: inboundSelfId,
         selfAliases: options.selfAliasesRef?.() ?? [],
         conversationType: await resolveConversationType(event),
       })

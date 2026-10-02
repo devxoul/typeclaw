@@ -2,6 +2,8 @@ import { createHash, randomUUID } from 'node:crypto'
 import { mkdir, open, readFile, readdir, rename, unlink } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
 
+import { z } from 'zod'
+
 import type { MatchableOrigin } from '../permissions/resolve'
 import { createLegacyRecoveryNotice } from './background-handoff'
 import type { LegacyBackgroundHandoffReader } from './background-handoff'
@@ -63,23 +65,59 @@ async function syncDirectory(path: string) {
     await fd.close()
   }
 }
+const nonempty = z.string().min(1)
+const generation = z.number().int().positive().max(Number.MAX_SAFE_INTEGER)
+const backgroundSchema = z
+  .object({
+    schemaVersion: z.literal(1),
+    obligationId: z.string().regex(/^[a-f0-9]{64}$/),
+    generation,
+    taskId: nonempty,
+    parentSessionId: nonempty,
+    parentSessionFile: nonempty.optional(),
+    accountIdentity: nonempty,
+    target: z.unknown(),
+    principal: z.unknown(),
+    acceptedAt: z.number().finite().nonnegative(),
+    epoch: nonempty,
+    phase: z.enum(['accepted', 'result-ready', 'turn-owned', 'notice-prepared', 'notice-owned', 'closed']),
+    completionId: nonempty.optional(),
+    claim: z
+      .object({
+        turnId: nonempty,
+        ownerSessionId: nonempty.optional(),
+        epoch: nonempty,
+        generation,
+      })
+      .strict()
+      .optional(),
+    transfer: z.unknown().optional(),
+    legacyCoverage: z.object({ id: nonempty, generation }).strict().optional(),
+    outcome: z
+      .object({
+        kind: z.enum(['delivered', 'intentionally-suppressed']),
+        decisionId: nonempty,
+        reason: z.string().optional(),
+        deliveryId: nonempty.optional(),
+      })
+      .strict()
+      .optional(),
+    applications: z.array(
+      z
+        .object({
+          transitionId: nonempty,
+          decisionDigest: nonempty,
+          expectedGeneration: generation,
+          resultingGeneration: generation,
+        })
+        .strict(),
+    ),
+  })
+  .strict()
 function parse(value: unknown): BackgroundObligation {
+  backgroundSchema.parse(value)
+  // The shared notice parser below validates the opaque target/principal/transfer fields.
   const row = value as BackgroundObligation
-  if (
-    !row ||
-    row.schemaVersion !== 1 ||
-    !/^[a-f0-9]{64}$/.test(row.obligationId) ||
-    !row.taskId ||
-    !row.parentSessionId ||
-    !row.epoch ||
-    !row.accountIdentity ||
-    !Number.isSafeInteger(row.generation) ||
-    row.generation < 1 ||
-    !Number.isFinite(row.acceptedAt) ||
-    !Array.isArray(row.applications) ||
-    !['accepted', 'result-ready', 'turn-owned', 'notice-prepared', 'notice-owned', 'closed'].includes(row.phase)
-  )
-    throw new Error('Invalid background obligation')
   // Reuse the shared destination/principal validator without creating any send intent.
   createRecoveryNotice({
     target: row.target,
@@ -354,8 +392,24 @@ export class BackgroundObligationStore {
     decision: BackgroundDecision,
     change: (row: Readonly<BackgroundObligation>) => BackgroundObligation,
   ) {
+    return this.applyDecision(ref, decision, change, false)
+  }
+  /** Only journal replay may apply a committed decision while dependent work is frozen. */
+  applyJournalDecision(
+    ref: BackgroundObligationRef,
+    decision: BackgroundDecision,
+    change: (row: Readonly<BackgroundObligation>) => BackgroundObligation,
+  ) {
+    return this.applyDecision(ref, decision, change, true)
+  }
+  private applyDecision(
+    ref: BackgroundObligationRef,
+    decision: BackgroundDecision,
+    change: (row: Readonly<BackgroundObligation>) => BackgroundObligation,
+    journalRepair: boolean,
+  ) {
     return this.serialize(this.path(ref.obligationId), async () => {
-      this.check()
+      if (!journalRepair) this.check()
       const row = await this.read(ref.obligationId)
       if (!row) return undefined
       const receipt = row.applications.find((item) => item.transitionId === decision.transitionId)
@@ -757,3 +811,5 @@ export class BackgroundObligationStore {
     )
   }
 }
+
+export { parse as parseBackgroundObligation }

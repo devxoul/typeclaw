@@ -1,5 +1,5 @@
 import type { GithubReviewOn } from '@/channels/schema'
-import type { InboundMessage } from '@/channels/types'
+import type { InboundMessage, RouteReceipt } from '@/channels/types'
 
 import { describeError } from '../../describe-error'
 import type { GithubAuthContext } from './auth'
@@ -26,7 +26,7 @@ export type ReconcileOpenPrsOptions = {
   selfLogin: string | null
   authType: 'pat' | 'app'
   token: (context?: GithubAuthContext) => Promise<string>
-  route: (message: InboundMessage) => void
+  route: (message: InboundMessage) => Promise<RouteReceipt>
   logger: { info: (m: string) => void; warn: (m: string) => void }
   // Resolves whether the bot is a member of a requested team, gating
   // team-requested reviews under review.on 'review_requested' (mirrors the
@@ -111,7 +111,7 @@ async function reconcileRepo(
         continue
       }
     }
-    options.route(buildSyntheticInbound(pr, target))
+    await options.route(buildSyntheticInbound(pr, target))
     replayed += 1
   }
 
@@ -177,6 +177,8 @@ function buildSyntheticInbound(pr: OpenPr, target: RepoTarget): InboundMessage {
     thread: null,
     text,
     externalMessageId,
+    eventKind: 'pull_request:reconcile',
+    revision: pr.updatedAt,
     authorId: String(pr.authorId),
     authorName: pr.authorLogin,
     authorIsBot: pr.authorIsBot,

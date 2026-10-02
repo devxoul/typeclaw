@@ -14,6 +14,7 @@ import {
 import type { MembershipResolver, MembershipResolverFailure, MembershipResolverResult } from '@/channels/membership'
 import type { ChannelRouter } from '@/channels/router'
 import type { ChannelAdapterConfig } from '@/channels/schema'
+import { fallbackChannelAccountIdentity } from '@/channels/types'
 import type {
   ChannelNameResolver,
   ChannelSelfIdentityResolver,
@@ -27,6 +28,7 @@ import type {
 } from '@/channels/types'
 
 import { describeError } from '../describe-error'
+import { withOutboundAccount } from './outbound-account'
 import { classifyInbound, type InboundDropReason, TELEGRAM_WORKSPACE } from './telegram-bot-classify'
 import { createTelegramEditMessageCallback } from './telegram-bot-edit'
 import { toTelegramMarkdownV2 } from './telegram-bot-format'
@@ -458,11 +460,15 @@ export function createTelegramBotAdapter(options: TelegramBotAdapterOptions): Te
 
   const membershipResolver = createTelegramMembershipResolver({ client, logger })
 
-  const outboundCallback = createOutboundCallback({
-    client,
-    logger,
-    formatChannelTag,
-  })
+  const outboundCallback = withOutboundAccount(
+    createOutboundCallback({
+      client,
+      logger,
+      formatChannelTag,
+    }),
+    (workspace) =>
+      fallbackChannelAccountIdentity('telegram-bot', workspace, botUser === null ? undefined : String(botUser.id)),
+  )
 
   const fetchAttachmentCallback = createFetchAttachmentCallback({ token: options.token, logger })
   const editMessageCallback = createTelegramEditMessageCallback({ client })
@@ -494,7 +500,16 @@ export function createTelegramBotAdapter(options: TelegramBotAdapterOptions): Te
       logger.info(
         `[telegram-bot] routed message_id=${event.message_id} ${tag} mention=${verdict.payload.isBotMention} reply=${verdict.payload.replyToBotMessageId !== null}`,
       )
-      await options.router.route(verdict.payload)
+      await options.router.route({
+        ...verdict.payload,
+        accountIdentity: fallbackChannelAccountIdentity(
+          'telegram-bot',
+          verdict.payload.workspace,
+          botSnapshot === null ? undefined : String(botSnapshot.id),
+        ),
+        eventKind: 'message',
+        revision: 'original',
+      })
     } catch (err) {
       logger.error(`[telegram-bot] handleInbound failed: ${describeError(err)}`)
     } finally {

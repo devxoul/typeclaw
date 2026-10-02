@@ -114,6 +114,96 @@ Adapters own canonical target, emoji, authenticated identity, and own-actor remo
 
 If intent storage fails, the waiting add is skipped. JSON replacement synchronizes the file and parent directory on POSIX. Windows development compatibility keeps file synchronization but explicitly skips unsupported directory synchronization; it does not promise power-loss durability. Other synchronization errors propagate. This assumes one runtime writing an agent directory, not concurrent runtimes or remote-call fencing.
 
+## Durable inbound admission and turn ownership
+
+`src/channels/inbound-journal.ts` is the router's single-writer authority for
+engaged inbound requests and mixed inbound/background decisions. It appends one
+versioned transition per synced line to `channels/inbound-continuity.jsonl`.
+Observe, denied and control traffic creates no response obligation.
+
+`route()` returns an admission receipt: `accepted` with a stable input ID and
+generation, `duplicate` with the original input ID and outcome, or `observed`,
+`denied` or `control`. Acceptance is durable before publication, reactions,
+enqueueing or return. Identity includes the agent directory, authenticated
+account, exact channel key, external message ID, event kind and revision.
+An observed Slack message therefore does not suppress a later mention-adding
+edit, and GitHub review rounds are not collapsed into a generic PR ID.
+
+Queues cache IDs rather than generation snapshots. The target lane resolves
+current ownership and commits a turn claim before splicing, todo updates,
+prompting or tool dispatch. Retries retain their claim; rollover and reload move
+ownership rather than copying or deleting an obligation. A confirmed terminal
+reply or review covers only its captured IDs. Healthy inbound-only `NO_REPLY`
+explicitly records intentional silence; SDK stop, child completion and recovery
+`NO_REPLY` are not delivery or background suppression.
+
+Different authors may share a turn without losing their immutable permission
+principals. Interruption notices partition coverage by account, principal and
+captured parent session; `/stop` can withdraw every partition for that parent.
+Stop partitions active and queued inbound/background coverage by authenticated
+account before committing suppression, so a rotated account's queued request
+cannot invalidate withdrawal of the old account's active request.
+An account replacement does not inherit the old actor's accepted work: mismatched
+coverage transfers under its original identity, while compatible new input can
+continue. Replies and formal reviews retain the captured account fence through
+the selected sender rather than trusting a replacement adapter's credentials.
+The router captures the teardown generation before asynchronous journal and
+account checks; an inbound invalidated by teardown cannot install a later session.
+
+Mixed transitions validate complete coverage inside the target lane and follow
+this order:
+
+| Decision                       | Durable order before cache/dispatch changes                                                                    |
+| ------------------------------ | -------------------------------------------------------------------------------------------------------------- |
+| Claim or ownership move        | Journal decision → background JSON applications with matching generation/digest receipts → journal all-applied |
+| Reply, review, skip or `/stop` | Journal outcome → idempotent background settlement/receipts → all-applied → clear/abort                        |
+| Interruption transfer          | Journal preparation → required JSON applications/receipts → all-applied → outbox import → source ownership     |
+| Confirmed interruption         | Outbox receipt → journal source closure and required JSON applications → all-applied                           |
+
+Boot folds and repairs committed mixed decisions before transferring older-epoch
+admitted or claimed requests to the fixed-notice outbox. It never reopens a
+transcript to re-prompt interrupted work. Losing a reload handoff also transfers
+the obligation rather than erasing it.
+
+### Storage failure and operator recovery
+
+Write or sync failure rejects admission visibly and synchronously cancels active
+channel SDK loops, preventing new tool dispatch and follow-up provider requests;
+an already-running side effect cannot be recalled. Memory cannot authorize
+progress. Journal corruption freezes all
+background obligations and any background/inbound-covered outbox record because
+an unapplied mixed decision may have left no hint in child JSON. A valid-looking
+record, different target or absent receipt is not proof of independence.
+Verified inventory-only notices with entirely JSON provenance may still progress.
+`/stop` still aborts a live parent when durable withdrawal fails; unresolved
+coverage remains owed for conservative recovery.
+The dispatch fence rechecks stop intent after asynchronous account validation
+and before every provider attempt, so a stopped batch cannot start behind the
+abort. Failed bootstrap cleanup releases the journal writer before a later boot.
+
+Router shutdown cancels unfinished journal initialization before asynchronous
+teardown. Canceled startup releases writer ownership without reopening a removed
+state directory or reporting a continuity failure. An already-initialized journal
+remains writable for durable teardown decisions until its final close.
+
+An incomplete final line is truncated and synced through a non-append repair
+handle before opening the append writer, including on Windows.
+A complete malformed line, unknown schema version, invalid generation or
+mid-file corruption preserves the bytes and reports a recovery error instead
+of dispatching. Operators must stop the runtime, preserve a copy of the journal
+and related JSON, repair or restore the authoritative journal, then restart.
+Deleting the journal or the child JSON is not a safe repair: it can erase a
+committed cancellation or authorize duplicate work.
+
+Compaction serializes with writes, syncs a same-directory snapshot containing
+tombstones, generations and pending decisions/transfer receipts, closes the
+old handle before replacement, syncs the directory and reopens before resuming.
+Without a proven upstream replay/checkpoint floor covering revisions, minimal
+dedupe tombstones are retained indefinitely; unresolved obligations never
+expire. POSIX file/directory sync fences process death. Windows closes handles
+before replacement but cannot promise the same directory-sync power-loss
+durability.
+
 ## Background work across runtime death
 
 `src/channels/background-obligations.ts` stores one durable owed-response record per direct background task launched by a channel-origin parent. The router accepts the response before execution; a failed acceptance prevents the child from starting. The record captures the original exact channel target, permission principal and cached authenticated account identity. Transcript filenames are optional metadata. TUI, cron, foreground children and nested descendants do not get separate background-response records.
@@ -154,7 +244,7 @@ The locale, template version and text are frozen at transfer preparation. This s
 
 ### Recovery boundary
 
-- **Background-work guarantee:** unless explicitly cancelled or intentionally suppressed, a durably accepted channel-background request interrupted by process death eventually receives an answer or interruption notice once the runtime and authorized destination are available again. Ordinary queued or first-turn human input is not yet durably admitted; the broader inbound guarantee belongs to the later journal stage.
+- **Inbound and background guarantee:** unless explicitly cancelled or intentionally suppressed, a durably accepted channel request interrupted by process death eventually receives an answer or interruption notice once the runtime and authorized destination are available again. This starts at the durable admission boundary, not at upstream delivery or the first transcript entry.
 - Healthy terminal replies and reviews close their exact result coverage without an extra interruption notice. A remote reply or review that landed before a settlement-write failure remains ambiguous: the obligation stays owed, and a later notice may accompany that answer. This never authorizes repeating the reply, review or logical turn. Notices contain no request content, names, transcript or provider errors, and interrupted work is never automatically replayed.
 - Delivery is **at least once**, not exactly once. Death after a remote POST succeeds but before the local receipt is synced is ambiguous. Supported adapters reconcile the stable correlation marker against paginated history from their own authenticated actor at the exact target; a read failure or first-page miss is not proof of absence. Unknown or unsupported reconciliation eventually retries, accepting a possible duplicate notice. No ambiguous remote success authorizes replay of a reply, review or logical turn.
 - Inventories written before this version, and new admissions whose cached identity was unavailable, use an unbound marker. The first authorized attempt durably binds the authenticated actor serving the original exact adapter/workspace under its lease before sending. Slack direct-message coordinates use a workspace sentinel, while account identity still uses the authenticated team/user. A later identity change blocks delivery. An unbound record cannot prove that the posting identity stayed unchanged between death and reboot.

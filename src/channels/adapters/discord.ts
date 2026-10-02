@@ -22,6 +22,7 @@ import type { MembershipResolver, MembershipResolverResult } from '@/channels/me
 import { deriveMembershipFromHistory } from '@/channels/membership-from-history'
 import type { ChannelRouter } from '@/channels/router'
 import type { ChannelAdapterConfig } from '@/channels/schema'
+import { fallbackChannelAccountIdentity } from '@/channels/types'
 import type {
   ChannelHistoryMessage,
   ChannelSelfIdentityResolver,
@@ -49,6 +50,7 @@ import {
 import { createDiscordUserEditMessageCallback } from './discord-edit'
 import { createDiscordReactionCallback, createDiscordRemoveReactionCallback } from './discord-reactions'
 import { createDiscordOwnReactionCallbacks } from './discord-reactions'
+import { withOutboundAccount } from './outbound-account'
 
 export type DiscordAdapterLogger = {
   info: (msg: string) => void
@@ -309,13 +311,16 @@ export function createDiscordAdapter(options: DiscordAdapterOptions): DiscordAda
   }
   const historyCallback = createDiscordHistoryCallback({ client, logger })
   const membershipResolver = createDiscordMembershipResolver({ historyCallback })
-  const outboundCallback = createDiscordOutboundCallback({
-    client,
-    logger,
-    formatChannelTag,
-    tokenRef: () => token,
-    fetchImpl: options.fetchImpl,
-  })
+  const outboundCallback = withOutboundAccount(
+    createDiscordOutboundCallback({
+      client,
+      logger,
+      formatChannelTag,
+      tokenRef: () => token,
+      fetchImpl: options.fetchImpl,
+    }),
+    (workspace) => fallbackChannelAccountIdentity('discord', workspace, selfUserId),
+  )
   const fetchAttachmentCallback = createDiscordFetchAttachmentCallback({
     tokenRef: () => token,
     fetchImpl: options.fetchImpl,
@@ -327,10 +332,11 @@ export function createDiscordAdapter(options: DiscordAdapterOptions): DiscordAda
   const editMessageCallback = createDiscordUserEditMessageCallback({ client })
 
   const handleMessage = async (event: DiscordGatewayMessageCreateEvent): Promise<void> => {
+    const inboundSelfId = selfUserId
     inflightInbounds++
     try {
       const verdict = classifyInbound(event, options.configRef(), {
-        selfUserId,
+        selfUserId: inboundSelfId,
         selfAliases: options.selfAliasesRef?.() ?? [],
       })
       const tag =
@@ -357,7 +363,12 @@ export function createDiscordAdapter(options: DiscordAdapterOptions): DiscordAda
         ...(attachments.length > 0 ? { attachments } : {}),
       }
       logger.info(`[discord] routed id=${event.id} ${tag} mention=${payload.isBotMention}`)
-      await options.router.route(payload)
+      await options.router.route({
+        ...payload,
+        accountIdentity: fallbackChannelAccountIdentity('discord', payload.workspace, inboundSelfId),
+        eventKind: 'message',
+        revision: 'original',
+      })
     } catch (err) {
       logger.error(`[discord] handleInbound failed: ${describeError(err)}`)
     } finally {

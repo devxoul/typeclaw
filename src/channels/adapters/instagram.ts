@@ -8,6 +8,7 @@ import type { InstagramChatSummary, InstagramMessageSummary } from 'agent-messen
 
 import type { ChannelRouter } from '@/channels/router'
 import type { ChannelAdapterConfig } from '@/channels/schema'
+import { fallbackChannelAccountIdentity } from '@/channels/types'
 import type {
   ChannelSelfIdentityResolver,
   ChannelHistoryMessage,
@@ -25,6 +26,7 @@ import { createInstagramChannelResolver } from './instagram-channel-resolver'
 import { classifyInbound } from './instagram-classify'
 import { loadInstagramContinuityStore, type InstagramContinuityStore } from './instagram-continuity-store'
 import { toInstagramPlainText } from './instagram-format'
+import { withOutboundAccount } from './outbound-account'
 
 export interface InstagramClientShape {
   login(credentials?: { username: string; password: string }, accountId?: string): Promise<this>
@@ -201,9 +203,12 @@ export function createInstagramAdapter(options: InstagramAdapterOptions): Instag
   }
 
   const historyCallback = createInstagramHistoryCallback({ client, logger, selfUserIdRef: () => selfUserId })
-  const outboundCallback = createOutboundCallback({ client, logger, formatChannelTag })
+  const outboundCallback = withOutboundAccount(
+    createOutboundCallback({ client, logger, formatChannelTag }),
+    (workspace) => fallbackChannelAccountIdentity('instagram', workspace, selfUserId),
+  )
 
-  const processInbound = async (message: InstagramMessageSummary): Promise<boolean> => {
+  const processInbound = async (message: InstagramMessageSummary, inboundSelfId: string | null): Promise<boolean> => {
     inflightInbounds++
     try {
       if (channelResolver.lookupChat(message.thread_id) === null) {
@@ -223,7 +228,7 @@ export function createInstagramAdapter(options: InstagramAdapterOptions): Instag
       )
 
       const verdict = classifyInbound(message, options.configRef(), {
-        selfUserId,
+        selfUserId: inboundSelfId,
         lookupChat: (id) => channelResolver.lookupChat(id),
         ...(options.selfAliasesRef ? { selfAliases: options.selfAliasesRef() } : {}),
       })
@@ -235,8 +240,19 @@ export function createInstagramAdapter(options: InstagramAdapterOptions): Instag
       logger.info(
         `[instagram] routed message_id=${message.id} ${inboundTag} mention=${verdict.payload.isBotMention} dm=${verdict.payload.isDm}`,
       )
-      await options.router.route(verdict.payload)
-      return true
+      const receipt = await options.router.route({
+        ...verdict.payload,
+        accountIdentity: fallbackChannelAccountIdentity('instagram', verdict.payload.workspace, inboundSelfId),
+        eventKind: 'message',
+        revision: 'original',
+      })
+      return (
+        receipt.kind === 'accepted' ||
+        receipt.kind === 'duplicate' ||
+        receipt.kind === 'observed' ||
+        receipt.kind === 'denied' ||
+        receipt.kind === 'control'
+      )
     } catch (err) {
       logger.error(`[instagram] handleInbound failed: ${describeError(err)}`)
       return false
@@ -250,23 +266,21 @@ export function createInstagramAdapter(options: InstagramAdapterOptions): Instag
     }
   }
 
-  const markDelivered = async (message: InstagramMessageSummary): Promise<void> => {
-    if (continuityStore === null || selfUserId === null) return
-    await continuityStore.markMessage(selfUserId, message.thread_id, message.id)
-  }
-
   const deliverUnseen = async (message: InstagramMessageSummary): Promise<boolean> => {
+    const accountId = selfUserId
     if (
       continuityStore !== null &&
-      selfUserId !== null &&
-      continuityStore.hasMessage(selfUserId, message.thread_id, message.id)
+      accountId !== null &&
+      continuityStore.hasMessage(accountId, message.thread_id, message.id)
     ) {
       return true
     }
-    if (!(await processInbound(message))) return false
+    if (!(await processInbound(message, accountId))) return false
     // Checkpoint only after the router accepts the message. A crash can replay
     // once, but persisting first would silently lose a message when routing fails.
-    await markDelivered(message)
+    if (continuityStore !== null && accountId !== null) {
+      await continuityStore.markMessage(accountId, message.thread_id, message.id)
+    }
     return true
   }
 

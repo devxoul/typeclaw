@@ -334,6 +334,7 @@ export function dumpTurnPromptWithBreakdown(kind: OriginKind): DumpResult {
   ]
   const batch = [
     {
+      inputId: 'system-prompt-preview',
       text: PLACEHOLDER_TURN_TEXT.channel,
       authorId: 'U<PLACEHOLDER-AUTHOR>',
       authorName: '<PLACEHOLDER: current speaker name>',

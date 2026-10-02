@@ -42,6 +42,10 @@ const submissionAttempts = new Map<string, ReviewSubmissionAttempt>()
 const pendingCommentOutput = new Map<string, DetectedReviewOutput>()
 const pendingCoverage = new Map<string, ReviewResultCoverage>()
 
+export function capturedReviewAccountIdentity(callId: string): string | undefined {
+  return pendingCoverage.get(callId)?.expectedAccountIdentity
+}
+
 export function discardReviewCommand(callId: string): void {
   pending.delete(callId)
   pendingCommentOutput.delete(callId)

@@ -3,6 +3,23 @@ import { describe, expect, it } from 'bun:test'
 import { createGithubTokenBridge } from './github-token-bridge'
 
 describe('createGithubTokenBridge', () => {
+  it('in-flight resolver rotation preserves the credential actor pair', async () => {
+    const bridge = createGithubTokenBridge()
+    const release = Promise.withResolvers<void>()
+    bridge.registerResolver(async () => {
+      await release.promise
+      return { token: 'ghs_A', accountIdentity: 'github:1' }
+    })
+    const pending = bridge.resolveTokenForRepo('acme/widgets')
+    bridge.registerResolver(async () => ({ token: 'ghs_B', accountIdentity: 'github:2' }))
+    release.resolve()
+    expect(await pending).toEqual({ kind: 'token', token: 'ghs_A', accountIdentity: 'github:1' })
+    expect(await bridge.resolveTokenForRepo('acme/widgets')).toEqual({
+      kind: 'token',
+      token: 'ghs_B',
+      accountIdentity: 'github:2',
+    })
+  })
   it('returns unavailable when no resolver is registered', async () => {
     const bridge = createGithubTokenBridge()
 
@@ -10,15 +27,6 @@ describe('createGithubTokenBridge', () => {
 
     expect(result.kind).toBe('unavailable')
     if (result.kind === 'unavailable') expect(result.reason).toContain('not running')
-  })
-
-  it('returns the minted token when a resolver is registered', async () => {
-    const bridge = createGithubTokenBridge()
-    bridge.registerResolver(async (repoSlug) => `ghs_token_for_${repoSlug}`)
-
-    const result = await bridge.resolveTokenForRepo('acme/widgets')
-
-    expect(result).toEqual({ kind: 'token', token: 'ghs_token_for_acme/widgets' })
   })
 
   it('surfaces a throwing resolver as unavailable instead of crashing', async () => {
@@ -34,7 +42,7 @@ describe('createGithubTokenBridge', () => {
 
   it('unregister restores the unavailable state', async () => {
     const bridge = createGithubTokenBridge()
-    const unregister = bridge.registerResolver(async () => 'ghs_x')
+    const unregister = bridge.registerResolver(async () => ({ token: 'ghs_x' }))
 
     unregister()
     const result = await bridge.resolveTokenForRepo('acme/widgets')
@@ -44,8 +52,8 @@ describe('createGithubTokenBridge', () => {
 
   it('a later register replaces the current resolver', async () => {
     const bridge = createGithubTokenBridge()
-    bridge.registerResolver(async () => 'ghs_first')
-    bridge.registerResolver(async () => 'ghs_second')
+    bridge.registerResolver(async () => ({ token: 'ghs_first' }))
+    bridge.registerResolver(async () => ({ token: 'ghs_second' }))
 
     const result = await bridge.resolveTokenForRepo('acme/widgets')
 
@@ -54,8 +62,8 @@ describe('createGithubTokenBridge', () => {
 
   it('stale unregister does not wipe a newer resolver', async () => {
     const bridge = createGithubTokenBridge()
-    const unregisterFirst = bridge.registerResolver(async () => 'ghs_first')
-    bridge.registerResolver(async () => 'ghs_second')
+    const unregisterFirst = bridge.registerResolver(async () => ({ token: 'ghs_first' }))
+    bridge.registerResolver(async () => ({ token: 'ghs_second' }))
 
     unregisterFirst()
     const result = await bridge.resolveTokenForRepo('acme/widgets')
@@ -67,7 +75,7 @@ describe('createGithubTokenBridge', () => {
     const bridge = createGithubTokenBridge()
     expect(bridge.hasAppTokenResolver()).toBe(false)
 
-    const unregister = bridge.registerResolver(async () => 'ghs_x')
+    const unregister = bridge.registerResolver(async () => ({ token: 'ghs_x' }))
     expect(bridge.hasAppTokenResolver()).toBe(true)
 
     unregister()
@@ -77,7 +85,7 @@ describe('createGithubTokenBridge', () => {
   it('carries adapter-resolved self login with the active App resolver', () => {
     const bridge = createGithubTokenBridge()
     const unregister = bridge.registerResolver(
-      async () => 'ghs_x',
+      async () => ({ token: 'ghs_x' }),
       () => 'typeclaw[bot]',
     )
 

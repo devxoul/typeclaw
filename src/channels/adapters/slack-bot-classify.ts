@@ -7,6 +7,7 @@ import type { InboundAttachment, InboundMessage } from '@/channels/types'
 import { encodeSlackReactionRef } from './slack-bot-reactions'
 import { hasSlackMessageShareAttachments } from './slack-bot-reference'
 import { slackTsToMillis } from './slack-bot-time'
+import { normalizeSlackInbound, slackInboundRevision } from './slack-inbound-revision'
 
 export type SlackInboundMessageEvent = SlackSocketModeMessageEvent
 export type SlackInboundAppMentionEvent = SlackSocketModeAppMentionEvent
@@ -47,6 +48,7 @@ export function classifyInbound(
   _config: ChannelAdapterConfig,
   context: SlackInboundContext,
 ): InboundClassification {
+  event = normalizeSlackInbound(event)
   // Self-drop is the hard floor: never route our own messages back to
   // ourselves. The check requires `botUserId` (post-auth.test); before that,
   // fail closed below because mention, reply, and self classification all
@@ -148,6 +150,9 @@ export function classifyInbound(
       text,
       ...(attachments.length > 0 ? { attachments } : {}),
       externalMessageId: event.ts,
+      accountIdentity: `slack-bot:${context.teamId}:${context.botUserId}`,
+      eventKind: 'message',
+      revision: slackInboundRevision(event),
       reactionRef: encodeSlackReactionRef({ channel: event.channel, ts: event.ts }),
       authorId: event.user,
       authorName: event.user,

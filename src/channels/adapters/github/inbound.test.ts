@@ -1,7 +1,11 @@
 import { describe, expect, it } from 'bun:test'
 import { createHmac } from 'node:crypto'
+import { mkdtemp, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
 import { __resetReviewVerdictGuardForTest } from '@/channels/github-review-verdict-coordinator'
+import { InboundJournal } from '@/channels/inbound-journal'
 import { DEFAULT_GITHUB_EVENT_ALLOWLIST } from '@/channels/schema'
 import type { InboundMessage } from '@/channels/types'
 
@@ -30,6 +34,35 @@ describe('verifySignature', () => {
 })
 
 describe('classifyGithubInbound', () => {
+  it('keeps edited comments and review requests on different commits distinct', () => {
+    const original = issueCommentPayload({ pullRequest: true, body: '@typeclaw-bot 확인해줘' })
+    const edited = {
+      ...original,
+      action: 'edited',
+      comment: { ...(original.comment as Record<string, unknown>), updated_at: '2026-01-02T00:00:00Z' },
+    }
+    const before = classifyGithubInbound('issue_comment', original, 'typeclaw-bot')
+    const after = classifyGithubInbound('issue_comment', edited, 'typeclaw-bot')
+    expect(after?.externalMessageId).toBe(before?.externalMessageId)
+    expect(after?.eventKind).not.toBe(before?.eventKind)
+    expect(after?.revision).not.toBe(before?.revision)
+    const request = reviewRequestedPayload({ reviewerLogin: 'typeclaw-bot' })
+    const pr = request.pull_request as Record<string, unknown>
+    const first = classifyGithubInbound(
+      'pull_request',
+      { ...request, pull_request: { ...pr, head: { sha: 'commit-a' } } },
+      'typeclaw-bot',
+    )
+    const second = classifyGithubInbound(
+      'pull_request',
+      { ...request, pull_request: { ...pr, head: { sha: 'commit-b' } } },
+      'typeclaw-bot',
+    )
+    expect(first?.isBotMention).toBe(true)
+    expect(second?.isBotMention).toBe(true)
+    expect(second?.revision).not.toBe(first?.revision)
+  })
+
   it('classifies issue comments on pull requests as PR chats', () => {
     const msg = classifyGithubInbound('issue_comment', issueCommentPayload({ pullRequest: true }), 'typeclaw-bot')
     expect(msg?.workspace).toBe('acme/project')
@@ -918,8 +951,9 @@ describe('createGithubWebhookHandler — review.on wiring', () => {
     selfId: () => '99',
     selfLogin: () => 'typeclaw-bot',
     logger,
-    route: (msg: InboundMessage) => {
+    route: async (msg: InboundMessage) => {
       routed.push(msg)
+      return { kind: 'observed' as const }
     },
     ...(reviewOn !== undefined ? { reviewOn } : {}),
   })
@@ -978,8 +1012,9 @@ describe('createGithubWebhookHandler — pull_request.opened lands as context', 
       selfLogin: () => 'typeclaw-bot',
       authType: () => 'app',
       logger,
-      route: (msg) => {
+      route: async (msg) => {
         routed.push(msg)
+        return { kind: 'observed' as const }
       },
     })
 
@@ -999,8 +1034,9 @@ describe('createGithubWebhookHandler — pull_request.opened lands as context', 
       selfLogin: () => 'typeclaw-bot',
       authType: () => 'pat',
       logger,
-      route: (msg) => {
+      route: async (msg) => {
         routed.push(msg)
+        return { kind: 'observed' as const }
       },
     })
 
@@ -1026,8 +1062,9 @@ describe('createGithubWebhookHandler — review_requested team gating', () => {
         return true
       },
       logger,
-      route: (msg) => {
+      route: async (msg) => {
         routed.push(msg)
+        return { kind: 'observed' as const }
       },
     })
 
@@ -1049,8 +1086,9 @@ describe('createGithubWebhookHandler — review_requested team gating', () => {
       selfLogin: () => 'typeclaw-bot',
       isBotInTeam: async () => false,
       logger,
-      route: (msg) => {
+      route: async (msg) => {
         routed.push(msg)
+        return { kind: 'observed' as const }
       },
     })
 
@@ -1070,8 +1108,9 @@ describe('createGithubWebhookHandler — review_requested team gating', () => {
         throw new Error('boom')
       },
       logger,
-      route: (msg) => {
+      route: async (msg) => {
         routed.push(msg)
+        return { kind: 'observed' as const }
       },
     })
 
@@ -1091,9 +1130,10 @@ describe('createGithubWebhookHandler', () => {
       selfId: () => '99',
       selfLogin: () => 'typeclaw-bot',
       logger,
-      route: (msg) => {
+      route: async (msg) => {
         routed.push(msg)
-        void routeWait.promise
+        await routeWait.promise
+        return { kind: 'observed' as const }
       },
     })
 
@@ -1114,8 +1154,9 @@ describe('createGithubWebhookHandler', () => {
       selfId: () => '99',
       selfLogin: () => 'typeclaw-bot',
       logger,
-      route: () => {
+      route: async () => {
         count++
+        return { kind: 'observed' as const }
       },
     })
     const body = JSON.stringify(issueCommentPayload({ pullRequest: false }))
@@ -1135,8 +1176,9 @@ describe('createGithubWebhookHandler', () => {
       selfId: () => '99',
       selfLogin: () => 'typeclaw-bot',
       logger,
-      route: () => {
+      route: async () => {
         count++
+        return { kind: 'observed' as const }
       },
     }
     const payload = issueCommentPayload({ pullRequest: false }) as Record<string, unknown>
@@ -1186,8 +1228,9 @@ describe('createGithubWebhookHandler — pull_request.converted_to_draft control
         input.tasks.push(task)
       },
       logger: { info: (message) => input.info?.push(message), warn: () => {}, error: () => {} },
-      route: (message) => {
+      route: async (message) => {
         input.routed.push(message)
+        return { kind: 'observed' as const }
       },
     })
   }
@@ -1273,7 +1316,7 @@ describe('createGithubWebhookHandler — pull_request.converted_to_draft control
       },
       scheduleBackgroundTask: (task) => tasks.push(task),
       logger,
-      route: () => {},
+      route: async () => ({ kind: 'observed' }),
     })
 
     await handler(
@@ -1316,7 +1359,7 @@ describe('createGithubWebhookHandler — pull_request.converted_to_draft control
       selfLogin: () => 'typeclaw-bot',
       scheduleBackgroundTask: (task) => tasks.push(task),
       logger: { info: (message) => info.push(message), warn: () => {}, error: () => {} },
-      route: () => {},
+      route: async () => ({ kind: 'observed' }),
     })
 
     await handler(signedRequest(JSON.stringify(convertedToDraftPayload()), 'pull_request', 'draft-unwired'))
@@ -1347,8 +1390,9 @@ describe('createGithubWebhookHandler — review comment parent lookup', () => {
         return new Response(JSON.stringify({ id: 101, user: parentUser }), { status: 200 })
       }),
       logger,
-      route: (msg) => {
+      route: async (msg) => {
         routed.push(msg)
+        return { kind: 'observed' as const }
       },
     })
   }
@@ -1402,7 +1446,10 @@ describe('createGithubWebhookHandler — reply review rounds', () => {
       generateReviewRoundId: input.generateReviewRoundId,
       now: input.now,
       logger,
-      route: (message) => input.routed.push(message),
+      route: async (message) => {
+        input.routed.push(message)
+        return { kind: 'observed' as const }
+      },
     })
   }
 
@@ -1642,8 +1689,9 @@ describe('createGithubWebhookHandler — self-author drop', () => {
       selfId: () => overrides.selfId ?? '99',
       selfLogin: () => overrides.selfLogin ?? 'typeclaw-bot',
       logger,
-      route: (msg) => {
+      route: async (msg) => {
         routed.push(msg)
+        return { kind: 'observed' as const }
       },
     })
   }
@@ -1765,8 +1813,9 @@ describe('createGithubWebhookHandler — self-author drop', () => {
       selfId: () => '99',
       selfLogin: () => 'typeclaw-bot',
       logger: { ...logger, info: (m) => drops.push(m) },
-      route: (msg) => {
+      route: async (msg) => {
         routedSink.push(msg)
+        return { kind: 'observed' as const }
       },
     })
     const routedSink: InboundMessage[] = []
@@ -1790,8 +1839,9 @@ describe('createGithubWebhookHandler — self-author drop', () => {
       selfId: () => '99',
       selfLogin: () => 'typeclaw-bot',
       logger: { ...logger, info: (m) => drops.push(m) },
-      route: (msg) => {
+      route: async (msg) => {
         routedSink.push(msg)
+        return { kind: 'observed' as const }
       },
     })
     const payload = {
@@ -1917,7 +1967,7 @@ describe('decoy reviewer drop on self-review', () => {
         warn: (m) => overrides.warns?.push(m),
         error: () => {},
       },
-      route: () => {},
+      route: async () => ({ kind: 'observed' }),
     })
     return { handler, tasks, drops }
   }
@@ -1972,7 +2022,7 @@ describe('decoy reviewer drop on self-review', () => {
         tasks.push(task)
       },
       logger,
-      route: () => {},
+      route: async () => ({ kind: 'observed' }),
     })
     const payload = {
       action: 'created',
@@ -2110,6 +2160,8 @@ describe('createGithubWebhookHandler — pull_request.synchronize recheck', () =
     reviewOn?: 'review_requested' | 'opened' | 'off'
     sleepImpl?: GithubWebhookHandlerOptions['sleepImpl']
     allowApprove?: boolean
+    route?: GithubWebhookHandlerOptions['route']
+    generateReviewRoundId?: () => string
   }) {
     return createGithubWebhookHandler({
       webhookSecret: 'secret',
@@ -2121,16 +2173,18 @@ describe('createGithubWebhookHandler — pull_request.synchronize recheck', () =
       ...(input.allowApprove !== undefined ? { allowApprove: () => input.allowApprove! } : {}),
       ...(input.reviewOn !== undefined ? { reviewOn: () => input.reviewOn! } : {}),
       authToken: input.authToken ?? (async () => 'tok'),
-      generateReviewRoundId: () => 'round-id',
+      generateReviewRoundId: input.generateReviewRoundId ?? (() => 'round-id'),
       fetchImpl: input.fetchImpl,
       scheduleBackgroundTask: (task) => {
         input.tasks.push(task)
       },
       sleepImpl: input.sleepImpl ?? (async () => {}),
       logger: { info: () => {}, warn: (m) => input.warns?.push(m), error: () => {} },
-      route: (msg) => {
+      route: async (msg) => {
         input.routed.push(msg)
+        return { kind: 'observed' as const }
       },
+      ...(input.route ? { route: input.route } : {}),
     })
   }
 
@@ -2149,6 +2203,77 @@ describe('createGithubWebhookHandler — pull_request.synchronize recheck', () =
       sender: { login: 'alice', id: 10, type: 'User' },
     }
   }
+
+  it('deduplicates partial followup retries and reboot redelivery while admitting a new commit', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'github-followup-journal-'))
+    let journal = new InboundJournal(dir, { epoch: 'one' })
+    const receipts: string[] = []
+    let failSecond = true
+    let round = 0
+    const tasks: Array<() => Promise<void>> = []
+    const route: GithubWebhookHandlerOptions['route'] = async (message) => {
+      if (message.thread === '200' && failSecond) {
+        failSecond = false
+        throw new Error('admission interrupted')
+      }
+      const target = {
+        adapter: message.adapter,
+        workspace: message.workspace,
+        chat: message.chat,
+        thread: message.thread,
+      }
+      const receipt = await journal.admit({
+        target,
+        principal: {
+          kind: 'channel',
+          adapter: message.adapter,
+          workspace: message.workspace,
+          chat: message.chat,
+          lastInboundAuthorId: message.authorId,
+        },
+        accountIdentity: 'github:99',
+        messageId: message.externalMessageId,
+        eventKind: message.eventKind!,
+        revision: message.revision!,
+      })
+      receipts.push(`${message.thread}:${receipt.kind}`)
+      return receipt.kind === 'accepted'
+        ? receipt
+        : { kind: 'duplicate', inputId: receipt.inputId, outcome: receipt.outcome?.kind }
+    }
+    const makeHandler = () =>
+      recheckHandler({
+        routed: [],
+        tasks,
+        route,
+        generateReviewRoundId: () => `ephemeral-round-${++round}`,
+        fetchImpl: followupFetch({
+          threads: [
+            { id: 'T1', isResolved: false, rootCommentId: 100, login: 'typeclaw-bot' },
+            { id: 'T2', isResolved: false, rootCommentId: 200, login: 'typeclaw-bot' },
+          ],
+          reviews: [{ state: 'CHANGES_REQUESTED' }],
+        }),
+      })
+    try {
+      const payload = JSON.stringify(synchronizePayload('commit-one'))
+      await makeHandler()(signedRequest(payload, 'pull_request', 'same-delivery'))
+      await tasks.shift()?.()
+      expect(receipts).toEqual(['100:accepted', '100:duplicate', '200:accepted'])
+      await journal.close()
+      journal = new InboundJournal(dir, { epoch: 'two' })
+      const rebooted = makeHandler()
+      await rebooted(signedRequest(payload, 'pull_request', 'same-delivery'))
+      await tasks.shift()?.()
+      expect(receipts.slice(-2)).toEqual(['100:duplicate', '200:duplicate'])
+      await rebooted(signedRequest(JSON.stringify(synchronizePayload('commit-two')), 'pull_request', 'new-delivery'))
+      await tasks.shift()?.()
+      expect(receipts.slice(-2)).toEqual(['100:accepted', '200:accepted'])
+    } finally {
+      await journal.close()
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
 
   it('does not route when the PR has no bot-authored unresolved threads', async () => {
     const routed: InboundMessage[] = []
@@ -2244,8 +2369,9 @@ describe('createGithubWebhookHandler — pull_request.synchronize recheck', () =
         tasks.push(task)
       },
       logger,
-      route: (msg) => {
+      route: async (msg) => {
         routed.push(msg)
+        return { kind: 'observed' as const }
       },
     })
 
@@ -2272,8 +2398,9 @@ describe('createGithubWebhookHandler — pull_request.synchronize recheck', () =
         tasks.push(task)
       },
       logger,
-      route: (msg) => {
+      route: async (msg) => {
         routed.push(msg)
+        return { kind: 'observed' as const }
       },
     })
 
@@ -2519,8 +2646,9 @@ describe('createGithubWebhookHandler — pull_request.synchronize recheck', () =
         tasks.push(task)
       },
       logger,
-      route: (msg) => {
+      route: async (msg) => {
         routed.push(msg)
+        return { kind: 'observed' as const }
       },
     })
 
@@ -2567,8 +2695,9 @@ describe('createGithubWebhookHandler — pull_request.synchronize recheck', () =
         tasks.push(task)
       },
       logger,
-      route: (msg) => {
+      route: async (msg) => {
         routed.push(msg)
+        return { kind: 'observed' as const }
       },
     })
 
@@ -2600,8 +2729,9 @@ describe('createGithubWebhookHandler — pull_request.synchronize recheck', () =
         tasks.push(task)
       },
       logger,
-      route: (msg) => {
+      route: async (msg) => {
         routed.push(msg)
+        return { kind: 'observed' as const }
       },
     })
 
@@ -2702,8 +2832,9 @@ describe('createGithubWebhookHandler — allowApprove policy note', () => {
     selfId: () => '99',
     selfLogin: () => 'typeclaw-bot',
     logger,
-    route: (msg) => {
+    route: async (msg) => {
       routed.push(msg)
+      return { kind: 'observed' as const }
     },
     ...(allowApprove !== undefined ? { allowApprove } : {}),
   })

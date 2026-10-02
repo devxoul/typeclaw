@@ -40,6 +40,7 @@ import {
   recordVerifiedDismissal,
   setReviewObserver,
 } from '@/channels/github-review-turn-ledger'
+import { RecoveryOutbox } from '@/channels/recovery-outbox'
 import type { PermissionService } from '@/permissions'
 import type { HookBus, SessionIdleEvent } from '@/plugin'
 import { waitFor } from '@/test-helpers/wait-for'
@@ -57,6 +58,7 @@ import {
   releaseGithubReviewRoundDismissal,
   REVIEW_ROUND_TTL_MS,
 } from './github-review-verdict-coordinator'
+import { InboundJournal } from './inbound-journal'
 import type { ChannelSessionRecord } from './persistence'
 import { channelsSessionsPath, loadChannelSessions, saveChannelSessions } from './persistence'
 import type { CreateChannelRouterOptions } from './router'
@@ -120,6 +122,7 @@ import type {
   ReactionRef,
   SendResult,
 } from './types'
+import { fallbackChannelAccountIdentity } from './types'
 
 class FakeSession {
   public prompts: string[] = []
@@ -608,6 +611,7 @@ function makeRouter(
 const FIXED_INBOUND_TS = Date.parse('2024-06-15T12:34:56.000Z')
 const FIXED_INBOUND_ISO = '2024-06-15T12:34:56.000Z'
 
+let inboundSequence = 0
 function inbound(over: Partial<InboundMessage> = {}): InboundMessage {
   return {
     adapter: 'discord-bot',
@@ -615,7 +619,8 @@ function inbound(over: Partial<InboundMessage> = {}): InboundMessage {
     chat: 'c1',
     thread: null,
     text: 'hello',
-    externalMessageId: 'm1',
+    externalMessageId: `fixture-${++inboundSequence}`,
+    accountIdentity: 'proof-account',
     authorId: 'alice',
     authorName: 'alice',
     authorIsBot: false,
@@ -626,6 +631,14 @@ function inbound(over: Partial<InboundMessage> = {}): InboundMessage {
     isDm: false,
     ts: FIXED_INBOUND_TS,
     ...over,
+  }
+}
+
+function inboundForSelf(userId: string, over: Partial<InboundMessage> = {}): InboundMessage {
+  const event = inbound(over)
+  return {
+    ...event,
+    accountIdentity: fallbackChannelAccountIdentity(event.adapter, event.workspace, userId),
   }
 }
 
@@ -721,7 +734,7 @@ describe('ChannelRouter session lifecycle', () => {
     const { router, origins } = makeRouter(dir)
     router.registerSelfIdentity('discord-bot', () => ({ id: 'BOT_SELF_ID' }))
 
-    await router.route(inbound())
+    await router.route(inboundForSelf('BOT_SELF_ID'))
     await router.__testing!.flushDebounce(KEY)
 
     const channelOrigin = origins.find((o) => o.kind === 'channel')
@@ -1409,7 +1422,7 @@ describe('ChannelRouter session lifecycle', () => {
     expect(sessions[1]!.prompts.join('\n').match(/queued once/g)).toHaveLength(1)
   })
 
-  test('expired reload handoff reports the loss and recovery path to the channel and operator log', async () => {
+  test('expired reload handoff transfers exact accepted coverage instead of reporting lossy replay', async () => {
     const dir = await tempDir()
     const factoryCalls: SessionFactoryArgs[] = []
     const logs: string[] = []
@@ -1444,14 +1457,14 @@ describe('ChannelRouter session lifecycle', () => {
     const firstPromptHeld = new Promise<void>((resolve) => {
       releaseFirstPrompt = resolve
     })
-    await router.route(inbound({ externalMessageId: 'm1', text: 'before reload' }))
+    const firstAdmission = await router.route(inbound({ externalMessageId: 'm1', text: 'before reload' }))
     sessions[0]!.onPrompt = async () => {
       await firstPromptHeld
     }
     const drainPromise = router.__testing!.flushDebounce(KEY)
     await waitFor(() => sessions[0]!.prompts.length > 0)
     await router.tearDownAllLive()
-    await router.route(
+    const queuedAdmission = await router.route(
       inbound({
         externalMessageId: 'm2',
         text: 'retained until expiry',
@@ -1464,10 +1477,14 @@ describe('ChannelRouter session lifecycle', () => {
     nowRef.value += 100
     await router.__testing!.runIdleGc()
 
-    expect(logs.some((line) => line.includes('reload handoff retention policy discarded'))).toBe(true)
-    expect(notices).toHaveLength(1)
-    expect(notices[0]!).toContain('could not replay 1 queued item(s)')
-    expect(notices[0]!).toContain("reload({ scope: 'providers' })")
+    if (firstAdmission.kind !== 'accepted' || queuedAdmission.kind !== 'accepted')
+      throw new Error('expected durable admissions')
+    const pending = await new RecoveryOutbox(dir).list()
+    expect(pending.flatMap((record) => record.covers.map((cover) => cover.id)).sort()).toEqual(
+      [firstAdmission.inputId, queuedAdmission.inputId].sort(),
+    )
+    expect(pending.every((record) => record.state === 'pending')).toBe(true)
+    expect(notices).toEqual([])
     expect(removed).toHaveLength(1)
     expect(removed[0]).toMatchObject({
       target: { adapter: 'discord-bot', value: 'queued-message' },
@@ -1512,7 +1529,7 @@ describe('ChannelRouter session lifecycle', () => {
     expect(replayed.match(/retained reminder marker/g)).toHaveLength(1)
   })
 
-  test('oversized reload handoff reports the whole rejected batch instead of silently trimming it', async () => {
+  test('oversized reload handoff transfers the whole rejected batch without silent trimming', async () => {
     const dir = await tempDir()
     const logs: string[] = []
     const notices: string[] = []
@@ -1525,25 +1542,28 @@ describe('ChannelRouter session lifecycle', () => {
     const firstPromptHeld = new Promise<void>((resolve) => {
       releaseFirstPrompt = resolve
     })
-    await router.route(inbound({ externalMessageId: 'm1', text: 'before reload' }))
+    const firstAdmission = await router.route(inbound({ externalMessageId: 'm1', text: 'before reload' }))
     sessions[0]!.onPrompt = async () => {
       await firstPromptHeld
     }
     const drainPromise = router.__testing!.flushDebounce(KEY)
     await waitFor(() => sessions[0]!.prompts.length > 0)
     await router.tearDownAllLive()
-    await router.route(inbound({ externalMessageId: 'm2', text: 'queued first' }))
-    await router.route(inbound({ externalMessageId: 'm3', text: 'queued second' }))
+    const secondAdmission = await router.route(inbound({ externalMessageId: 'm2', text: 'queued first' }))
+    const thirdAdmission = await router.route(inbound({ externalMessageId: 'm3', text: 'queued second' }))
 
     releaseFirstPrompt()
     await drainPromise
 
     expect(sessions).toHaveLength(1)
     expect(router.liveCount()).toBe(0)
-    expect(logs.some((line) => line.includes('per-key item limit 1 exceeded'))).toBe(true)
-    expect(notices).toHaveLength(1)
-    expect(notices[0]!).toContain('could not replay 2 queued item(s)')
-    expect(notices[0]!).toContain('per-key item limit 1 exceeded')
+    if (firstAdmission.kind !== 'accepted' || secondAdmission.kind !== 'accepted' || thirdAdmission.kind !== 'accepted')
+      throw new Error('expected durable admissions')
+    const pending = await new RecoveryOutbox(dir).list()
+    expect(pending.flatMap((record) => record.covers.map((cover) => cover.id)).sort()).toEqual(
+      [firstAdmission.inputId, secondAdmission.inputId, thirdAdmission.inputId].sort(),
+    )
+    expect(notices).toEqual([])
   })
 
   test('stop logs teardown abort details when a prompt is in flight', async () => {
@@ -1855,6 +1875,11 @@ describe('ChannelRouter ensureLive watchdog', () => {
     // between creation start and the liveSessions.set install
     const dir = await tempDir()
     let callCount = 0
+    const sessions: FakeSession[] = []
+    let firstCreationEntered!: () => void
+    const firstCreation = new Promise<void>((resolve) => {
+      firstCreationEntered = resolve
+    })
     let releaseFirst: (() => void) | undefined
     const firstBlocked = new Promise<void>((resolve) => {
       releaseFirst = resolve
@@ -1864,8 +1889,12 @@ describe('ChannelRouter ensureLive watchdog', () => {
       configForAdapter: () => baseConfig,
       createSessionForChannel: async () => {
         callCount++
-        if (callCount === 1) await firstBlocked
+        if (callCount === 1) {
+          firstCreationEntered()
+          await firstBlocked
+        }
         const fake = new FakeSession()
+        sessions.push(fake)
         return {
           session: fake as unknown as AgentSession,
           sessionId: `ses_race_${callCount}`,
@@ -1879,7 +1908,7 @@ describe('ChannelRouter ensureLive watchdog', () => {
     // when the first inbound starts creating (and blocks), a roles reload tears
     // down all live sessions, then the blocked creation is released
     const routePromise = router.route(inbound())
-    await new Promise((r) => setTimeout(r, 10))
+    await firstCreation
     await router.tearDownAllLive()
     releaseFirst!()
 
@@ -1887,12 +1916,56 @@ describe('ChannelRouter ensureLive watchdog', () => {
     // installed — the stale-role session never becomes live
     await expect(routePromise).rejects.toBeInstanceOf(StaleLiveSessionError)
     expect(router.liveCount()).toBe(0)
+    expect(sessions[0]!.disposed).toBe(1)
 
     // and a fresh post-reload inbound creates a new live session normally
     await router.route(inbound({ externalMessageId: 'm2' }))
     await router.__testing!.flushDebounce(KEY)
     expect(router.liveCount()).toBe(1)
     expect(callCount).toBe(2)
+  })
+
+  test('teardown while journal initialization is pending invalidates the pre-reload inbound', async () => {
+    const dir = await tempDir()
+    let releaseInitialization!: () => void
+    const initializationGate = new Promise<void>((resolve) => {
+      releaseInitialization = resolve
+    })
+    class GatedJournal extends InboundJournal {
+      override async initialize(): Promise<void> {
+        await initializationGate
+        await super.initialize()
+      }
+    }
+    const sessions: FakeSession[] = []
+    const router = createChannelRouter({
+      agentDir: dir,
+      configForAdapter: () => baseConfig,
+      inboundJournal: new GatedJournal(dir),
+      createSessionForChannel: async () => {
+        const fake = new FakeSession()
+        sessions.push(fake)
+        return {
+          session: fake as unknown as AgentSession,
+          sessionId: `ses_initialization_race_${sessions.length}`,
+          dispose: async () => fake.dispose(),
+        }
+      },
+    })
+
+    const routePromise = router.route(inbound())
+    void routePromise.catch(() => undefined)
+    await router.tearDownAllLive()
+    releaseInitialization()
+    await expect(routePromise).rejects.toBeInstanceOf(StaleLiveSessionError)
+    expect(router.liveCount()).toBe(0)
+    expect(sessions).toHaveLength(0)
+
+    await router.route(inbound({ externalMessageId: 'm2' }))
+    await router.__testing!.flushDebounce(KEY)
+    expect(router.liveCount()).toBe(1)
+    expect(sessions).toHaveLength(1)
+    expect(sessions[0]!.prompts).toHaveLength(1)
   })
 })
 
@@ -2999,7 +3072,13 @@ describe('ChannelRouter sticky credits', () => {
     router.registerSelfIdentity('discord-bot', () => ({ id: '999' }))
     router.registerOutbound('discord-bot', async () => ({ ok: true }))
     await router.route(
-      inbound({ authorId: '111', authorName: 'alice', externalMessageId: 'p1', isBotMention: true, text: 'bot hi' }),
+      inboundForSelf('999', {
+        authorId: '111',
+        authorName: 'alice',
+        externalMessageId: 'p1',
+        isBotMention: true,
+        text: 'bot hi',
+      }),
     )
     await router.__testing!.flushDebounce(KEY)
 
@@ -3015,7 +3094,13 @@ describe('ChannelRouter sticky credits', () => {
       })
     }
     await router.route(
-      inbound({ authorId: '111', authorName: 'alice', externalMessageId: 'p2', isBotMention: true, text: 'bot go' }),
+      inboundForSelf('999', {
+        authorId: '111',
+        authorName: 'alice',
+        externalMessageId: 'p2',
+        isBotMention: true,
+        text: 'bot go',
+      }),
     )
     await router.__testing!.flushDebounce(KEY)
 
@@ -3965,6 +4050,8 @@ describe('ChannelRouter persistent output acknowledgements', () => {
     sessions[0]!.onPrompt = async () => {
       await router.noteGithubReviewOutput({
         sessionId: 'ses_fake_1',
+        inboundCoverage: await router.captureInboundResultCoverage?.('ses_fake_1'),
+        backgroundCoverage: await router.captureBackgroundResultCoverage?.('ses_fake_1'),
         workspace: 'acme/repo',
         prNumber: 672,
         state: 'APPROVE',
@@ -4007,10 +4094,12 @@ describe('ChannelRouter persistent output acknowledgements', () => {
     })
     await original.router.route(inbound({ ...key, reactionRef: target }))
     original.sessions[0]!.onPrompt = async () => {
+      const captureInbound = original.router.captureInboundResultCoverage
       const captureBackground = original.router.captureBackgroundResultCoverage
-      if (!captureBackground) throw new Error('Missing durable review coverage capabilities')
+      if (!captureInbound || !captureBackground) throw new Error('Missing durable review coverage capabilities')
       await original.router.noteGithubReviewOutput({
         sessionId: 'ses_fake_1',
+        inboundCoverage: await captureInbound('ses_fake_1'),
         backgroundCoverage: await captureBackground('ses_fake_1'),
         workspace: key.workspace,
         prNumber: 672,
@@ -4024,7 +4113,10 @@ describe('ChannelRouter persistent output acknowledgements', () => {
     const journalFiles = (await readdir(journalDir)).filter((name) => name.endsWith('.json'))
     expect(journalFiles).toHaveLength(1)
 
-    // Simulate loss of the runtime, not an orderly release of its in-memory handles.
+    // Close the runtime's journal writer without retiring protected acknowledgements.
+    await original.router.stop()
+    expect(present).toBe(true)
+    expect((await readdir(journalDir)).filter((name) => name.endsWith('.json'))).toEqual(journalFiles)
     const rebooted = makeRouter(dir)
     const removed: RemoveOwnReactionRequest[] = []
     rebooted.router.registerRemoveOwnReaction('github', async (req) => {
@@ -4169,6 +4261,8 @@ describe('ChannelRouter persistent output acknowledgements', () => {
     sessions[0]!.onPrompt = async () => {
       await router.noteGithubReviewOutput({
         sessionId: 'ses_fake_1',
+        inboundCoverage: await router.captureInboundResultCoverage?.('ses_fake_1'),
+        backgroundCoverage: await router.captureBackgroundResultCoverage?.('ses_fake_1'),
         workspace: 'acme/repo',
         prNumber: 672,
         state: 'APPROVE',
@@ -4235,6 +4329,8 @@ describe('ChannelRouter persistent output acknowledgements', () => {
     sessions[0]!.onPrompt = async () => {
       await router.noteGithubReviewOutput({
         sessionId: 'ses_fake_1',
+        inboundCoverage: await router.captureInboundResultCoverage?.('ses_fake_1'),
+        backgroundCoverage: await router.captureBackgroundResultCoverage?.('ses_fake_1'),
         workspace: 'acme/repo',
         prNumber: 672,
         state: 'APPROVE',
@@ -4297,6 +4393,8 @@ describe('ChannelRouter persistent output acknowledgements', () => {
       sessions[0]!.onPrompt = async () => {
         await router.noteGithubReviewOutput({
           sessionId: 'ses_fake_1',
+          inboundCoverage: await router.captureInboundResultCoverage?.('ses_fake_1'),
+          backgroundCoverage: await router.captureBackgroundResultCoverage?.('ses_fake_1'),
           workspace: 'acme/repo',
           prNumber: 672,
           state: 'APPROVE',
@@ -4325,8 +4423,17 @@ describe('ChannelRouter persistent output acknowledgements', () => {
 describe('ChannelRouter waiting reaction account continuity', () => {
   test('adapter replacement during preparation cannot add as the replacement account under the old durable tuple', async () => {
     const dir = await tempDir()
-    const { router } = makeRouter(dir)
+    const successorEntered = Promise.withResolvers<void>()
+    const releaseSuccessor = Promise.withResolvers<void>()
+    const { router } = makeRouter(dir, {
+      beforeSessionCreation: async (attempt) => {
+        if (attempt !== 2) return
+        successorEntered.resolve()
+        await releaseSuccessor.promise
+      },
+    })
     const actors = new Set<string>()
+    const addedActors: string[] = []
     let finishPreparation!: () => void
     let preparationStarted!: () => void
     const started = new Promise<void>((resolve) => {
@@ -4337,10 +4444,12 @@ describe('ChannelRouter waiting reaction account continuity', () => {
     })
     const target: ReactionRef = { adapter: 'discord-bot', value: 'account-race-target' }
     const addA = async () => {
+      addedActors.push('A')
       actors.add('A')
       return { ok: true as const }
     }
     const addB = async () => {
+      addedActors.push('B')
       actors.add('B')
       return { ok: true as const }
     }
@@ -4376,18 +4485,36 @@ describe('ChannelRouter waiting reaction account continuity', () => {
       await readFile(join(recordDirectory, files.find((name) => name.endsWith('.json'))!), 'utf8'),
     )
     expect(record.prepared.accountIdentity).toBe('A')
-    await router.tearDownAllLive()
-    await router.recoverWaitingReactions('discord-bot')
-    expect([...actors]).toEqual(['A'])
-    router.unregisterRemoveOwnReaction('discord-bot', removeB)
-    router.registerRemoveOwnReaction('discord-bot', async (req) => {
-      if (req.expectedAccountIdentity !== 'A') return { ok: false, code: 'identity', error: 'wrong account' }
-      actors.delete('A')
-      return { ok: true }
-    })
-    await router.recoverWaitingReactions('discord-bot')
-    expect([...actors]).toEqual([])
-    await router.stop()
+    // Reload must transfer the queued owner rather than add as replacement B.
+    const reload = router.tearDownAllLive()
+    try {
+      await successorEntered.promise
+      await router.recoverWaitingReactions('discord-bot')
+      expect([...actors]).toEqual(['A'])
+      expect(addedActors).toEqual(['A'])
+      const retained = JSON.parse(
+        await readFile(join(recordDirectory, files.find((name) => name.endsWith('.json'))!), 'utf8'),
+      )
+      expect(retained.prepared.accountIdentity).toBe('A')
+      expect(retained.owners).toEqual(record.owners)
+      // The successor is held: terminal stop, not elapsed time, ends ownership.
+      await router.stop()
+      await router.recoverWaitingReactions('discord-bot')
+      expect([...actors]).toEqual(['A'])
+      router.unregisterRemoveOwnReaction('discord-bot', removeB)
+      router.registerRemoveOwnReaction('discord-bot', async (req) => {
+        if (req.expectedAccountIdentity !== 'A') return { ok: false, code: 'identity', error: 'wrong account' }
+        actors.delete('A')
+        return { ok: true }
+      })
+      await router.recoverWaitingReactions('discord-bot')
+      expect([...actors]).toEqual([])
+      expect(addedActors).toEqual(['A'])
+    } finally {
+      releaseSuccessor.resolve()
+      await reload
+      await router.stop()
+    }
   })
 })
 
@@ -5273,6 +5400,8 @@ describe('ChannelRouter channel-turn protocol', () => {
       if (calls === 1) {
         await router.noteGithubReviewOutput({
           sessionId: 'ses_fake_1',
+          inboundCoverage: await router.captureInboundResultCoverage?.('ses_fake_1'),
+          backgroundCoverage: await router.captureBackgroundResultCoverage?.('ses_fake_1'),
           workspace: 'acme/repo',
           prNumber: 672,
           state: 'APPROVE',
@@ -5304,6 +5433,8 @@ describe('ChannelRouter channel-turn protocol', () => {
     sessions[0]!.onPrompt = async () => {
       await router.noteGithubReviewOutput({
         sessionId: 'ses_fake_1',
+        inboundCoverage: await router.captureInboundResultCoverage?.('ses_fake_1'),
+        backgroundCoverage: await router.captureBackgroundResultCoverage?.('ses_fake_1'),
         workspace: 'acme/repo',
         prNumber: 672,
         state: 'COMMENT',
@@ -5337,6 +5468,8 @@ describe('ChannelRouter channel-turn protocol', () => {
       if (calls === 1) {
         await router.noteGithubReviewOutput({
           sessionId: 'ses_fake_1',
+          inboundCoverage: await router.captureInboundResultCoverage?.('ses_fake_1'),
+          backgroundCoverage: await router.captureBackgroundResultCoverage?.('ses_fake_1'),
           workspace: 'acme/repo',
           prNumber: 672,
           state: 'APPROVE',
@@ -7074,11 +7207,19 @@ describe('ChannelRouter channel-turn protocol', () => {
       return { ok: true }
     })
 
-    await router.route(inbound({ text: 'say hi' }))
+    const event = inbound({ text: 'say hi' })
+    const admission = await router.route(event)
+    if (admission.kind !== 'accepted') throw new Error('Expected durable admission')
     sessions[0]!.onPrompt = () => {
       sessions[0]!.setAssistantText('hi from invisible assistant text')
     }
     await router.__testing!.flushDebounce(KEY)
+
+    expect(await router.route(event)).toEqual({
+      kind: 'duplicate',
+      inputId: admission.inputId,
+      outcome: 'delivered',
+    })
 
     expect(sent).toEqual([{ chat: 'c1', thread: null, text: 'hi from invisible assistant text' }])
     expect(logs.some((m) => m.includes('recovering assistant_text_without_channel_tool'))).toBe(true)
@@ -12880,7 +13021,7 @@ describe('ChannelRouter cold-start prefetch', () => {
     // human — Slack's parent_user_id always points at the root, so this is the
     // shape the suppressor exists to catch. No mention/alias/dm.
     await router.route(
-      inbound({
+      inboundForSelf('BOT_SELF_ID', {
         thread: 't-A',
         externalMessageId: 'human-followup',
         text: 'follow-up between others',
@@ -12919,7 +13060,7 @@ describe('ChannelRouter cold-start prefetch', () => {
     }))
 
     await router.route(
-      inbound({
+      inboundForSelf('BOT_SELF_ID', {
         thread: 't-A',
         externalMessageId: 'human-followup',
         text: 'thanks, one more thing',
@@ -17058,10 +17199,7 @@ describe('ChannelRouter more_work_this_turn:true empty-stop recovery (phrase-ind
         return
       }
       if (bAttempt === 2 + MAX_WILLINGNESS_NUDGES) {
-        router.__testing!.enqueueUserInbound(
-          KEY,
-          inbound({ text: 'and how do i actually fix it now?', externalMessageId: 'c1' }),
-        )
+        await router.route(inbound({ text: 'and how do i actually fix it now?', externalMessageId: 'c1' }))
         sessions[0]!.setAssistantText('')
         return
       }
@@ -20193,7 +20331,12 @@ describe('ChannelRouter GitHub review-thread closeout obligation', () => {
       })
       const logs: string[] = []
       const sent: OutboundMessage[] = []
-      const { router, sessions } = makeRouter(dir, { logs, nowRef })
+      const childStartedAt = nowRef.value
+      const { router, sessions } = makeRouter(dir, {
+        logs,
+        nowRef,
+        newestRunningChildSubagentStartedAt: (sessionId) => (sessionId === 'ses_fake_1' ? childStartedAt : null),
+      })
       router.registerOutbound('github', async (message) => {
         sent.push(message)
         return { ok: true }
@@ -20226,6 +20369,9 @@ describe('ChannelRouter GitHub review-thread closeout obligation', () => {
         await router.markTurnSkipped({ parentSessionId: 'ses_fake_2', reason: 'no close-out' })
         rehydratedSibling.setAssistantText('NO_REPLY')
       }
+      // The carrier is waiting on its review child, not silently relinquishing
+      // the round. Exercise its timer winning before the restored sibling.
+      await router.__testing!.flushDebounce(carrierKey)
       await router.__testing!.flushDebounce(GITHUB_KEY)
       expect(sent).toEqual([])
 
@@ -20792,6 +20938,7 @@ describe('ChannelRouter durable background response coverage', () => {
 
   async function reply(session: FakeSession, router: ChannelRouter, key: ChannelKey, text: string, moreWork = false) {
     const backgroundCoverage = await router.captureBackgroundResultCoverage!('ses_fake_1')
+    const inboundCoverage = await router.captureInboundResultCoverage!('ses_fake_1')
     expect((await router.send({ ...key, text })).ok).toBe(true)
     await session.agent.afterToolCall!({
       assistantMessage: assistantMessage(''),
@@ -20799,7 +20946,7 @@ describe('ChannelRouter durable background response coverage', () => {
       args: { text },
       result: {
         content: [{ type: 'text', text: 'sent' }],
-        details: { ok: true, more_work_this_turn: moreWork, backgroundCoverage },
+        details: { ok: true, more_work_this_turn: moreWork, backgroundCoverage, inboundCoverage },
       },
       isError: false,
       context: { messages: [] },
@@ -20823,10 +20970,11 @@ describe('ChannelRouter durable background response coverage', () => {
         if (ending === 'review')
           await f.router.noteGithubReviewOutput({
             sessionId: 'ses_fake_1',
+            inboundCoverage: await f.router.captureInboundResultCoverage?.('ses_fake_1'),
+            backgroundCoverage: await f.router.captureBackgroundResultCoverage?.('ses_fake_1'),
             workspace: 'acme/repo',
             prNumber: 672,
             state: 'APPROVE',
-            backgroundCoverage: await f.router.captureBackgroundResultCoverage!('ses_fake_1'),
           })
         if (ending === 'stop') await f.router.route(inbound({ ...key, text: '/stop', externalMessageId: 'stop' }))
         f.sessions[0]!.setAssistantText('NO_REPLY')
@@ -20994,31 +21142,6 @@ describe('ChannelRouter durable background response coverage', () => {
     await rm(f.dir, { recursive: true, force: true })
   })
 
-  test('failed suppression decision neither clears coverage nor arms the skip send lock', async () => {
-    const f = await fixture()
-    const ref = await f.accept('decision-failure')
-    const original = f.store.settle.bind(f.store)
-    f.sessions[0]!.onPrompt = async () => {
-      await f.router.attachBackgroundResultCoverage({ parentSessionId: 'ses_fake_1', taskId: 'decision-failure' })
-      f.store.settle = async () => {
-        throw new Error('outcome sync failed')
-      }
-      await expect(f.router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'quiet' })).rejects.toThrow(
-        'outcome sync failed',
-      )
-      expect((await f.store.get(ref.obligationId))?.phase).toBe('turn-owned')
-      expect((await f.router.send({ ...KEY, text: 'A progress update remains allowed.' })).ok).toBe(true)
-      f.store.settle = original
-      await f.router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'intentional quiet after progress' })
-      f.sessions[0]!.setAssistantText('NO_REPLY')
-    }
-    await f.router.route(inbound({ externalMessageId: 'followup' }))
-    await f.router.__testing!.flushDebounce(KEY)
-    expect((await f.store.get(ref.obligationId))?.outcome?.kind).toBe('intentionally-suppressed')
-    expect(f.sent).toEqual(['A progress update remains allowed.'])
-    await rm(f.dir, { recursive: true, force: true })
-  })
-
   test('inbound arriving during durable claim remains a separate normal turn', async () => {
     const f = await fixture()
     const ref = await f.accept('claim-in-flight')
@@ -21052,8 +21175,9 @@ describe('ChannelRouter durable background response coverage', () => {
       durationMs: 20,
     })
     await entered.promise
-    await f.router.route(inbound({ text: 'unrelated new request', externalMessageId: 'during-claim' }))
+    const admission = f.router.route(inbound({ text: 'unrelated new request', externalMessageId: 'during-claim' }))
     release.resolve()
+    await admission
     await f.router.__testing!.flushDebounce(KEY)
     expect(prompts).toBe(2)
     expect((await f.store.get(ref.obligationId))?.phase).toBe('closed')

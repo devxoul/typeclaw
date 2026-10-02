@@ -1,5 +1,6 @@
 import type { BackgroundObligationStore } from './background-obligations'
 import type { RecoveryRecord } from './continuity-types'
+import type { InboundJournal } from './inbound-journal'
 import type { RecoveryOutbox } from './recovery-outbox'
 import type { ChannelRouter } from './router'
 import { channelKeyId, RecoveryTransportError, type ChannelKey } from './types'
@@ -18,12 +19,34 @@ export class RecoveryDispatcher {
       consistencyDelayMs?: number
       onError?: (error: unknown) => void
       backgroundObligations?: BackgroundObligationStore
+      inboundJournal?: InboundJournal
     } = {},
   ) {
     router.setRecoveryStopHandler((target, parent) => this.suppressParent(target, parent))
   }
 
+  private async validateCoverageInLane(record: RecoveryRecord): Promise<'open' | 'resolved'> {
+    if (record.covers.some((cover) => cover.store === 'inbound')) {
+      if (!this.options.inboundJournal) throw new Error('Inbound recovery requires journal authority')
+      return this.options.inboundJournal.validateNotice(record)
+    }
+    if (record.covers.some((cover) => cover.store === 'background')) {
+      this.options.inboundJournal?.assertAvailable()
+      if (!this.options.backgroundObligations) throw new Error('Background recovery requires source authority')
+      this.options.backgroundObligations.assertAvailable()
+    }
+    return this.options.backgroundObligations?.validateNotice(record) ?? 'open'
+  }
+
   private async acknowledge(record: RecoveryRecord): Promise<void> {
+    if (record.covers.some((cover) => cover.store === 'inbound')) {
+      const journal = this.options.inboundJournal
+      if (!journal) throw new Error('Inbound recovery requires journal authority')
+      if (this.options.backgroundObligations)
+        await this.options.backgroundObligations.withTargetLane(record.target, () => journal.acknowledgeNotice(record))
+      else await journal.acknowledgeNotice(record)
+      return
+    }
     const source = this.options.backgroundObligations
     if (!source) return
     if (record.covers.some((cover) => cover.store === 'background')) {
@@ -72,10 +95,22 @@ export class RecoveryDispatcher {
     this.timer.unref?.()
   }
   private async acquire(record: RecoveryRecord) {
-    if (record.lease?.epoch === this.outbox.epoch) {
-      return (await this.outbox.repairLease(record.deliveryId, record.lease)) ? record.lease : undefined
+    const claim = async () => {
+      if ((await this.validateCoverageInLane(record)) === 'resolved') return undefined
+      if (record.lease?.epoch === this.outbox.epoch) {
+        return (await this.outbox.repairLease(record.deliveryId, record.lease)) ? record.lease : undefined
+      }
+      return this.outbox.lease(record.deliveryId, record.generation)
     }
-    return this.outbox.lease(record.deliveryId, record.generation)
+    try {
+      const source = this.options.backgroundObligations
+      return source && record.covers.some((cover) => cover.store !== 'inventory')
+        ? await source.withTargetLane(record.target, claim)
+        : await claim()
+    } catch (error) {
+      this.options.onError?.(error)
+      return undefined
+    }
   }
 
   private async dispatchTarget(key: string): Promise<void> {
@@ -87,10 +122,12 @@ export class RecoveryDispatcher {
       if (!record || record.state === 'delivered' || record.state === 'suppressed' || (record.nextAttemptAt ?? 0) > now)
         continue
       try {
-        if (
-          this.options.backgroundObligations &&
-          (await this.options.backgroundObligations.validateNotice(record)) === 'resolved'
-        ) {
+        const source = this.options.backgroundObligations
+        const coverage =
+          source && record.covers.some((cover) => cover.store !== 'inventory')
+            ? await source.withTargetLane(record.target, () => this.validateCoverageInLane(record!))
+            : await this.validateCoverageInLane(record)
+        if (coverage === 'resolved') {
           await this.outbox.suppress(record.deliveryId, 'coverage-resolved', crypto.randomUUID())
           continue
         }
@@ -165,10 +202,7 @@ export class RecoveryDispatcher {
         }
         if ((await this.outbox.get(record.deliveryId))?.state === 'suppressed') continue
         const sendNotice = async () => {
-          if (
-            this.options.backgroundObligations &&
-            (await this.options.backgroundObligations.validateNotice(record!)) === 'resolved'
-          ) {
+          if ((await this.validateCoverageInLane(record!)) === 'resolved') {
             await this.outbox.suppress(record!.deliveryId, 'coverage-resolved', crypto.randomUUID())
             return undefined
           }
@@ -190,7 +224,7 @@ export class RecoveryDispatcher {
           }
         }
         const dispatched =
-          this.options.backgroundObligations && record.covers.some((cover) => cover.store === 'background')
+          this.options.backgroundObligations && record.covers.some((cover) => cover.store !== 'inventory')
             ? await this.options.backgroundObligations.withTargetLane(record.target, sendNotice)
             : await sendNotice()
         if (!dispatched) continue
@@ -204,6 +238,10 @@ export class RecoveryDispatcher {
           const delivered = await this.outbox.get(record.deliveryId)
           if (delivered) await this.acknowledge(delivered).catch((error) => this.options.onError?.(error))
         } else {
+          if (record.covers.some((cover) => cover.store !== 'inventory')) {
+            this.options.inboundJournal?.assertAvailable()
+            this.options.backgroundObligations?.assertAvailable()
+          }
           await this.outbox.fail(
             record.deliveryId,
             lease,
@@ -215,6 +253,17 @@ export class RecoveryDispatcher {
           )
         }
       } catch (error) {
+        if (record.covers.some((cover) => cover.store !== 'inventory')) {
+          try {
+            this.options.inboundJournal?.assertAvailable()
+            this.options.backgroundObligations?.assertAvailable()
+          } catch (frozen) {
+            // Leave the lease untouched: an unreadable source cannot authorize
+            // even retry-state progress. Verified repair can reclaim it later.
+            this.options.onError?.(frozen)
+            continue
+          }
+        }
         await this.outbox.fail(
           record.deliveryId,
           lease,
@@ -231,23 +280,28 @@ export class RecoveryDispatcher {
   }
 
   async suppressParent(target: ChannelKey, parentSessionId: string): Promise<void> {
-    const decisionId = crypto.randomUUID()
+    const parentDecisionId = crypto.randomUUID()
     for (const record of await this.outbox.list()) {
       if (channelKeyId(record.target) !== channelKeyId(target)) continue
       if (
         record.sourceParentSessionId === parentSessionId ||
         (record.covers.length > 0 && record.covers.every((coverage) => coverage.parentSessionId === parentSessionId))
       ) {
+        const decisionId = `${parentDecisionId}:${record.deliveryId}`
         const source = this.options.backgroundObligations
-        if (source) {
-          if (record.covers.some((cover) => cover.store === 'background')) {
-            await source.withTargetLane(target, () =>
-              source.suppressNoticeCoverage(record, { decisionId, reason: 'user-stop' }),
-            )
-          } else {
+        const suppress = async () => {
+          if (record.covers.some((cover) => cover.store === 'inbound')) {
+            if (!this.options.inboundJournal) throw new Error('Inbound recovery requires journal authority')
+            await this.options.inboundJournal.suppressNoticeCoverage(record, { decisionId, reason: 'user-stop' })
+          } else if (source) {
+            if (record.covers.some((cover) => cover.store === 'background'))
+              this.options.inboundJournal?.assertAvailable()
             await source.suppressNoticeCoverage(record, { decisionId, reason: 'user-stop' })
           }
         }
+        if (source && record.covers.some((cover) => cover.store !== 'inventory'))
+          await source.withTargetLane(target, suppress)
+        else await suppress()
         await this.outbox.suppress(record.deliveryId, 'user_stop', decisionId)
       }
     }

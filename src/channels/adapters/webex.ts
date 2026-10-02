@@ -23,6 +23,7 @@ import {
 import { deriveMembershipFromHistory } from '@/channels/membership-from-history'
 import type { ChannelRouter } from '@/channels/router'
 import type { ChannelAdapterConfig } from '@/channels/schema'
+import { fallbackChannelAccountIdentity } from '@/channels/types'
 import type {
   ChannelHistoryMessage,
   ChannelSelfIdentityResolver,
@@ -40,6 +41,7 @@ import type {
 import type { WebexAccountRecord } from '@/secrets/schema'
 
 import { describeError } from '../describe-error'
+import { withOutboundAccount } from './outbound-account'
 import { createWebexChannelNameResolver } from './webex-channel-resolver'
 import { classifyInbound, type InboundDropReason, type WebexInboundMessage } from './webex-classify'
 import { createWebexEditMessageCallback } from './webex-edit'
@@ -368,7 +370,10 @@ export function createWebexAdapter(options: WebexAdapterOptions): WebexAdapter {
     historyCallback,
     botPersonIdRef: () => botPerson?.ref ?? null,
   })
-  const outboundCallback = createOutboundCallback({ client, logger, formatChannelTag })
+  const outboundCallback = withOutboundAccount(
+    createOutboundCallback({ client, logger, formatChannelTag }),
+    (workspace) => fallbackChannelAccountIdentity('webex', workspace, botPerson?.ref),
+  )
   const typingCallback = createTypingCallback({ client, logger, formatChannelTag })
   const fetchAttachmentCallback = createFetchAttachmentCallback({ tokenRef: () => currentToken, logger, fetchImpl })
   const editMessageCallback = createWebexEditMessageCallback({ adapter: 'webex', client })
@@ -399,7 +404,12 @@ export function createWebexAdapter(options: WebexAdapterOptions): WebexAdapter {
       logger.info(
         `[webex] routed id=${event.ref} ${tag} mention=${payload.isBotMention} reply=${payload.replyToBotMessageId !== null}`,
       )
-      await options.router.route(payload)
+      await options.router.route({
+        ...payload,
+        accountIdentity: fallbackChannelAccountIdentity('webex', payload.workspace, botSnapshot?.ref),
+        eventKind: 'message',
+        revision: 'original',
+      })
     } catch (err) {
       logger.error(`[webex] handleInbound failed: ${describeError(err)}`)
     } finally {

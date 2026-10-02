@@ -7,7 +7,11 @@ import { join } from 'node:path'
 import type { AgentSession } from '@/agent'
 import { createFileSecretsProvider } from '@/secrets/secrets-provider'
 
-import { createChannelManager } from './manager'
+import {
+  type ChannelManager,
+  type ChannelManagerOptions,
+  createChannelManager as createChannelManagerImpl,
+} from './manager'
 import { defaultHistoryConfig, type ChannelAdapterConfig, type ChannelsConfig } from './schema'
 import type { ChannelKey, InboundMessage } from './types'
 
@@ -93,12 +97,21 @@ function makeRecordingAdapter(
 let agentDir: string
 let cfg: ChannelsConfig
 
+const managers: ChannelManager[] = []
+
+function createChannelManager(options: ChannelManagerOptions): ChannelManager {
+  const manager = createChannelManagerImpl(options)
+  managers.push(manager)
+  return manager
+}
+
 beforeEach(async () => {
   agentDir = await mkdtemp(join(tmpdir(), 'typeclaw-channels-mgr-'))
   cfg = {}
 })
 
 afterEach(async () => {
+  for (const manager of managers.splice(0)) await manager.stop()
   await rm(agentDir, { recursive: true, force: true })
 })
 

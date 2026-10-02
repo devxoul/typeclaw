@@ -21,6 +21,7 @@ import {
 import { deriveMembershipFromHistory } from '@/channels/membership-from-history'
 import type { ChannelRouter } from '@/channels/router'
 import type { ChannelAdapterConfig } from '@/channels/schema'
+import { fallbackChannelAccountIdentity } from '@/channels/types'
 import type {
   ChannelHistoryMessage,
   ChannelSelfIdentityResolver,
@@ -35,6 +36,7 @@ import type {
 } from '@/channels/types'
 
 import { describeError } from '../describe-error'
+import { withOutboundAccount } from './outbound-account'
 import { createWebexChannelNameResolver } from './webex-bot-channel-resolver'
 import { classifyInbound, type InboundDropReason, type WebexInboundMessage } from './webex-bot-classify'
 import { enrichWebexMessageReference } from './webex-bot-reference'
@@ -316,7 +318,10 @@ export function createWebexBotAdapter(options: WebexBotAdapterOptions): WebexBot
     historyCallback,
     botPersonIdRef: () => botPerson?.ref ?? null,
   })
-  const outboundCallback = createOutboundCallback({ client, logger, formatChannelTag })
+  const outboundCallback = withOutboundAccount(
+    createOutboundCallback({ client, logger, formatChannelTag }),
+    (workspace) => fallbackChannelAccountIdentity('webex-bot', workspace, botPerson?.ref),
+  )
   const fetchAttachmentCallback = createFetchAttachmentCallback({ token: options.token, logger, fetchImpl })
   const editMessageCallback = createWebexEditMessageCallback({ adapter: 'webex-bot', client })
 
@@ -348,7 +353,12 @@ export function createWebexBotAdapter(options: WebexBotAdapterOptions): WebexBot
       logger.info(
         `[webex-bot] routed id=${event.ref} ${tag} mention=${payload.isBotMention} reply=${payload.replyToBotMessageId !== null}`,
       )
-      await options.router.route(payload)
+      await options.router.route({
+        ...payload,
+        accountIdentity: fallbackChannelAccountIdentity('webex-bot', payload.workspace, botSnapshot?.ref),
+        eventKind: 'message',
+        revision: 'original',
+      })
     } catch (err) {
       logger.error(`[webex-bot] handleInbound failed: ${describeError(err)}`)
     } finally {

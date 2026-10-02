@@ -21,6 +21,7 @@ import { createSpawnSubagentTool } from './src/agent/tools/spawn-subagent.ts';
 import { createStream } from './src/stream/index.ts';
 import { createSubagentCompletionBridge } from './src/channels/subagent-completion-bridge.ts';
 import { BackgroundObligationStore } from './src/channels/background-obligations.ts';
+import { InboundJournal } from './src/channels/inbound-journal.ts';
 import { RecoveryOutbox } from './src/channels/recovery-outbox.ts';
 import { RecoveryDispatcher } from './src/channels/recovery-dispatcher.ts';
 import { createChannelRouter } from './src/channels/router.ts';
@@ -55,17 +56,18 @@ const store=new BackgroundObligationStore(dir,{epoch:mode,onDurability:async(pha
   if(phase==='directory-synced'&&((mode==='ready'&&row.phase==='result-ready')||(mode==='claim'&&row.phase==='turn-owned')||(mode.startsWith('settled-')&&row.phase==='closed')))await stopAt();
   if(phase==='temp-synced'&&mode.startsWith('ambiguous-')&&row.phase==='closed')await stopAt();
 }});
+const journal=new InboundJournal(dir,{backgroundObligations:store});
 const stream=createStream();
 const live=new LiveSubagentRegistry();
 let parent;
 const router=createChannelRouter({
-  agentDir:dir,backgroundObligations:store,
+  agentDir:dir,backgroundObligations:store,inboundJournal:journal,
   configForAdapter:()=>({enabled:true,engagement:{trigger:['dm'],stickiness:'off'},history:defaultHistoryConfig()}),
   permissions:{...noopPermissionService,has:()=>true},
   logger:{info(){},warn(){},error(m){appendFileSync(dir+'/router-errors',JSON.stringify(m)+'\\n')}},
   createSessionForChannel:async({origin,originRef})=>{
     if(!initial)throw new Error('recovery reopened model session');
-    const result=await createSessionWithDispose({sessionManager:SessionManager.create(dir),systemPromptOverride:'Reply briefly.',tools:[],origin,originRef});
+    const result=await createSessionWithDispose({sessionManager:SessionManager.create(dir,dir+'/sessions'),systemPromptOverride:'Reply briefly.',tools:[],origin,originRef});
     parent=result.session;
     return {session:parent,sessionId:parent.sessionId,dispose:result.dispose};
   }
@@ -97,6 +99,8 @@ if(initial){
   if(mode==='before-claim'){
     const original=store.claim.bind(store);
     store.claim=async(refs,owner)=>{if(refs.length)await stopAt();return original(refs,owner)};
+    const claim=journal.claim.bind(journal);
+    journal.claim=async(refs,owner,backgroundRefs,...rest)=>{if(backgroundRefs?.length)await stopAt();return claim(refs,owner,backgroundRefs,...rest)};
   }
   const originalPrompt=parent.prompt.bind(parent);
   parent.prompt=async(text)=>{
@@ -110,13 +114,15 @@ if(initial){
       const ending=mode.split('-')[1];
       if(ending==='reply'){
         const backgroundCoverage=await router.captureBackgroundResultCoverage(parent.sessionId);
+        const inboundCoverage=await router.captureInboundResultCoverage(parent.sessionId);
         await router.send({...key,text:'Result: 42.'});
-        await parent.agent.afterToolCall({assistantMessage:{usage:{totalTokens:1}},toolCall:{name:'channel_reply',arguments:{text:'Result: 42.'}},args:{text:'Result: 42.'},result:{details:{ok:true,backgroundCoverage}},isError:false,context:{messages:[]}});
+        await parent.agent.afterToolCall({assistantMessage:{usage:{totalTokens:1}},toolCall:{name:'channel_reply',arguments:{text:'Result: 42.'}},args:{text:'Result: 42.'},result:{details:{ok:true,backgroundCoverage,inboundCoverage}},isError:false,context:{messages:[]}});
       }
       if(ending==='review'){
         const backgroundCoverage=await router.captureBackgroundResultCoverage(parent.sessionId);
+        const inboundCoverage=await router.captureInboundResultCoverage(parent.sessionId);
         await appendFile(dir+'/reviews','APPROVE\\n');
-        await router.noteGithubReviewOutput({sessionId:parent.sessionId,workspace:key.workspace,prNumber:672,state:'APPROVE',backgroundCoverage});
+        await router.noteGithubReviewOutput({sessionId:parent.sessionId,workspace:key.workspace,prNumber:672,state:'APPROVE',backgroundCoverage,inboundCoverage});
       }
       if(ending==='skip')await router.markTurnSkipped({parentSessionId:parent.sessionId,reason:'intentional quiet'});
       if(ending==='stop')await router.route({...key,text:'/stop',externalMessageId:'stop',authorId:'alice',authorName:'alice',authorIsBot:false,isBotMention:false,isDm:true,mentionsOthers:false,replyToBotMessageId:null,replyToOtherMessageId:null,ts:1001});
@@ -127,9 +133,10 @@ if(initial){
   const tool=createSpawnSubagentTool({
     registry:{explorer:{visibility:'public',systemPrompt:'Compute the answer.'}},liveRegistry:live,stream,
     agentDir:dir,parentSessionId:parent.sessionId,generateTaskId:()=> 'task',router,
+    getAccountIdentity:async()=> 'proof-account',
     getOrigin:()=>({kind:'channel',...key,lastInboundAuthorId:'alice'}),
     createSessionForSubagent:async()=>{
-      const result=await createSessionWithDispose({sessionManager:SessionManager.create(dir),systemPromptOverride:'Compute the answer.',tools:[]});
+      const result=await createSessionWithDispose({sessionManager:SessionManager.create(dir,dir+'/sessions'),systemPromptOverride:'Compute the answer.',tools:[]});
       return {sessionId:result.session.sessionId,prompt:(text)=>result.session.prompt(text),subscribe:(cb)=>result.session.subscribe(cb),abort:()=>result.session.abort(),dispose:result.dispose};
     }
   });
@@ -137,6 +144,8 @@ if(initial){
   await forever;
 }else{
   const outbox=new RecoveryOutbox(dir,{epoch:mode});
+  await journal.initialize();
+  await journal.importOldEpoch(outbox);
   await store.importOldEpoch(outbox);
   if(mode==='receipt-death'){
     const delivered=outbox.delivered.bind(outbox);
@@ -145,7 +154,7 @@ if(initial){
   const acknowledged=Promise.withResolvers();
   const acknowledge=store.acknowledgeNotice.bind(store);
   store.acknowledgeNotice=async(record)=>{await acknowledge(record);acknowledged.resolve()};
-  const dispatcher=new RecoveryDispatcher(outbox,router,{backgroundObligations:store,onError:acknowledged.reject});
+  const dispatcher=new RecoveryDispatcher(outbox,router,{backgroundObligations:store,inboundJournal:journal,onError:acknowledged.reject});
   await dispatcher.wake();
   if((await store.list()).some(row=>row.phase!=='closed'))await acknowledged.promise;
   await dispatcher.stop();

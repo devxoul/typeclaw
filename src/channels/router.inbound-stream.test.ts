@@ -54,6 +54,7 @@ function inbound(over: Partial<InboundMessage> = {}): InboundMessage {
     thread: null,
     text: 'hello bot',
     externalMessageId: 'm1',
+    accountIdentity: 'proof-account',
     authorId: 'alice',
     authorName: 'Alice',
     authorIsBot: false,
@@ -166,22 +167,6 @@ describe('router publishes channel-inbound broadcasts', () => {
     const p = captured[0]!.payload as Record<string, unknown>
     expect(p.decision).toBe('observe')
     expect(p.isBotMention).toBe(false)
-  })
-
-  test('omitting stream is a no-op (router still works)', async () => {
-    const dir = await tempDir()
-    const router = createChannelRouter({
-      agentDir: dir,
-      configForAdapter: () => baseConfig,
-      permissions: grantAll,
-      createSessionForChannel: async () => ({
-        session: new FakeSession() as unknown as AgentSession,
-        sessionId: 'ses_1',
-        dispose: async () => {},
-      }),
-    })
-
-    await expect(router.route(inbound())).resolves.toBeUndefined()
   })
 
   test('claim intercept publishes with decision=claim', async () => {

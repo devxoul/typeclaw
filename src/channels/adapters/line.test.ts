@@ -475,7 +475,10 @@ function makeRouterStub(onRoute: (m: InboundMessage) => void) {
   const registered = { outbound: false, history: false, nameResolver: false }
   return {
     registered,
-    route: async (m: InboundMessage) => onRoute(m),
+    route: async (m: InboundMessage) => {
+      onRoute(m)
+      return { kind: 'accepted' as const, inputId: m.externalMessageId, generation: 0 }
+    },
     registerSelfIdentity: () => {},
     unregisterSelfIdentity: () => {},
     registerOutbound: () => {
