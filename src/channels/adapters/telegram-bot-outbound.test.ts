@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test'
-import { mkdtemp, readFile, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { basename, join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 
 import type { TelegramBotClient, TelegramMessage } from 'agent-messenger/telegrambot'
 
@@ -336,6 +336,35 @@ describe('telegram-bot createOutboundCallback', () => {
     if (result.ok) throw new Error('expected error')
     expect(result.error).toContain('sendDocument failed')
     expect(fake.sendMessageCalls).toHaveLength(0)
+  })
+
+  test('removes the staged copy and keeps the source when a renamed upload fails', async () => {
+    // given a renamed attachment whose upload Telegram rejects
+    const fake = fakeClient()
+    fake.setSendDocumentBehavior(async () => {
+      throw new Error('upload failed: 413 too large')
+    })
+    const dir = await mkdtemp(join(tmpdir(), 'telegram-outbound-'))
+    const path = join(dir, 'tmp-3f9a2.pdf')
+    await writeFile(path, 'report body')
+    const cb = createOutboundCallback({
+      client: fake.client,
+      logger: silentLogger(),
+      formatChannelTag: async () => 'chat=-100123',
+    })
+
+    // when
+    const result = await cb(buildOutbound({ text: 'context', attachments: [{ path, filename: '보고서.pdf' }] }))
+
+    // then the error surfaces, no text posts, the staged dir is gone, the source is intact
+    expect(result.ok).toBe(false)
+    if (result.ok) throw new Error('expected error')
+    expect(result.error).toContain('sendDocument failed')
+    expect(fake.sendMessageCalls).toHaveLength(0)
+    const stagedPath = fake.sendDocumentCalls[0]?.filePath ?? ''
+    expect(basename(stagedPath)).toBe('보고서.pdf')
+    expect(await stat(dirname(stagedPath)).catch(() => null)).toBeNull()
+    expect(await readFile(path, 'utf8')).toBe('report body')
   })
 
   test('refuses outbound with neither text nor attachments', async () => {
