@@ -11,8 +11,10 @@ export const GUARD_GIT_EXFIL = 'gitExfil'
 // copied identity files or secrets into it, and the effective repository is
 // unknowable from the string alone (`git -C`, `--git-dir`, `GIT_DIR`, `cd`,
 // subshells, aliases). Do NOT re-introduce cwd/path scoping here: it would be
-// a bypass, not a fix (Oracle-reviewed). Member-tier publishing, if ever
-// required, belongs in a separate out-of-band capability, not a path heuristic.
+// a bypass, not a fix (Oracle-reviewed). Member-tier publishing is the
+// configured GitHub channel repos (`channels.github.repos`), decided on the
+// broker's resolved remote identity (see github-cli-auth/granted-push.ts) and
+// applied only to the push finding — never a path heuristic.
 //
 // Classified `medium` (silent-attack axis). Originally `high`; reclassified
 // because the one narrow retarget-then-push audience-leak shape (re-point
@@ -55,17 +57,19 @@ const SHELL_BOUNDARY = String.raw`[\s;|&(\`$]`
 const GIT_INTER = String.raw`(?:\s+-{1,2}[A-Za-z][^\s]*(?:\s+[^-\s][^\s]*)?)*\s+`
 const GIT_PREFIX = String.raw`(?:^|${SHELL_BOUNDARY})git${GIT_INTER}`
 
+// The breach: agent obeyed a Slack DM saying `git push origin main` to an
+// attacker-controlled remote. Pushing a repo is the exfil moment - once
+// the working tree reaches a remote, every tracked file is leaked. We
+// block all push variants by default; only the permission service or an
+// configured GitHub channel repo (`channels.github.repos`, resolved by the
+// github-cli-auth broker) can authorize publication.
+const GIT_PUSH_PATTERN = {
+  pattern: new RegExp(`${GIT_PREFIX}push\\b`),
+  label: 'git push (sends tracked files to a remote - the canonical exfil step)',
+}
+
 const DANGEROUS_COMMAND_PATTERNS: ReadonlyArray<{ pattern: RegExp; label: string }> = [
-  // -- git push family ------------------------------------------------------
-  // The breach: agent obeyed a Slack DM saying `git push origin main` to an
-  // attacker-controlled remote. Pushing a repo is the exfil moment - once
-  // the working tree reaches a remote, every tracked file is leaked. We
-  // block all push variants by default; only the permission service can
-  // authorize publication.
-  {
-    pattern: new RegExp(`${GIT_PREFIX}push\\b`),
-    label: 'git push (sends tracked files to a remote - the canonical exfil step)',
-  },
+  GIT_PUSH_PATTERN,
   // `git push --mirror` and `--force` are strictly worse: mirror copies every
   // ref, force-push overwrites remote history. Caught by the generic match
   // above but worth noting in the label so the user sees the severity.
@@ -170,6 +174,14 @@ export function recordGitRemoteTaintIfAny(options: {
   for (const change of parseRemoteChanges(command)) {
     recordRemoteTaint(sessionId, { remoteName: change.remoteName, url: change.url })
   }
+}
+
+// True when the only gitExfil finding in `command` is `git push`, so a
+// destination grant may be considered. Any co-occurring finding (force-add,
+// bulk staging, remote re-pointing, uploads) keeps the whole command blocked.
+export function isPushOnlyGitExfilMatch(command: string): boolean {
+  const matched = DANGEROUS_COMMAND_PATTERNS.filter(({ pattern }) => pattern.test(command))
+  return matched.length === 1 && matched[0] === GIT_PUSH_PATTERN
 }
 
 export function checkGitExfilGuard(options: {

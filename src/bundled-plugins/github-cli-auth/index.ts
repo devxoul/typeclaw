@@ -38,6 +38,7 @@ import {
   resolveGhDefaultRepoFromCwd,
 } from './git-command'
 import { buildGitCredentialEnv, type GitRepoCredential } from './git-credential-env'
+import { matchesGrantedPush, takeGrantedPush } from './granted-push'
 import { checkGraphqlAuthNudge } from './graphql-auth-nudge'
 import { commitReviewIfSucceeded, dismissalMutationSucceeded, noteReviewCommand } from './review-recorder'
 import { classifyGhToken, shouldMintAppToken } from './token-class'
@@ -176,6 +177,8 @@ export default definePlugin({
     // names both remedies instead of guessing one. The closing lines exist because
     // a mute refusal here is indistinguishable from broken auth, so the caller
     // retries credential-management commands that are themselves blocked.
+    const grantedPushMismatchReason =
+      'This push was allowed for one configured channels.github.repos destination, but the credential broker resolved a different one (the remote may have changed). Re-run the push; if it repeats, check the remote with `git remote -v`.'
     const missingAppAuthForPushReason =
       'Pushing to github.com needs an eligible credential and validated destination, and TypeClaw has nothing it can give this git command. ' +
       'Operator remedy: declare `GH_TOKEN` in the agent `.env` and restart, configure GitHub App auth under ' +
@@ -495,6 +498,10 @@ export default definePlugin({
         cwd: agentDir,
         resolvers: createSessionTmpGitResolvers(agentDir, sessionId),
       })
+      const grantedPush = takeGrantedPush(event.callId)
+      if (grantedPush !== undefined && (!hasAppTokenResolver() || !matchesGrantedPush(decision, grantedPush))) {
+        return { block: true, reason: grantedPushMismatchReason }
+      }
       if (decision.kind === 'pass-through') return
       if (decision.kind === 'block') return { block: true, reason: decision.reason }
 
@@ -613,7 +620,8 @@ export default definePlugin({
           trustedEnv: trustedGitTransportEnv,
         },
       )
-      if (decision.rewrittenCommand !== undefined) event.args.command = decision.rewrittenCommand
+      if (grantedPush !== undefined) event.args.command = grantedPush.command
+      else if (decision.rewrittenCommand !== undefined) event.args.command = decision.rewrittenCommand
       return
     }
 
