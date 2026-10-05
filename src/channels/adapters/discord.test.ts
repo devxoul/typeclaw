@@ -1,4 +1,7 @@
 import { describe, expect, test } from 'bun:test'
+import { mkdtemp, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
 import type { DiscordGatewayMessageCreateEvent, DiscordListener } from 'agent-messenger/discord'
 
@@ -7,7 +10,12 @@ import { channelsSchema } from '@/channels/schema'
 import type { InboundMessage, OutboundCallback } from '@/channels/types'
 import type { DiscordAccountRecord } from '@/secrets/schema'
 
-import { createDiscordAdapter, createDiscordHistoryCallback, type DiscordAdapterLogger } from './discord'
+import {
+  createDiscordAdapter,
+  createDiscordHistoryCallback,
+  createDiscordOutboundCallback,
+  type DiscordAdapterLogger,
+} from './discord'
 
 const config = channelsSchema.parse({ discord: {} }).discord!
 
@@ -337,36 +345,78 @@ describe('createDiscordAdapter', () => {
     expect(sent).toEqual([['300000000000000003', 'on it', { reply_to: '900000000000000009' }]])
   })
 
-  test('attachment-only reply forwards reply_to on the first file upload (native reply)', async () => {
-    const uploads: unknown[] = []
+  test('attachment-only reply carries message_reference on the first file upload only (native reply)', async () => {
+    const { fetchImpl, uploads } = uploadFetch()
     const r = router()
     const adapter = createDiscordAdapter({
       router: r,
       configRef: () => config,
       logger: logger(),
       credentialsStore: { getAccount: async () => account() },
-      createClient: () => fakeClient({ uploadFile: async (...args: unknown[]) => void uploads.push(args) }),
+      createClient: () => fakeClient(),
       createListener: () => new FakeListener() as unknown as DiscordListener,
+      fetchImpl,
     })
+    const a = await tempFile('a.png')
+    const b = await tempFile('b.png')
 
     await adapter.start()
     const result = await r.outbound?.({
       adapter: 'discord',
       workspace: '200000000000000002',
       chat: '300000000000000003',
-      attachments: [{ path: '/tmp/a.png' }, { path: '/tmp/b.png' }],
+      attachments: [{ path: a }, { path: b }],
       replyTo: { externalMessageId: '900000000000000009' },
     })
 
     expect(result).toEqual({ ok: true })
-    expect(uploads).toEqual([
-      ['300000000000000003', '/tmp/a.png', { reply_to: '900000000000000009' }],
-      ['300000000000000003', '/tmp/b.png', undefined],
+    expect(uploads.map((u) => u.payload)).toEqual([
+      { attachments: [{ id: 0, filename: 'a.png' }], message_reference: { message_id: '900000000000000009' } },
+      { attachments: [{ id: 0, filename: 'b.png' }] },
     ])
+    expect(uploads.map((u) => u.url)).toEqual([
+      'https://discord.com/api/v10/channels/300000000000000003/messages',
+      'https://discord.com/api/v10/channels/300000000000000003/messages',
+    ])
+    expect(uploads.every((u) => u.authorization === 'discord-token-test')).toBe(true)
+  })
+
+  test('declares the original filename in payload_json.attachments so Discord does not name it by index', async () => {
+    // given a Korean filename with a space, and an explicit filename override
+    const { fetchImpl, uploads } = uploadFetch()
+    const r = router()
+    const adapter = createDiscordAdapter({
+      router: r,
+      configRef: () => config,
+      logger: logger(),
+      credentialsStore: { getAccount: async () => account() },
+      createClient: () => fakeClient(),
+      createListener: () => new FakeListener() as unknown as DiscordListener,
+      fetchImpl,
+    })
+    const korean = await tempFile('보고서 최종.pdf')
+    const scratch = await tempFile('tmp-3f9a2.png')
+
+    // when
+    await adapter.start()
+    const result = await r.outbound?.({
+      adapter: 'discord',
+      workspace: '200000000000000002',
+      chat: '300000000000000003',
+      attachments: [{ path: korean }, { path: scratch, filename: 'chart.png' }],
+    })
+
+    // then
+    expect(result).toEqual({ ok: true })
+    expect(uploads.map((u) => u.payload)).toEqual([
+      { attachments: [{ id: 0, filename: '보고서 최종.pdf' }] },
+      { attachments: [{ id: 0, filename: 'chart.png' }] },
+    ])
+    expect(uploads.map((u) => u.fileName)).toEqual(['보고서 최종.pdf', 'chart.png'])
   })
 
   test('text+attachment reply keeps reply_to on the text send, files upload bare', async () => {
-    const uploads: unknown[] = []
+    const { fetchImpl, uploads } = uploadFetch()
     const sent: unknown[] = []
     const r = router()
     const adapter = createDiscordAdapter({
@@ -374,13 +424,11 @@ describe('createDiscordAdapter', () => {
       configRef: () => config,
       logger: logger(),
       credentialsStore: { getAccount: async () => account() },
-      createClient: () =>
-        fakeClient({
-          uploadFile: async (...args: unknown[]) => void uploads.push(args),
-          sendMessage: async (...args: unknown[]) => void sent.push(args),
-        }),
+      createClient: () => fakeClient({ sendMessage: async (...args: unknown[]) => void sent.push(args) }),
       createListener: () => new FakeListener() as unknown as DiscordListener,
+      fetchImpl,
     })
+    const a = await tempFile('a.png')
 
     await adapter.start()
     const result = await r.outbound?.({
@@ -388,18 +436,23 @@ describe('createDiscordAdapter', () => {
       workspace: '200000000000000002',
       chat: '300000000000000003',
       text: 'here you go',
-      attachments: [{ path: '/tmp/a.png' }],
+      attachments: [{ path: a }],
       replyTo: { externalMessageId: '900000000000000009' },
     })
 
     expect(result).toEqual({ ok: true })
-    expect(uploads).toEqual([['300000000000000003', '/tmp/a.png', undefined]])
+    expect(uploads.map((u) => u.payload)).toEqual([{ attachments: [{ id: 0, filename: 'a.png' }] }])
     expect(sent).toEqual([['300000000000000003', 'here you go', { reply_to: '900000000000000009' }]])
   })
 
   test('outbound uploads attachments before posting text', async () => {
     // given an outbound with both an attachment and text
     const calls: string[] = []
+    const { fetchImpl: baseFetch } = uploadFetch()
+    const fetchImpl = (async (...args: Parameters<typeof fetch>) => {
+      calls.push('upload')
+      return baseFetch(...args)
+    }) as unknown as typeof fetch
     const r = router()
     const adapter = createDiscordAdapter({
       router: r,
@@ -408,14 +461,15 @@ describe('createDiscordAdapter', () => {
       credentialsStore: { getAccount: async () => account() },
       createClient: () =>
         fakeClient({
-          uploadFile: async () => void calls.push('upload'),
           sendMessage: async () => {
             calls.push('send')
             return { id: '1', channel_id: '3', author: { id: '0', username: 'self' }, content: 'ok', timestamp: '' }
           },
         }),
       createListener: () => new FakeListener() as unknown as DiscordListener,
+      fetchImpl,
     })
+    const a = await tempFile('a.txt')
 
     // when
     await adapter.start()
@@ -424,12 +478,124 @@ describe('createDiscordAdapter', () => {
       workspace: '200000000000000002',
       chat: '300000000000000003',
       text: 'hello',
-      attachments: [{ path: '/tmp/a.txt' }],
+      attachments: [{ path: a }],
     })
 
     // then the upload happens first so a failed upload never leaves text-only posted
     expect(result).toEqual({ ok: true })
     expect(calls).toEqual(['upload', 'send'])
+  })
+
+  test('upload failure aborts before the text is posted', async () => {
+    const { fetchImpl } = uploadFetch(500)
+    const sent: unknown[] = []
+    const r = router()
+    const adapter = createDiscordAdapter({
+      router: r,
+      configRef: () => config,
+      logger: logger(),
+      credentialsStore: { getAccount: async () => account() },
+      createClient: () => fakeClient({ sendMessage: async (...args: unknown[]) => void sent.push(args) }),
+      createListener: () => new FakeListener() as unknown as DiscordListener,
+      fetchImpl,
+    })
+    const a = await tempFile('a.png')
+
+    await adapter.start()
+    const result = await r.outbound?.({
+      adapter: 'discord',
+      workspace: '200000000000000002',
+      chat: '300000000000000003',
+      text: 'caption',
+      attachments: [{ path: a }],
+    })
+
+    expect(result?.ok).toBe(false)
+    expect(result?.ok === false ? result.error : '').toContain('uploadFile failed: http 500')
+    expect(sent).toEqual([])
+  })
+
+  test('retries a rate-limited upload after Retry-After so remaining attachments and text still post', async () => {
+    // given the first upload hits a 429, then Discord accepts everything
+    const { fetchImpl, uploads } = uploadFetch([429])
+    const sleeps: number[] = []
+    const sent: unknown[] = []
+    const cb = createDiscordOutboundCallback({
+      client: fakeClient({ sendMessage: async (...args: unknown[]) => void sent.push(args) }),
+      logger: logger(),
+      formatChannelTag: async (chat) => `channel=${chat}`,
+      tokenRef: () => 'discord-token-test',
+      fetchImpl,
+      sleep: async (ms) => void sleeps.push(ms),
+    })
+    const a = await tempFile('a.png')
+    const b = await tempFile('b.png')
+
+    // when
+    const result = await cb({
+      adapter: 'discord',
+      workspace: '200000000000000002',
+      chat: '300000000000000003',
+      text: 'caption',
+      attachments: [{ path: a }, { path: b }],
+    })
+
+    // then the 429'd upload is retried once, the second file and the text follow
+    expect(result).toEqual({ ok: true })
+    expect(sleeps).toEqual([2_000])
+    expect(uploads.map((u) => u.fileName)).toEqual(['a.png', 'a.png', 'b.png'])
+    expect(sent).toEqual([['300000000000000003', 'caption', undefined]])
+  })
+
+  test('waits out the full Retry-After cooldown rather than capping it', async () => {
+    const { fetchImpl } = uploadFetch([429], '30')
+    const sleeps: number[] = []
+    const cb = createDiscordOutboundCallback({
+      client: fakeClient(),
+      logger: logger(),
+      formatChannelTag: async (chat) => `channel=${chat}`,
+      tokenRef: () => 'discord-token-test',
+      fetchImpl,
+      sleep: async (ms) => void sleeps.push(ms),
+    })
+    const a = await tempFile('a.png')
+
+    const result = await cb({
+      adapter: 'discord',
+      workspace: '200000000000000002',
+      chat: '300000000000000003',
+      attachments: [{ path: a }],
+    })
+
+    expect(result).toEqual({ ok: true })
+    expect(sleeps).toEqual([30_000])
+  })
+
+  test('gives up after the bounded 429 retries without posting the text', async () => {
+    const { fetchImpl, uploads } = uploadFetch([429, 429, 429])
+    const sent: unknown[] = []
+    const cb = createDiscordOutboundCallback({
+      client: fakeClient({ sendMessage: async (...args: unknown[]) => void sent.push(args) }),
+      logger: logger(),
+      formatChannelTag: async (chat) => `channel=${chat}`,
+      tokenRef: () => 'discord-token-test',
+      fetchImpl,
+      sleep: async () => {},
+    })
+    const a = await tempFile('a.png')
+
+    const result = await cb({
+      adapter: 'discord',
+      workspace: '200000000000000002',
+      chat: '300000000000000003',
+      text: 'caption',
+      attachments: [{ path: a }],
+    })
+
+    expect(result.ok).toBe(false)
+    expect(result.ok === false ? result.error : '').toContain('uploadFile failed: http 429')
+    expect(uploads).toHaveLength(3)
+    expect(sent).toEqual([])
   })
 
   test('listener start failure rolls back registrations', async () => {
@@ -563,14 +729,39 @@ function fakeClient(
       content: 'ok',
       timestamp: '2026-01-01T00:00:00.000Z',
     }),
-    uploadFile: async () => ({
-      id: '700000000000000007',
-      filename: 'a.txt',
-      size: 1,
-      url: 'https://cdn.example.invalid/a.txt',
-    }),
     addReaction: async () => {},
     removeReaction: async () => {},
     ...overrides,
   } as unknown as ReturnType<NonNullable<Parameters<typeof createDiscordAdapter>[0]['createClient']>>
+}
+
+type UploadCall = { url: string; authorization: string | null; payload: unknown; fileName: string }
+
+// Fake Discord create-message endpoint. Echoes the filename declared in
+// payload_json.attachments, which is what real Discord names the attachment.
+function uploadFetch(
+  statuses: number | number[] = 200,
+  retryAfter = '2',
+): { fetchImpl: typeof fetch; uploads: UploadCall[] } {
+  const uploads: UploadCall[] = []
+  const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url
+    const body = init?.body as FormData
+    const payload = JSON.parse(body.get('payload_json') as string) as { attachments: Array<{ filename: string }> }
+    const authorization = new Headers(init?.headers).get('authorization')
+    uploads.push({ url, authorization, payload, fileName: (body.get('files[0]') as File).name })
+    const status = Array.isArray(statuses) ? (statuses[uploads.length - 1] ?? 200) : statuses
+    if (status === 429) return new Response('{}', { status, headers: { 'retry-after': retryAfter } })
+    if (status !== 200) return new Response('boom', { status })
+    const filename = payload.attachments[0]?.filename ?? 'unknown'
+    return new Response(JSON.stringify({ attachments: [{ id: `f${uploads.length}`, filename, size: 3 }] }))
+  }) as unknown as typeof fetch
+  return { fetchImpl, uploads }
+}
+
+async function tempFile(name: string): Promise<string> {
+  const dir = await mkdtemp(join(tmpdir(), 'discord-upload-'))
+  const path = join(dir, name)
+  await writeFile(path, 'png')
+  return path
 }

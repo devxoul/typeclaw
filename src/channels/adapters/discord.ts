@@ -1,6 +1,10 @@
+import { readFile } from 'node:fs/promises'
+import { basename } from 'node:path'
+
 import {
   DiscordClient,
   DiscordListener,
+  type DiscordFile,
   type DiscordGatewayMessageCreateEvent,
   type DiscordMessage,
 } from 'agent-messenger/discord'
@@ -58,6 +62,8 @@ const consoleLogger: DiscordAdapterLogger = {
   error: (m) => console.error(m),
 }
 
+const DISCORD_API_BASE = 'https://discord.com/api/v10'
+
 export type DiscordCredentialStore = {
   getAccount(id?: string): Promise<DiscordAccountRecord | null>
 }
@@ -82,10 +88,15 @@ export type DiscordAdapter = {
 }
 
 export function createDiscordOutboundCallback(deps: {
-  client: Pick<DiscordClient, 'sendMessage' | 'uploadFile'>
+  client: Pick<DiscordClient, 'sendMessage'>
   logger: DiscordAdapterLogger
   formatChannelTag: (chat: string) => Promise<string>
+  tokenRef: () => string | null
+  fetchImpl?: typeof fetch
+  sleep?: (ms: number) => Promise<void>
 }): OutboundCallback {
+  const fetchImpl = deps.fetchImpl ?? fetch
+  const sleep = deps.sleep ?? ((ms: number) => Bun.sleep(ms))
   return async (msg: OutboundMessage): Promise<SendResult> => {
     if (msg.adapter !== 'discord') return { ok: false, error: `unknown adapter: ${msg.adapter}` }
     const text = msg.text ?? ''
@@ -102,11 +113,20 @@ export function createDiscordOutboundCallback(deps: {
     const replyOption = (reference: string | undefined): { reply_to: string } | undefined =>
       reference !== undefined ? { reply_to: reference } : undefined
     try {
-      // Attachments first, then text — Discord's upstream uploadFile takes no
-      // content body, so a failed upload must not leave a text-only message
-      // already posted (see OutboundMessage.attachments contract).
+      // Attachments first, then text, so a failed upload never leaves a
+      // text-only message already posted (see OutboundMessage.attachments).
       for (const [index, attachment] of attachments.entries()) {
-        await deps.client.uploadFile(msg.chat, attachment.path, replyOption(index === 0 ? replyOnFirstFile : undefined))
+        const token = deps.tokenRef()
+        if (token === null) throw new Error('discord account is not logged in')
+        await uploadDiscordUserFile({
+          channelId: msg.chat,
+          path: attachment.path,
+          filename: attachment.filename ?? (basename(attachment.path) || 'file'),
+          replyToId: index === 0 ? replyOnFirstFile : undefined,
+          token,
+          fetchImpl,
+          sleep,
+        })
       }
       if (text !== '') {
         const chunks = chunkMarkdown(text, 2_000)
@@ -122,6 +142,69 @@ export function createDiscordOutboundCallback(deps: {
       return { ok: false, error: message }
     }
   }
+}
+
+// Raw multipart create-message instead of the SDK's `uploadFile`. The SDK
+// sends only a `files[0]` part and leaves Discord to recover the name from its
+// Content-Disposition header; when Discord can't, the attachment is named by
+// the part index and lands in chat as `0`, `1`, .... Declaring the filename in
+// `payload_json.attachments` (Discord's documented upload shape) is
+// unambiguous UTF-8 JSON, and is also what lets the OutboundAttachment
+// `filename` override reach the chat.
+//
+// Bypassing the SDK also bypasses its per-bucket rate-limit pacing, so a 429
+// is retried here after Discord's Retry-After delay instead of aborting the
+// remaining attachments and text.
+async function uploadDiscordUserFile(args: {
+  channelId: string
+  path: string
+  filename: string
+  replyToId: string | undefined
+  token: string
+  fetchImpl: typeof fetch
+  sleep: (ms: number) => Promise<void>
+}): Promise<DiscordFile> {
+  const fileBuffer = await readFile(args.path)
+  const payload = {
+    attachments: [{ id: 0, filename: args.filename }],
+    ...(args.replyToId !== undefined ? { message_reference: { message_id: args.replyToId } } : {}),
+  }
+  for (let attempt = 1; ; attempt++) {
+    // FormData bodies are single-use streams, so rebuild per attempt.
+    const form = new FormData()
+    form.append('payload_json', JSON.stringify(payload))
+    form.append('files[0]', new Blob([new Uint8Array(fileBuffer)]), args.filename)
+    const response = await args.fetchImpl(`${DISCORD_API_BASE}/channels/${args.channelId}/messages`, {
+      method: 'POST',
+      headers: { Authorization: args.token },
+      body: form,
+    })
+    if (response.status === 429 && attempt < UPLOAD_MAX_ATTEMPTS) {
+      await args.sleep(retryAfterMs(response))
+      continue
+    }
+    if (!response.ok) {
+      const body = await response.text().catch(() => '')
+      throw new Error(`uploadFile failed: http ${response.status}${body ? `: ${body.slice(0, 200)}` : ''}`)
+    }
+    const message = (await response.json()) as { attachments?: DiscordFile[] }
+    const first = message.attachments?.[0]
+    if (first === undefined) throw new Error('uploadFile failed: upload succeeded but no attachments returned')
+    return first
+  }
+}
+
+const UPLOAD_MAX_ATTEMPTS = 3
+
+function retryAfterMs(response: Response): number {
+  // Number(null) and Number('') are 0, so a missing header must be caught
+  // before conversion or it becomes a zero-delay retry.
+  const header = response.headers.get('retry-after')?.trim() ?? ''
+  const seconds = header === '' ? Number.NaN : Number(header)
+  if (!Number.isFinite(seconds) || seconds < 0) return 1_000
+  // Honor the full cooldown, as the SDK's own rate-limit handling does: a
+  // capped wait retries before the bucket resets and burns the attempts.
+  return seconds * 1_000
 }
 
 export function createDiscordHistoryCallback(deps: {
@@ -226,7 +309,13 @@ export function createDiscordAdapter(options: DiscordAdapterOptions): DiscordAda
   }
   const historyCallback = createDiscordHistoryCallback({ client, logger })
   const membershipResolver = createDiscordMembershipResolver({ historyCallback })
-  const outboundCallback = createDiscordOutboundCallback({ client, logger, formatChannelTag })
+  const outboundCallback = createDiscordOutboundCallback({
+    client,
+    logger,
+    formatChannelTag,
+    tokenRef: () => token,
+    fetchImpl: options.fetchImpl,
+  })
   const fetchAttachmentCallback = createDiscordFetchAttachmentCallback({
     tokenRef: () => token,
     fetchImpl: options.fetchImpl,
