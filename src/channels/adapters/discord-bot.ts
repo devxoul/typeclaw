@@ -1,4 +1,5 @@
 import { readFile } from 'node:fs/promises'
+import { basename } from 'node:path'
 
 import { DiscordBotClient, DiscordBotListener, type DiscordBotListenerOptions } from 'agent-messenger/discordbot'
 import {
@@ -869,7 +870,7 @@ const UPLOAD_MAX_ATTEMPTS = 3
 const UPLOAD_MAX_RETRY_AFTER_MS = 10_000
 
 function basenameOf(path: string): string {
-  return path.split('/').pop() || 'file'
+  return basename(path) || 'file'
 }
 
 async function uploadDiscordFile(args: {

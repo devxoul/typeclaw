@@ -6,7 +6,6 @@ import { join } from 'node:path'
 import type {
   DiscordBotClient,
   DiscordBotListener,
-  DiscordFile,
   DiscordGatewayMessageCreateEvent,
   DiscordMessage,
 } from 'agent-messenger/discordbot'
