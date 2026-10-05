@@ -870,7 +870,6 @@ type DiscordCreateMessageWithAttachments = {
 }
 
 const UPLOAD_MAX_ATTEMPTS = 3
-const UPLOAD_MAX_RETRY_AFTER_MS = 10_000
 
 function basenameOf(path: string): string {
   return basename(path) || 'file'
@@ -925,7 +924,9 @@ function retryAfterMs(response: Response): number {
   const header = response.headers.get('retry-after')?.trim() ?? ''
   const seconds = header === '' ? Number.NaN : Number(header)
   if (!Number.isFinite(seconds) || seconds < 0) return 1_000
-  return Math.min(seconds * 1_000, UPLOAD_MAX_RETRY_AFTER_MS)
+  // Honor the full cooldown, as the SDK's own rate-limit handling does: a
+  // capped wait retries before the bucket resets and burns the attempts.
+  return seconds * 1_000
 }
 
 // Discord CDN URLs (`cdn.discordapp.com/attachments/...`) are signed and

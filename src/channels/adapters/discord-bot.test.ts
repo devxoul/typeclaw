@@ -1667,7 +1667,7 @@ describe('discord-bot createOutboundCallback', () => {
 
   // Fake Discord create-message endpoint. Echoes back the filename declared in
   // payload_json.attachments, which is what real Discord names the attachment.
-  function makeUploadFetch(responses: Array<'ok' | 429 | '429-no-header' | 500> = []): {
+  function makeUploadFetch(responses: Array<'ok' | 429 | '429-no-header' | '429-long' | 500> = []): {
     fetchImpl: typeof fetch
     uploads: UploadCall[]
   } {
@@ -1682,6 +1682,9 @@ describe('discord-bot createOutboundCallback', () => {
         return new Response('{"retry_after":0}', { status: 429, headers: { 'retry-after': '0' } })
       }
       if (behavior === '429-no-header') return new Response('{}', { status: 429 })
+      if (behavior === '429-long') {
+        return new Response('{}', { status: 429, headers: { 'retry-after': '30' } })
+      }
       if (behavior === 500) return new Response('boom', { status: 500 })
       const filename = payload.attachments[0]?.filename ?? 'unknown'
       return new Response(JSON.stringify({ attachments: [{ id: `f${uploads.length}`, filename, size: 3 }] }), {
@@ -1919,6 +1922,24 @@ describe('discord-bot createOutboundCallback', () => {
     expect(result.ok).toBe(true)
     expect(uploads).toHaveLength(2)
     expect(sleeps).toEqual([0])
+  })
+
+  test('waits out the full Retry-After cooldown rather than capping it', async () => {
+    const { client } = makeFakeClient()
+    const { fetchImpl, uploads } = makeUploadFetch(['429-long', 'ok'])
+    const sleeps: number[] = []
+    const cb = makeOutbound({
+      client,
+      logger: silentLogger(),
+      formatChannelTag: tag,
+      fetchImpl,
+      sleep: async (ms) => void sleeps.push(ms),
+    })
+    const path = await writeTempFile('a.png')
+    const result = await cb(makeMsg({ text: undefined, attachments: [{ path }] }))
+    expect(result.ok).toBe(true)
+    expect(uploads).toHaveLength(2)
+    expect(sleeps).toEqual([30_000])
   })
 
   test('waits the one-second fallback when a 429 carries no Retry-After header', async () => {
