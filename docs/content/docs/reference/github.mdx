@@ -86,7 +86,7 @@ These extend the [shared base config](/docs/reference/channel-adapters) for `cha
 | `webhookUrl`     | string                                    | —                    | Public URL for webhook delivery; tunnel used when omitted                                                        |
 | `webhookPort`    | number                                    | `8975`               | Container-side port the webhook server listens on                                                                |
 | `eventAllowlist` | string[]                                  | (12 defaults)        | Events that trigger the adapter                                                                                  |
-| `repos`          | string[]                                  | `[]`                 | `owner/name` pairs; hooks auto-registered on start                                                               |
+| `repos`          | string[]                                  | `[]`                 | `owner/name` pairs; hooks auto-registered on start; members may push branches to them (see below)                |
 | `review.on`      | `'review_requested' \| 'opened' \| 'off'` | `'review_requested'` | When to fire a review                                                                                            |
 | `review.approve` | boolean                                   | `true`               | `false` downgrades APPROVE verdicts to COMMENT; a re-review that clears the bot's own block dismisses it instead |
 
@@ -152,6 +152,14 @@ Requires `pull_request.synchronize` in `eventAllowlist`. It is in the shipped de
 - On tunnel URL change, the adapter restarts and re-registers automatically.
 
 ## Config
+
+### Letting channel members open PRs
+
+Roles without `security.bypass.gitExfil` (such as member) can still push a branch to any repository listed in `repos`, so a member can ask the agent for a PR. Other `git push` destinations still need the bypass.
+
+This is deliberately narrow. It needs GitHub App auth and applies only to a standalone `git push <remote> <branch>` (optionally `-u`) whose configured remote resolves to exactly one listed repository, with one plainly named branch. `src:dst` retargeting, `:branch` deletion, `+`/`--force`, tags, explicit URLs, and commands that also force-add, bulk-stage, re-point a remote, or upload files stay blocked. The push is funded with that repository's App token, and the agent then opens the PR with an explicit `gh pr create --repo … --head … --base … --title … --body …`.
+
+Listing a repository in `repos` therefore authorizes publishing branch **content** to it for every role that can reach the agent; git objects are not scanned for secrets. Pair it with branch protection on the default branch, and scope `roles.member.match` to the people who should be able to ask for PRs — a signed webhook authenticates delivery, not the commenter's entitlement.
 
 ```json
 {
