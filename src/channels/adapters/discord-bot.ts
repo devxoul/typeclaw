@@ -786,9 +786,11 @@ export function createOutboundCallback(deps: {
   token: string
   resolvePath?: (path: string) => string
   fetchImpl?: typeof fetch
+  sleep?: (ms: number) => Promise<void>
 }): OutboundCallback {
   const { client, logger, formatChannelTag, token, resolvePath } = deps
   const fetchImpl = deps.fetchImpl ?? fetch
+  const sleep = deps.sleep ?? ((ms: number) => Bun.sleep(ms))
   return async (msg: OutboundMessage): Promise<SendResult> => {
     if (msg.adapter !== 'discord-bot') {
       return { ok: false, error: `unknown adapter: ${msg.adapter}` }
@@ -819,6 +821,7 @@ export function createOutboundCallback(deps: {
           replyToId: index === 0 ? replyOnFirstFile : undefined,
           token,
           fetchImpl,
+          sleep,
         })
         logger.info(`[discord-bot] uploaded id=${file.id} filename=${file.filename} size=${file.size} ${tag}`)
         if (msg.thread) {
@@ -880,6 +883,7 @@ async function uploadDiscordFile(args: {
   replyToId: string | undefined
   token: string
   fetchImpl: typeof fetch
+  sleep: (ms: number) => Promise<void>
 }): Promise<DiscordFile> {
   const fileBuffer = await readFile(args.path)
   const payload = {
@@ -899,7 +903,7 @@ async function uploadDiscordFile(args: {
     // The SDK upload path this replaced retried rate limits; keep that so a
     // burst of attachments doesn't fail the whole send on the first 429.
     if (response.status === 429 && attempt < UPLOAD_MAX_ATTEMPTS) {
-      await Bun.sleep(retryAfterMs(response))
+      await args.sleep(retryAfterMs(response))
       continue
     }
     if (!response.ok) {
@@ -916,7 +920,10 @@ async function uploadDiscordFile(args: {
 }
 
 function retryAfterMs(response: Response): number {
-  const seconds = Number(response.headers.get('retry-after'))
+  // Number(null) and Number('') are 0, so a missing header must be caught
+  // before conversion or it becomes a zero-delay retry.
+  const header = response.headers.get('retry-after')?.trim() ?? ''
+  const seconds = header === '' ? Number.NaN : Number(header)
   if (!Number.isFinite(seconds) || seconds < 0) return 1_000
   return Math.min(seconds * 1_000, UPLOAD_MAX_RETRY_AFTER_MS)
 }
