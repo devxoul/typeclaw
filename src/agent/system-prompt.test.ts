@@ -98,18 +98,19 @@ describe('agent folder vs project repo', () => {
     expect(prompt).toMatch(/not a (software )?project (checkout|you develop)|not a checkout of any project/i)
   })
 
-  // The runtime brokers a per-repo credential for a standalone project push, so
-  // neither prompt may claim model-driven bash cannot push. `gh pr create` is
-  // the only host-stage-only step; conflating the two strands real work.
+  // The runtime brokers a per-repo credential for a standalone project push and
+  // for an explicit inline `gh pr create`, so neither prompt may send PR
+  // creation to the operator; doing so strands real work.
   test.each([
     ['default prompt', DEFAULT_SYSTEM_PROMPT],
     ['slim prompt', SLIM_SYSTEM_PROMPT],
-  ])('splits brokered push from host-stage-only PR creation in the %s', (_name, prompt) => {
+  ])('tells the agent to push through the broker and open the PR itself in the %s', (_name, prompt) => {
     expect(prompt).toContain('git -C <checkout> push <remote> <branch>')
     expect(prompt).toMatch(/any accessible repository path/i)
     expect(prompt).not.toMatch(/git[^\n]*push\s+(?:-u|--set-upstream)/i)
     expect(prompt).toMatch(/broker[\s\S]*?credential/i)
-    expect(prompt).toMatch(/gh pr create[\s\S]*?host-stage only/i)
+    expect(prompt).toMatch(/gh pr create[\s\S]*?--head[\s\S]*?--base/i)
+    expect(prompt).not.toMatch(/gh pr create[^\n]*host-stage only/i)
     expect(prompt).toMatch(/refus/i)
     expect(prompt).not.toMatch(/cannot push or create a PR/i)
   })
@@ -130,7 +131,7 @@ describe('agent folder vs project repo', () => {
   test.each([
     ['channel-github skill', 'typeclaw-channel-github'],
     ['github-contributing skill', 'typeclaw-github-contributing'],
-  ])('mirrors the brokered-push / host-stage-PR split in the %s', (_name, slug) => {
+  ])('mirrors the brokered push and in-session PR creation guidance in the %s', (_name, slug) => {
     const skill = readFileSync(join(import.meta.dir, '..', 'skills', slug, 'SKILL.md'), 'utf8')
     expect(skill).toMatch(/push <remote> <branch>/)
     expect(skill).toMatch(/any accessible repository path/i)
@@ -138,8 +139,10 @@ describe('agent folder vs project repo', () => {
     expect(skill).toMatch(/gh auth login --hostname github\.com/)
     expect(skill).not.toMatch(/push -u origin <branch>/)
     expect(skill).toMatch(/broker[\s\S]*?credential/i)
-    expect(skill).toMatch(/gh pr create[\s\S]*?host-stage only/i)
-    expect(skill).toMatch(/refuse it/i)
+    expect(skill).toMatch(/gh pr create --repo[^\n]*--head[^\n]*--base/i)
+    expect(skill).not.toMatch(/gh pr create[^\n]*host-stage only/i)
+    expect(skill).toMatch(/channels\.github\.repos/)
+    expect(skill).toMatch(/refuse/i)
     expect(skill).not.toMatch(/cannot (push or create|create or push) a PR/i)
     expect(skill).not.toMatch(/cannot run `gh pr checkout` or authenticated `git push`/i)
   })

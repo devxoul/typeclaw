@@ -102,11 +102,11 @@ The same applies to PRs: a quick `gh pr list --search` avoids opening a PR for s
    ```sh
    git -C <checkout> push <remote> <branch>
    ```
-   Then prepare the exact title, body, head branch and base branch and ask the operator to run this at the host stage from that same checkout:
+   Then open the PR yourself, with every field explicit and inline:
    ```sh
    gh pr create --repo OWNER/REPO --title '<conventional title>' --body '<filled body>' --head <branch> --base <branch>
    ```
-   `gh pr create` is host-stage only: TypeClaw blocks it because it may invoke local Git hooks with reusable credentials. Fix ordinary Git errors yourself and retry; only hand the operator a push command when the broker or your permissions refuse it. If the trusted store is unavailable, ask the operator to run `gh auth login --hostname github.com` on the host; the next real `typeclaw start` or `typeclaw restart` refreshes it automatically, while a start against an already-running container does not. When handing off, name a host-accessible checkout; never direct the operator to a per-session `/tmp` path.
+   All five flags are required (`--draft` is optional). `--fill`, `--body-file`, `--template`, `--editor`, `--web` and `--attach` are refused because they read local files or open an editor/browser while the credential is live; omitting `--head` would make gh interrogate the checkout and offer to push. Fix ordinary Git errors yourself and retry. Without the `gitExfil` bypass, a plain one-branch push still works to repos listed in `channels.github.repos` under GitHub App auth; if `gitExfil` refuses it anyway, your role can't publish to that repository — surface the denial and only hand the operator a push command when the broker or your permissions refuse it. If the trusted store is unavailable, ask the operator to run `gh auth login --hostname github.com` on the host; the next real `typeclaw start` or `typeclaw restart` refreshes it automatically, while a start against an already-running container does not. When handing off, name a host-accessible checkout; never direct the operator to a per-session `/tmp` path.
 5. **Verify it landed** as intended (`gh issue view` / `gh pr view`) — confirm the template rendered and nothing got truncated.
 
 ## Things you must not do
