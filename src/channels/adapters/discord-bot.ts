@@ -1,4 +1,5 @@
 import { readFile } from 'node:fs/promises'
+import { basename } from 'node:path'
 
 import { DiscordBotClient, DiscordBotListener, type DiscordBotListenerOptions } from 'agent-messenger/discordbot'
 import {
@@ -749,15 +750,22 @@ function clampLimit(requested: number, max: number): number {
   return Math.min(Math.floor(requested), max)
 }
 
-// Discord-side asymmetry: agent-messenger's upstream `uploadFile` posts the
-// file to `POST /channels/{id}/messages` as a multipart-only request. It does
-// not accept a `content` body or a `thread_id`. So when the agent wants to
-// send "text + file together in a thread", we cannot do it in one round-trip
-// the way Slack can. Compromise that preserves observable intent without
-// patching upstream:
-//   1. Upload each attachment individually via uploadFile(chat, path).
-//      Files land in channel root even when the session is in a thread —
-//      logged as a warning so it shows up in operator triage.
+// Every file goes through a raw multipart create-message (uploadDiscordFile)
+// rather than agent-messenger's `uploadFile`. The SDK sends only the
+// `files[0]` part and relies on Discord parsing the filename out of the
+// Content-Disposition header; Discord's attachment pipeline does not reliably
+// recover non-ASCII filenames from that header and falls back to the part
+// index, so files land as `0`, `1`, ... in the chat. Declaring the filename in
+// `payload_json.attachments` (the documented shape, matching what discord.js
+// sends) is unambiguous UTF-8 JSON. It is also the only way to honor the
+// OutboundAttachment `filename` override and to attach a `message_reference`.
+//
+// Discord-side asymmetry: a file upload here does not accept a `thread_id`, so
+// "text + file together in a thread" cannot happen in one round-trip the way
+// Slack can. Compromise that preserves observable intent:
+//   1. Upload each attachment individually. Files land in channel root even
+//      when the session is in a thread — logged as a warning so it shows up in
+//      operator triage.
 //   2. After uploads, if `text` was provided, send it via sendMessage with
 //      thread_id when applicable. Text DOES get the thread, file does not.
 // Failure semantics: if any upload fails, we abort and return ok:false with
@@ -765,17 +773,14 @@ function clampLimit(requested: number, max: number): number {
 // part of the message). The text post is best-effort and only attempted
 // after every upload succeeds.
 //
-// Native reply on an attachment-only send: the SDK's `uploadFile` cannot carry
-// a `message_reference`, so a reply-arrow on a pure-attachment reply is
-// impossible through it. When `msg.replyTo` is set AND there is no text send to
-// carry the reference, the FIRST file upload goes through a raw multipart POST
-// with a `payload_json.message_reference` instead (uploadFirstFileWithReply) so
-// the file message itself is the native reply. Only the first file carries it —
-// otherwise Discord renders one reply-arrow per attachment. Remaining files, and
-// every upload on a send that also has text (the text send carries the
-// reference), stay on the SDK path.
+// Native reply on an attachment-only send: when `msg.replyTo` is set AND there
+// is no text send to carry the reference, the FIRST file upload carries
+// `payload_json.message_reference` so the file message itself is the native
+// reply. Only the first file carries it — otherwise Discord renders one
+// reply-arrow per attachment. On a send that also has text, the text send
+// carries the reference instead.
 export function createOutboundCallback(deps: {
-  client: Pick<DiscordBotClient, 'sendMessage' | 'uploadFile'>
+  client: Pick<DiscordBotClient, 'sendMessage'>
   logger: DiscordBotAdapterLogger
   formatChannelTag: (workspace: string, chat: string) => Promise<string>
   token: string
@@ -805,23 +810,21 @@ export function createOutboundCallback(deps: {
 
     for (const [index, attachment] of attachments.entries()) {
       const path = resolvePath ? resolvePath(attachment.path) : attachment.path
-      const referenceThisFile = index === 0 ? replyOnFirstFile : undefined
+      const filename = attachment.filename ?? basenameOf(attachment.path)
       try {
-        const file =
-          referenceThisFile !== undefined
-            ? await uploadFirstFileWithReply({
-                channelId: msg.chat,
-                path,
-                replyToId: referenceThisFile,
-                token,
-                fetchImpl,
-              })
-            : await client.uploadFile(msg.chat, path)
+        const file = await uploadDiscordFile({
+          channelId: msg.chat,
+          path,
+          filename,
+          replyToId: index === 0 ? replyOnFirstFile : undefined,
+          token,
+          fetchImpl,
+        })
         logger.info(`[discord-bot] uploaded id=${file.id} filename=${file.filename} size=${file.size} ${tag}`)
         if (msg.thread) {
           logger.warn(
             `[discord-bot] uploaded file landed in channel root, not thread ${msg.thread}: ` +
-              'agent-messenger uploadFile does not accept thread_id',
+              'file uploads do not accept thread_id',
           )
         }
       } catch (err) {
@@ -863,41 +866,59 @@ type DiscordCreateMessageWithAttachments = {
   attachments?: DiscordFile[]
 }
 
-// Raw multipart create-message so a pure-attachment reply carries a native
-// `message_reference`. Mirrors the SDK's `uploadFile` wire shape (`files[0]`)
-// and adds a `payload_json` field — Discord merges JSON body fields from
-// `payload_json` with the multipart file parts, which is the only documented
-// way to attach `message_reference` to a file upload. Returns the created
-// message's first attachment as a `DiscordFile`, matching `client.uploadFile`
-// so the caller's logging/typing is identical on both paths.
-async function uploadFirstFileWithReply(args: {
+const UPLOAD_MAX_ATTEMPTS = 3
+const UPLOAD_MAX_RETRY_AFTER_MS = 10_000
+
+function basenameOf(path: string): string {
+  return basename(path) || 'file'
+}
+
+async function uploadDiscordFile(args: {
   channelId: string
   path: string
-  replyToId: string
+  filename: string
+  replyToId: string | undefined
   token: string
   fetchImpl: typeof fetch
 }): Promise<DiscordFile> {
   const fileBuffer = await readFile(args.path)
-  const filename = args.path.split('/').pop() ?? 'file'
-  const form = new FormData()
-  form.append('payload_json', JSON.stringify({ message_reference: { message_id: args.replyToId } }))
-  form.append('files[0]', new Blob([new Uint8Array(fileBuffer)]), filename)
+  const payload = {
+    attachments: [{ id: 0, filename: args.filename }],
+    ...(args.replyToId !== undefined ? { message_reference: { message_id: args.replyToId } } : {}),
+  }
+  for (let attempt = 1; ; attempt++) {
+    // FormData bodies are single-use streams, so rebuild per attempt.
+    const form = new FormData()
+    form.append('payload_json', JSON.stringify(payload))
+    form.append('files[0]', new Blob([new Uint8Array(fileBuffer)]), args.filename)
+    const response = await args.fetchImpl(`${DISCORD_API_BASE}/channels/${args.channelId}/messages`, {
+      method: 'POST',
+      headers: { Authorization: `Bot ${args.token}` },
+      body: form,
+    })
+    // The SDK upload path this replaced retried rate limits; keep that so a
+    // burst of attachments doesn't fail the whole send on the first 429.
+    if (response.status === 429 && attempt < UPLOAD_MAX_ATTEMPTS) {
+      await Bun.sleep(retryAfterMs(response))
+      continue
+    }
+    if (!response.ok) {
+      const body = await response.text().catch(() => '')
+      throw new Error(`http ${response.status}${body ? `: ${body.slice(0, 200)}` : ''}`)
+    }
+    const message = (await response.json()) as DiscordCreateMessageWithAttachments
+    const first = message.attachments?.[0]
+    if (first === undefined) {
+      throw new Error('upload succeeded but no attachments returned')
+    }
+    return first
+  }
+}
 
-  const response = await args.fetchImpl(`${DISCORD_API_BASE}/channels/${args.channelId}/messages`, {
-    method: 'POST',
-    headers: { Authorization: `Bot ${args.token}` },
-    body: form,
-  })
-  if (!response.ok) {
-    const body = await response.text().catch(() => '')
-    throw new Error(`http ${response.status}${body ? `: ${body.slice(0, 200)}` : ''}`)
-  }
-  const message = (await response.json()) as DiscordCreateMessageWithAttachments
-  const first = message.attachments?.[0]
-  if (first === undefined) {
-    throw new Error('upload succeeded but no attachments returned')
-  }
-  return first
+function retryAfterMs(response: Response): number {
+  const seconds = Number(response.headers.get('retry-after'))
+  if (!Number.isFinite(seconds) || seconds < 0) return 1_000
+  return Math.min(seconds * 1_000, UPLOAD_MAX_RETRY_AFTER_MS)
 }
 
 // Discord CDN URLs (`cdn.discordapp.com/attachments/...`) are signed and
