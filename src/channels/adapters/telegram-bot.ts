@@ -1,3 +1,7 @@
+import { copyFile, mkdtemp, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { basename, join } from 'node:path'
+
 import { TelegramBotClient, TelegramBotListener } from 'agent-messenger/telegrambot'
 import type { TelegramBotUser, TelegramMessage } from 'agent-messenger/telegrambot'
 
@@ -239,7 +243,9 @@ export function createOutboundCallback(deps: {
     for (const attachment of attachments) {
       const path = resolvePath ? resolvePath(attachment.path) : attachment.path
       try {
-        const sent = await client.sendDocument(msg.chat, path)
+        const sent = await withUploadFilename(path, attachment.filename, (uploadPath) =>
+          client.sendDocument(msg.chat, uploadPath),
+        )
         logger.info(`[telegram-bot] uploaded message_id=${sent.message_id} ${tag}`)
         if (threadId !== undefined) {
           logger.warn(
@@ -279,6 +285,27 @@ export function createOutboundCallback(deps: {
       logger.error(`[telegram-bot] sendMessage failed: ${message}`)
       return { ok: false, error: message }
     }
+  }
+}
+
+// agent-messenger's `sendDocument` names the upload after the path's basename
+// and takes no filename argument, so honoring the OutboundAttachment
+// `filename` override means uploading from a copy that carries that name.
+// The copy lives in a private temp dir removed right after the send.
+async function withUploadFilename<T>(
+  path: string,
+  filename: string | undefined,
+  upload: (uploadPath: string) => Promise<T>,
+): Promise<T> {
+  const name = filename !== undefined ? basename(filename) : ''
+  if (name === '' || name === basename(path)) return upload(path)
+  const dir = await mkdtemp(join(tmpdir(), 'typeclaw-telegram-upload-'))
+  try {
+    const staged = join(dir, name)
+    await copyFile(path, staged)
+    return await upload(staged)
+  } finally {
+    await rm(dir, { recursive: true, force: true })
   }
 }
 

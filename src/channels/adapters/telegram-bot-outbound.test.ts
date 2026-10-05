@@ -1,4 +1,7 @@
 import { describe, expect, test } from 'bun:test'
+import { mkdtemp, readFile, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { basename, join } from 'node:path'
 
 import type { TelegramBotClient, TelegramMessage } from 'agent-messenger/telegrambot'
 
@@ -45,7 +48,7 @@ function fakeMessage(overrides: Partial<TelegramMessage> = {}): TelegramMessage 
 }
 
 type SendMessageCall = { chatId: string | number; text: string; options: unknown }
-type SendDocumentCall = { chatId: string | number; filePath: string }
+type SendDocumentCall = { chatId: string | number; filePath: string; content?: string }
 
 function fakeClient(): {
   client: Pick<TelegramBotClient, 'sendMessage' | 'sendDocument'>
@@ -64,7 +67,9 @@ function fakeClient(): {
       return sendMessageImpl()
     },
     sendDocument: async (chatId: string | number, filePath: string) => {
-      sendDocumentCalls.push({ chatId, filePath })
+      // Read at call time: a staged copy is deleted as soon as the send returns.
+      const content = await readFile(filePath, 'utf8').catch(() => undefined)
+      sendDocumentCalls.push({ chatId, filePath, ...(content !== undefined ? { content } : {}) })
       return sendDocumentImpl()
     },
   } as unknown as Pick<TelegramBotClient, 'sendMessage' | 'sendDocument'>
@@ -236,6 +241,43 @@ describe('telegram-bot createOutboundCallback', () => {
     expect(fake.sendDocumentCalls).toEqual([{ chatId: '-100123', filePath: '/agent/workspace/spec.pdf' }])
     expect(fake.sendMessageCalls).toHaveLength(1)
     expect(fake.sendMessageCalls[0]?.text).toBe('see file')
+  })
+
+  test('uploads from a copy named after the filename override, then removes the copy', async () => {
+    // given a scratch-named file the agent wants shown as "보고서.pdf"
+    const fake = fakeClient()
+    const dir = await mkdtemp(join(tmpdir(), 'telegram-outbound-'))
+    const path = join(dir, 'tmp-3f9a2.pdf')
+    await writeFile(path, 'report body')
+    const cb = createOutboundCallback({
+      client: fake.client,
+      logger: silentLogger(),
+      formatChannelTag: async () => 'chat=-100123',
+    })
+
+    // when
+    const result = await cb(buildOutbound({ text: '', attachments: [{ path, filename: '보고서.pdf' }] }))
+
+    // then Telegram sees the override as the basename, with the original bytes
+    expect(result.ok).toBe(true)
+    const call = fake.sendDocumentCalls[0]
+    expect(call?.filePath === undefined ? '' : basename(call.filePath)).toBe('보고서.pdf')
+    expect(call?.content).toBe('report body')
+    expect(await readFile(call?.filePath ?? '').catch(() => null)).toBeNull()
+    expect(await readFile(path, 'utf8')).toBe('report body')
+  })
+
+  test('uploads the original path when the filename override matches its basename', async () => {
+    const fake = fakeClient()
+    const cb = createOutboundCallback({
+      client: fake.client,
+      logger: silentLogger(),
+      formatChannelTag: async () => 'chat=-100123',
+    })
+
+    await cb(buildOutbound({ text: '', attachments: [{ path: '/agent/workspace/spec.pdf', filename: 'spec.pdf' }] }))
+
+    expect(fake.sendDocumentCalls.map((c) => c.filePath)).toEqual(['/agent/workspace/spec.pdf'])
   })
 
   test('warns when an attachment is sent in a forum topic (sendDocument cannot route to topic)', async () => {
