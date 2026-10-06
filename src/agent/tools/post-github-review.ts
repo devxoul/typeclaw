@@ -1,7 +1,12 @@
 import { Type } from '@earendil-works/pi-ai'
 import { defineTool } from '@earendil-works/pi-coding-agent'
 
-import { recordReview, recordReviewOutput, type ReviewVerdict } from '@/channels/github-review-turn-ledger'
+import {
+  recordReview,
+  recordReviewOutput,
+  type ReviewResultCoverage,
+  type ReviewVerdict,
+} from '@/channels/github-review-turn-ledger'
 import { createSharedReviewVerdictGuard, type ReviewVerdictGuard } from '@/channels/github-review-verdict-coordinator'
 import type { ChannelRouter } from '@/channels/router'
 import type { ReviewFinding, SubmitReviewRequest } from '@/channels/types'
@@ -124,6 +129,7 @@ export function createPostGithubReviewTool(options: {
       }
       let releaseAsLanded = false
       try {
+        const backgroundCoverage = (await router.captureBackgroundResultCoverage?.(sessionId)) ?? []
         const result = await router.submitReview(request)
         if (!result.ok) {
           // A POST whose verification failed may already have landed. Keep the
@@ -136,11 +142,12 @@ export function createPostGithubReviewTool(options: {
         if (effective === null)
           return denied(logger, `GitHub returned an unknown verified review state: ${result.state}`)
         releaseAsLanded = verdict !== null && effective === verdict
-        creditVerifiedReview({
+        await creditVerifiedReview({
           sessionId,
           workspace: origin.workspace,
           prNumber,
           effective,
+          backgroundCoverage,
           ...(result.commitSha !== undefined ? { commitSha: result.commitSha } : {}),
         })
 
@@ -179,6 +186,7 @@ async function postDuplicateRequestChangesComment(args: {
   comments: readonly ReviewFinding[]
   logger: ChannelToolLogger
 }) {
+  const backgroundCoverage = (await args.router.captureBackgroundResultCoverage?.(args.sessionId)) ?? []
   const result = await args.router.send(
     {
       adapter: 'github',
@@ -191,11 +199,12 @@ async function postDuplicateRequestChangesComment(args: {
   )
   if (!result.ok) return { landed: false, result: denied(args.logger, result.error, result.code) }
 
-  recordReviewOutput({
+  await recordReviewOutput({
     sessionId: args.sessionId,
     workspace: args.origin.workspace,
     prNumber: args.prNumber,
     state: 'COMMENT',
+    backgroundCoverage,
   })
 
   const details: PostGithubReviewDetails = {
@@ -264,29 +273,32 @@ function effectiveReviewState(state: string): ReviewVerdict | 'COMMENT' | null {
   return null
 }
 
-function creditVerifiedReview(args: {
-  sessionId: string
-  workspace: string
-  prNumber: number
-  effective: ReviewVerdict | 'COMMENT'
-  commitSha?: string
-}): void {
+async function creditVerifiedReview(
+  args: {
+    sessionId: string
+    workspace: string
+    prNumber: number
+    effective: ReviewVerdict | 'COMMENT'
+    commitSha?: string
+  } & ReviewResultCoverage,
+): Promise<void> {
   if (args.effective === 'COMMENT') {
-    recordReviewOutput({
+    await recordReviewOutput({
       sessionId: args.sessionId,
       workspace: args.workspace,
       prNumber: args.prNumber,
       state: 'COMMENT',
+      backgroundCoverage: args.backgroundCoverage,
     })
     return
   }
-  // recordReview also emits the review-output observer signal for decisive
-  // states, keeping verdict and output credit atomic.
-  recordReview({
+  // recordReview retains the verdict before awaiting the output owner's settlement.
+  await recordReview({
     sessionId: args.sessionId,
     workspace: args.workspace,
     prNumber: args.prNumber,
     verdict: args.effective,
+    backgroundCoverage: args.backgroundCoverage,
     ...(args.commitSha !== undefined ? { commitSha: args.commitSha } : {}),
   })
 }

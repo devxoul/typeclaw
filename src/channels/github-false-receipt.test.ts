@@ -37,13 +37,13 @@ describe('checkFalseReceipt — verdict false receipts', () => {
     expect(checkFalseReceipt(base({ text: 'Approved!' })).kind).toBe('block')
   })
 
-  test('terminal "Approved" AFTER a real APPROVE review is allowed', () => {
-    recordReview({ sessionId: S, workspace: WS, prNumber: 12, verdict: 'APPROVE' })
+  test('terminal "Approved" AFTER a real APPROVE review is allowed', async () => {
+    await recordReview({ sessionId: S, workspace: WS, prNumber: 12, verdict: 'APPROVE' })
     expect(checkFalseReceipt(base({ text: 'Approved — thanks!' })).kind).toBe('allow')
   })
 
-  test('a real REQUEST_CHANGES does not satisfy an approve claim', () => {
-    recordReview({ sessionId: S, workspace: WS, prNumber: 12, verdict: 'REQUEST_CHANGES' })
+  test('a real REQUEST_CHANGES does not satisfy an approve claim', async () => {
+    await recordReview({ sessionId: S, workspace: WS, prNumber: 12, verdict: 'REQUEST_CHANGES' })
     expect(checkFalseReceipt(base({ text: 'Approved!' })).kind).toBe('block')
   })
 

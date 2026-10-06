@@ -2051,11 +2051,13 @@ describe('createServer plugin hooks', () => {
     await waitFor((m) => m.type === 'connected')
 
     ws.close()
-    await expectStable(() => ended, { durationMs: 20, description: 'session.end resolved early' })
+    const releaseEnd = await waitForState(() => endResolve.fn)
     expect(ended).toBe(false)
-    endResolve.fn?.()
-    await waitForState(() => ended)
+    expect(session.disposeCalls).toBe(0)
+    releaseEnd()
+    await waitForState(() => ended && session.disposeCalls > 0)
     expect(ended).toBe(true)
+    expect(session.disposeCalls).toBe(1)
   })
 })
 

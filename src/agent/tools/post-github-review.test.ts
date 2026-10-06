@@ -47,6 +47,57 @@ describe('post_github_review', () => {
     __resetReviewVerdictGuardForTest()
   })
 
+  test.each([
+    ['APPROVE', 'APPROVED'],
+    ['COMMENT', 'COMMENTED'],
+  ] as const)('awaits delayed output settlement for %s before returning a receipt', async (event, state) => {
+    const channelRouter = router()
+    channelRouter.registerReviewSubmitter('github', async () => ({ ok: true, reviewId: 91, state }))
+    const entered = Promise.withResolvers<void>()
+    const settlement = Promise.withResolvers<void>()
+    setReviewOutputObserver(async () => {
+      entered.resolve()
+      await settlement.promise
+    })
+    let returned = false
+    const result = run(createPostGithubReviewTool({ router: channelRouter, origin: githubOrigin, sessionId }), {
+      event,
+      body: 'summary',
+    }).then((receipt) => {
+      returned = true
+      return receipt
+    })
+    await entered.promise
+    await Promise.resolve()
+    expect(returned).toBe(false)
+    settlement.resolve()
+    expect((await result).details).toMatchObject({ ok: true, reviewId: 91 })
+  })
+
+  test('keeps a landed review successful and deduped when output settlement rejects', async () => {
+    configureReviewVerdictCoordinator({
+      resolveEffectiveApproval: async () => ({ ok: true, effective: 'NONE' }),
+      resolveHeadSha: async () => 'sha-1',
+    })
+    const channelRouter = router()
+    let submissions = 0
+    channelRouter.registerReviewSubmitter('github', async () => {
+      submissions += 1
+      return { ok: true, reviewId: 92, state: 'APPROVED' }
+    })
+    setReviewOutputObserver(async () => {
+      throw new Error('settlement storage unavailable')
+    })
+    const tool = createPostGithubReviewTool({ router: channelRouter, origin: githubOrigin, sessionId })
+    expect((await run(tool, { event: 'APPROVE', body: 'summary' })).details).toMatchObject({
+      ok: true,
+      reviewId: 92,
+    })
+    expect(hasReview({ sessionId, workspace: githubOrigin.workspace, prNumber: 7, verdict: 'APPROVE' })).toBe(true)
+    expect((await run(tool, { event: 'APPROVE', body: 'retry' })).details).toMatchObject({ ok: false })
+    expect(submissions).toBe(1)
+  })
+
   test('is gated to GitHub-origin sessions', async () => {
     const result = await run(createPostGithubReviewTool({ router: router(), origin: slackOrigin, sessionId }), {
       event: 'COMMENT',
@@ -69,7 +120,9 @@ describe('post_github_review', () => {
       }
     })
     const output: unknown[] = []
-    setReviewOutputObserver((event) => output.push(event))
+    setReviewOutputObserver((event) => {
+      output.push(event)
+    })
     const result = await run(createPostGithubReviewTool({ router: channelRouter, origin: githubOrigin, sessionId }), {
       event: 'APPROVE',
       body: 'summary',
@@ -81,7 +134,9 @@ describe('post_github_review', () => {
     ])
     expect(result.details).toMatchObject({ ok: true, reviewId: 44, downgraded: true })
     expect(hasReview({ sessionId, workspace: githubOrigin.workspace, prNumber: 7, verdict: 'APPROVE' })).toBe(false)
-    expect(output).toEqual([{ sessionId, workspace: githubOrigin.workspace, prNumber: 7, state: 'COMMENT' }])
+    expect(output).toEqual([
+      { sessionId, workspace: githubOrigin.workspace, prNumber: 7, state: 'COMMENT', backgroundCoverage: [] },
+    ])
     expect(result.content[0]).toMatchObject({ type: 'text' })
     if (result.content[0]?.type === 'text') expect(result.content[0].text).toContain('out-of-diff')
   })
@@ -93,7 +148,9 @@ describe('post_github_review', () => {
     const channelRouter = router()
     channelRouter.registerReviewSubmitter('github', async () => ({ ok: true, reviewId: 45, state }))
     const output: unknown[] = []
-    setReviewOutputObserver((value) => output.push(value))
+    setReviewOutputObserver((value) => {
+      output.push(value)
+    })
 
     const result = await run(createPostGithubReviewTool({ router: channelRouter, origin: githubOrigin, sessionId }), {
       event,
@@ -102,7 +159,9 @@ describe('post_github_review', () => {
 
     expect(result.details).toMatchObject({ ok: true, state })
     expect(hasReview({ sessionId, workspace: githubOrigin.workspace, prNumber: 7, verdict })).toBe(true)
-    expect(output).toEqual([{ sessionId, workspace: githubOrigin.workspace, prNumber: 7, state: verdict }])
+    expect(output).toEqual([
+      { sessionId, workspace: githubOrigin.workspace, prNumber: 7, state: verdict, backgroundCoverage: [] },
+    ])
   })
 
   test('binds the verdict to the reviewed head and reports the landed commit to round completion', async () => {
@@ -289,7 +348,9 @@ describe('post_github_review', () => {
       return { ok: true, messageId: '91', messageIds: ['91'] }
     })
     const output: unknown[] = []
-    setReviewOutputObserver((value) => output.push(value))
+    setReviewOutputObserver((value) => {
+      output.push(value)
+    })
 
     const result = await run(createPostGithubReviewTool({ router: channelRouter, origin: githubOrigin, sessionId }), {
       event: 'REQUEST_CHANGES',
@@ -350,7 +411,9 @@ describe('post_github_review', () => {
     expect(hasReview({ sessionId, workspace: githubOrigin.workspace, prNumber: 7, verdict: 'REQUEST_CHANGES' })).toBe(
       false,
     )
-    expect(output).toEqual([{ sessionId, workspace: githubOrigin.workspace, prNumber: 7, state: 'COMMENT' }])
+    expect(output).toEqual([
+      { sessionId, workspace: githubOrigin.workspace, prNumber: 7, state: 'COMMENT', backgroundCoverage: [] },
+    ])
   })
 
   test('serializes duplicate REQUEST_CHANGES fallbacks until outbound delivery completes', async () => {

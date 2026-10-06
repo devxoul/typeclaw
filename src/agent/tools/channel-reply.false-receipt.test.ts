@@ -14,6 +14,15 @@ afterEach(() => resetReviewTurn(SESSION))
 function fakeRouter(onSend: (msg: OutboundMessage) => SendResult = () => ({ ok: true })): ChannelRouter {
   return {
     route: async () => {},
+    acceptBackgroundResponse: async () => {
+      throw new Error('Unexpected background admission')
+    },
+    suppressUnstartedBackgroundResponse: async () => {
+      throw new Error('Unexpected background suppression')
+    },
+    attachBackgroundResultCoverage: async () => {
+      throw new Error('Unexpected background coverage')
+    },
     send: async (msg) => onSend(msg),
     getConsecutiveSendCount: () => 0,
     getSendRate: () => ({ count: 0, windowMs: 5_000 }),
@@ -82,10 +91,10 @@ function fakeRouter(onSend: (msg: OutboundMessage) => SendResult = () => ({ ok: 
     markRestartAbortForAllLive: async () => {},
     liveCount: () => 0,
     executeCommand: async () => ({ kind: 'no-live-session' }),
-    injectSubagentCompletionReminder: () => ({ kind: 'no-live-session' }),
+    injectSubagentCompletionReminder: async () => ({ kind: 'no-live-session' }),
     injectPrVerdictActivity: () => ({ kind: 'delivered', count: 0 }),
-    noteGithubReviewOutput: () => ({ kind: 'no-live-session' }),
-    markTurnSkipped: () => ({ kind: 'no-live-session' }),
+    noteGithubReviewOutput: async () => ({ kind: 'no-live-session' }),
+    markTurnSkipped: async () => ({ kind: 'no-live-session' }),
     clearSticky: () => ({ keyId: '', cleared: 0 }),
     reserveRestartHandoff: () => null,
     resumeRestartHandoff: async () => {},
@@ -137,7 +146,7 @@ describe('channel_reply false-receipt guard', () => {
   })
 
   test('allows "Approved" once a real APPROVE review was recorded this turn', async () => {
-    recordReview({ sessionId: SESSION, workspace: WS, prNumber: 12, verdict: 'APPROVE' })
+    await recordReview({ sessionId: SESSION, workspace: WS, prNumber: 12, verdict: 'APPROVE' })
     let sent = 0
     const result = await run(
       tool(() => {

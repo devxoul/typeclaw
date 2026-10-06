@@ -68,8 +68,7 @@ test('a hung destination does not block another and in-flight stop retains recei
   const dispatcher = new RecoveryDispatcher(outbox, router)
   try {
     await dispatcher.wake()
-    await until(async () => (await outbox.get(b.deliveryId))?.state === 'delivered')
-    expect(sent).toContain('a')
+    await until(async () => (await outbox.get(b.deliveryId))?.state === 'delivered' && sent.includes('a'))
     await dispatcher.suppressParent(a.target, 'parent')
     finish()
     await dispatcher.stop()

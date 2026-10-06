@@ -46,6 +46,52 @@ function makeLive(overrides: Partial<LiveSubagent> = {}): LiveSubagent {
   }
 }
 
+test('running polling never captures coverage; final output waits for durable coverage and fails closed', async () => {
+  const liveRegistry = new LiveSubagentRegistry()
+  liveRegistry.register(makeLive())
+  const coverage = Promise.withResolvers<void>()
+  const capturing = Promise.withResolvers<void>()
+  let captures = 0
+  const tool = createSubagentOutputTool({
+    liveRegistry,
+    getOrigin: () => guestOrigin,
+    callerSessionId: 'ses_parent',
+    router: {
+      attachBackgroundResultCoverage: async () => {
+        captures++
+        capturing.resolve()
+        await coverage.promise
+      },
+    },
+  })
+  const running = await tool.execute('poll', { task_id: 'bg_o1' }, undefined, undefined, ctx)
+  expect(running.details).toMatchObject({ status: 'running' })
+  expect(captures).toBe(0)
+  liveRegistry.recordCompletionIfRunning('bg_o1', { ok: true, finalMessage: 'result', durationMs: 100 })
+  let returned = false
+  const final = tool.execute('fetch', { task_id: 'bg_o1' }, undefined, undefined, ctx).then((value) => {
+    returned = true
+    return value
+  })
+  await capturing.promise
+  expect(returned).toBe(false)
+  coverage.resolve()
+  expect((await final).details).toMatchObject({ status: 'completed', finalMessage: 'result' })
+  const failed = createSubagentOutputTool({
+    liveRegistry,
+    getOrigin: () => guestOrigin,
+    callerSessionId: 'ses_parent',
+    router: {
+      attachBackgroundResultCoverage: async () => {
+        throw new Error('storage failed')
+      },
+    },
+  })
+  await expect(failed.execute('failed', { task_id: 'bg_o1' }, undefined, undefined, ctx)).rejects.toThrow(
+    'storage failed',
+  )
+})
+
 describe('createSubagentOutputTool — unknown task_id', () => {
   test('returns ok=false with helpful error', async () => {
     const liveRegistry = new LiveSubagentRegistry()

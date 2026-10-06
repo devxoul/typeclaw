@@ -1,3 +1,4 @@
+import type { BackgroundObligationStore } from './background-obligations'
 import type { RecoveryRecord } from './continuity-types'
 import type { RecoveryOutbox } from './recovery-outbox'
 import type { ChannelRouter } from './router'
@@ -16,9 +17,21 @@ export class RecoveryDispatcher {
       now?: () => number
       consistencyDelayMs?: number
       onError?: (error: unknown) => void
+      backgroundObligations?: BackgroundObligationStore
     } = {},
   ) {
     router.setRecoveryStopHandler((target, parent) => this.suppressParent(target, parent))
+  }
+
+  private async acknowledge(record: RecoveryRecord): Promise<void> {
+    const source = this.options.backgroundObligations
+    if (!source) return
+    if (record.covers.some((cover) => cover.store === 'background')) {
+      await source.withTargetLane(record.target, () => source.acknowledgeNotice(record))
+    } else {
+      // Legacy upgrade receipts have immutable inventory-only provenance.
+      await source.acknowledgeNotice(record)
+    }
   }
 
   async wake(): Promise<void> {
@@ -28,7 +41,10 @@ export class RecoveryDispatcher {
     const now = this.options.now?.() ?? Date.now()
     let next = now + 30_000
     for (const record of await this.outbox.list()) {
-      if (record.state === 'delivered' || record.state === 'suppressed') continue
+      if (record.state === 'delivered' || record.state === 'suppressed') {
+        await this.acknowledge(record).catch((error) => this.options.onError?.(error))
+        continue
+      }
       const due = record.nextAttemptAt ?? 0
       if (due > now) {
         next = Math.min(next, due)
@@ -70,6 +86,18 @@ export class RecoveryDispatcher {
       const now = this.options.now?.() ?? Date.now()
       if (!record || record.state === 'delivered' || record.state === 'suppressed' || (record.nextAttemptAt ?? 0) > now)
         continue
+      try {
+        if (
+          this.options.backgroundObligations &&
+          (await this.options.backgroundObligations.validateNotice(record)) === 'resolved'
+        ) {
+          await this.outbox.suppress(record.deliveryId, 'coverage-resolved', crypto.randomUUID())
+          continue
+        }
+      } catch (error) {
+        this.options.onError?.(error)
+        continue
+      }
       const failure = await this.router.validateRecovery(record).catch((error: unknown) =>
         error instanceof RecoveryTransportError
           ? error.failure
@@ -105,6 +133,8 @@ export class RecoveryDispatcher {
             ...(found.messageId === undefined ? {} : { messageId: found.messageId }),
             ...(found.messageIds === undefined ? {} : { messageIds: [...found.messageIds] }),
           })
+          const delivered = await this.outbox.get(record.deliveryId)
+          if (delivered) await this.acknowledge(delivered).catch((error) => this.options.onError?.(error))
           continue
         }
       }
@@ -134,23 +164,45 @@ export class RecoveryDispatcher {
           continue
         }
         if ((await this.outbox.get(record.deliveryId))?.state === 'suppressed') continue
-        const result = await this.router.send(
-          { ...record.target, text: record.text },
-          {
-            source: 'system',
-            outputKind: 'meta',
-            accounting: 'recovery',
-            deliveryId: record.deliveryId,
-            coveredIds: record.covers.map((coverage) => coverage.id),
-            expectedAccountIdentity: record.boundAccountIdentity ?? record.accountIdentity,
-          },
-        )
+        const sendNotice = async () => {
+          if (
+            this.options.backgroundObligations &&
+            (await this.options.backgroundObligations.validateNotice(record!)) === 'resolved'
+          ) {
+            await this.outbox.suppress(record!.deliveryId, 'coverage-resolved', crypto.randomUUID())
+            return undefined
+          }
+          if ((await this.outbox.get(record!.deliveryId))?.state === 'suppressed') return undefined
+          // Begin the call under the source lane, but do not hold it during
+          // transport I/O. /stop can withdraw an already-in-flight notice.
+          return {
+            pending: this.router.send(
+              { ...record!.target, text: record!.text },
+              {
+                source: 'system',
+                outputKind: 'meta',
+                accounting: 'recovery',
+                deliveryId: record!.deliveryId,
+                coveredIds: record!.covers.map((coverage) => coverage.id),
+                expectedAccountIdentity: record!.boundAccountIdentity ?? record!.accountIdentity,
+              },
+            ),
+          }
+        }
+        const dispatched =
+          this.options.backgroundObligations && record.covers.some((cover) => cover.store === 'background')
+            ? await this.options.backgroundObligations.withTargetLane(record.target, sendNotice)
+            : await sendNotice()
+        if (!dispatched) continue
+        const result = await dispatched.pending
         if (result.ok) {
           await this.outbox.delivered(record.deliveryId, lease, {
             confirmedAt: this.options.now?.() ?? Date.now(),
             ...(result.messageId === undefined ? {} : { messageId: result.messageId }),
             ...(result.messageIds === undefined ? {} : { messageIds: [...result.messageIds] }),
           })
+          const delivered = await this.outbox.get(record.deliveryId)
+          if (delivered) await this.acknowledge(delivered).catch((error) => this.options.onError?.(error))
         } else {
           await this.outbox.fail(
             record.deliveryId,
@@ -186,6 +238,16 @@ export class RecoveryDispatcher {
         record.sourceParentSessionId === parentSessionId ||
         (record.covers.length > 0 && record.covers.every((coverage) => coverage.parentSessionId === parentSessionId))
       ) {
+        const source = this.options.backgroundObligations
+        if (source) {
+          if (record.covers.some((cover) => cover.store === 'background')) {
+            await source.withTargetLane(target, () =>
+              source.suppressNoticeCoverage(record, { decisionId, reason: 'user-stop' }),
+            )
+          } else {
+            await source.suppressNoticeCoverage(record, { decisionId, reason: 'user-stop' })
+          }
+        }
         await this.outbox.suppress(record.deliveryId, 'user_stop', decisionId)
       }
     }

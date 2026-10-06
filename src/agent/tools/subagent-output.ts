@@ -1,6 +1,7 @@
 import { Type } from '@earendil-works/pi-ai'
 import { defineTool } from '@earendil-works/pi-coding-agent'
 
+import type { ChannelRouter } from '@/channels/router'
 import type { PermissionService } from '@/permissions'
 
 import type { LiveSubagentRegistry, StatusSnapshot, SubagentProgressEvent } from '../live-subagents'
@@ -49,6 +50,7 @@ export type CreateSubagentOutputToolOptions = {
   getOrigin: () => SessionOrigin | undefined
   permissions?: PermissionService
   callerSessionId?: string
+  router?: Pick<ChannelRouter, 'attachBackgroundResultCoverage'>
   now?: () => number
 }
 
@@ -90,6 +92,12 @@ export function createSubagentOutputTool(options: CreateSubagentOutputToolOption
       const snap = liveRegistry.snapshot(params.task_id, now())
       if (snap === undefined) {
         return errorResult(`Unknown task_id: ${params.task_id}.`)
+      }
+      if (snap.status !== 'running' && callerSessionId !== undefined) {
+        await options.router?.attachBackgroundResultCoverage({
+          parentSessionId: callerSessionId,
+          taskId: snap.taskId,
+        })
       }
       return renderSnapshot(snap)
     },

@@ -6,7 +6,7 @@ import type { ChannelRouter } from '@/channels/router'
 import { type ChannelToolLogger, consoleChannelLogger, formatChannelToolFailure } from './channel-log'
 
 export type CreateSkipResponseToolOptions = {
-  router: ChannelRouter
+  router: Pick<ChannelRouter, 'markTurnSkipped'>
   // The channel session's id, used to locate the right LiveSession in the
   // router and stamp the skip flag with its current turnSeq. Mirrors how
   // `injectSubagentCompletionReminder` addresses live sessions by their
@@ -89,7 +89,7 @@ export function createSkipResponseTool({
         }
       }
 
-      const result = router.markTurnSkipped({ parentSessionId: sessionId, reason })
+      const result = await router.markTurnSkipped({ parentSessionId: sessionId, reason })
       if (result.kind === 'recorded-after-send') {
         // Reply-first skip: an ack already landed; this just ends the turn
         // quietly. Not suppressed (the reply stands) and not an error (erroring

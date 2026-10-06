@@ -3,8 +3,8 @@ import { randomUUID } from 'node:crypto'
 import { Type } from '@earendil-works/pi-ai'
 import { defineTool } from '@earendil-works/pi-coding-agent'
 
-import type { BackgroundLaunchIdentity } from '@/channels/background-handoff'
 import { githubReviewerWorkKey } from '@/channels/github-repo'
+import type { ChannelRouter } from '@/channels/router'
 import type { PermissionService } from '@/permissions'
 import type { Stream } from '@/stream'
 
@@ -55,6 +55,7 @@ export type CreateSpawnSubagentToolOptions = {
   parentSessionId: string
   getOrigin: () => SessionOrigin | undefined
   getSessionFile?: () => string | undefined
+  router?: Pick<ChannelRouter, 'acceptBackgroundResponse' | 'suppressUnstartedBackgroundResponse'>
   getAccountIdentity?: (
     adapter: NonNullable<Extract<SessionOrigin, { kind: 'channel' }>['adapter']>,
     workspace?: string,
@@ -237,11 +238,15 @@ export function createSpawnSubagentTool(options: CreateSpawnSubagentToolOptions)
         origin?.kind === 'channel'
           ? { adapter: origin.adapter, workspace: origin.workspace, chat: origin.chat, thread: origin.thread }
           : undefined
-      let backgroundLaunch: BackgroundLaunchIdentity | undefined
-      const abandonIntent = () => {
-        if (backgroundLaunch !== undefined) liveRegistry.retireBackgroundLaunch(backgroundLaunch)
-      }
-      if (background && origin?.kind === 'channel' && liveRegistry.backgroundInventory !== undefined) {
+      let backgroundResponse: { obligationId: string; generation: number } | undefined
+      if (background && origin?.kind === 'channel') {
+        if (options.router === undefined) {
+          if (pendingWorkKeyRegistration !== undefined) {
+            liveRegistry.abandonWorkKeyRegistration(pendingWorkKeyRegistration)
+          }
+          releaseCoalesceKey()
+          return errorResult('failed to persist background response: channel router unavailable')
+        }
         try {
           const { parentChat, lastInboundAuthorId } = origin
           let parentSessionFile: string | undefined
@@ -256,7 +261,7 @@ export function createSpawnSubagentTool(options: CreateSpawnSubagentToolOptions)
           } catch {
             // Recovery identity must not add a prerequisite to healthy launches.
           }
-          backgroundLaunch = await liveRegistry.backgroundInventory.add({
+          backgroundResponse = await options.router.acceptBackgroundResponse({
             parentSessionId,
             parentSessionFile,
             key: channelKey!,
@@ -266,7 +271,6 @@ export function createSpawnSubagentTool(options: CreateSpawnSubagentToolOptions)
             accountIdentity: accountIdentity ?? 'unbound-legacy',
             ...(parentChat !== undefined ? { parentChat } : {}),
             ...(lastInboundAuthorId !== undefined ? { triggeringAuthorId: lastInboundAuthorId } : {}),
-            ...(origin.reactionRef !== undefined ? { triggerReactionRef: origin.reactionRef } : {}),
           })
         } catch (error) {
           if (pendingWorkKeyRegistration !== undefined) {
@@ -274,16 +278,22 @@ export function createSpawnSubagentTool(options: CreateSpawnSubagentToolOptions)
           }
           releaseCoalesceKey()
           return errorResult(
-            `failed to persist background launch: ${error instanceof Error ? error.message : String(error)}`,
+            `failed to persist background response: ${error instanceof Error ? error.message : String(error)}`,
           )
         }
         // An aborted parent must not launch work after the durability await.
         if (signal?.aborted) {
-          abandonIntent()
-          if (pendingWorkKeyRegistration !== undefined) {
-            liveRegistry.abandonWorkKeyRegistration(pendingWorkKeyRegistration)
+          try {
+            await options.router.suppressUnstartedBackgroundResponse(
+              backgroundResponse,
+              'background launch cancelled before execution',
+            )
+          } finally {
+            if (pendingWorkKeyRegistration !== undefined) {
+              liveRegistry.abandonWorkKeyRegistration(pendingWorkKeyRegistration)
+            }
+            releaseCoalesceKey()
           }
-          releaseCoalesceKey()
           return errorResult('background launch cancelled before execution')
         }
       }
@@ -311,7 +321,6 @@ export function createSpawnSubagentTool(options: CreateSpawnSubagentToolOptions)
           liveRegistry.abandonWorkKeyRegistration(pendingWorkKeyRegistration)
         }
         releaseCoalesceKey()
-        abandonIntent()
         const message = err instanceof Error ? err.message : String(err)
         return errorResult(`failed to spawn ${subagentName}: ${message}`)
       }
@@ -328,7 +337,6 @@ export function createSpawnSubagentTool(options: CreateSpawnSubagentToolOptions)
         // reviewer's head/base/kind-aware coalescing key.
         ...(workKey !== undefined ? { workKey } : {}),
         startedAt,
-        ...(backgroundLaunch !== undefined ? { backgroundLaunch } : {}),
         status: 'running' as const,
         abort: resolvedHandle.abort,
         releaseCoalesceKey,
@@ -345,11 +353,8 @@ export function createSpawnSubagentTool(options: CreateSpawnSubagentToolOptions)
         }
         try {
           await resolvedHandle.abort()
-          abandonIntent()
         } catch {
-          // Failed cleanup can leave execution live without a registry entry.
-          // Keep its evidence until the actual completion checkpoint.
-          void completion.then(abandonIntent)
+          // Execution may already have started. Its response remains owed.
         }
         void completion.then(releaseCoalesceKey)
         releaseCoalesceKey()
@@ -362,7 +367,6 @@ export function createSpawnSubagentTool(options: CreateSpawnSubagentToolOptions)
         void completion.then(releaseCoalesceKey)
         try {
           await resolvedHandle.abort()
-          abandonIntent()
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err)
           // The child is still live. Register it so later cancellation, status
@@ -370,7 +374,6 @@ export function createSpawnSubagentTool(options: CreateSpawnSubagentToolOptions)
           try {
             liveRegistry.register(live)
           } catch (registrationError) {
-            void completion.then(abandonIntent)
             releaseCoalesceKey()
             return errorResult(
               `failed to register ${subagentName} after cancellation failed: ${registrationError instanceof Error ? registrationError.message : String(registrationError)}`,

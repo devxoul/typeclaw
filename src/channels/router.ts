@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto'
 import { statSync } from 'node:fs'
 import { basename } from 'node:path'
 
@@ -33,6 +34,7 @@ import { extractClaimCode } from '@/role-claim'
 import type { Stream } from '@/stream'
 
 import { extractMentionedUserIds } from './adapters/mention-hints'
+import { BackgroundObligationStore, type BackgroundObligationRef } from './background-obligations'
 import { formatChannelCommandHelp } from './commands'
 import { isQualifyingWorkResult } from './completion-claim'
 import { detectContinuationWillingness } from './continuation-willingness'
@@ -256,37 +258,6 @@ export const RESTART_RESUME_WAKE_REMINDER = [
   '---',
 ].join('\n')
 
-// The lost-work directive names recorded launches without asserting they ran:
-// an intent can survive a crash before execution or after child termination.
-// Never re-run automatically; the human decides whether to re-ask. Used
-// standalone when a racing inbound already provides the wake turn, and embedded
-// in the fuller resume reminder when the synthetic wake fires. Rendered as plain
-// text so a non-Latin subagent name survives intact.
-export function buildInterruptedSubagentNotice(interruptedSubagents: readonly string[]): string {
-  const names = interruptedSubagents.join(', ')
-  return [
-    '---',
-    '**[SYSTEM MESSAGE — not from a human]**',
-    '',
-    `Background work was recorded before the container restarted`,
-    `(interrupted subagent(s): ${names}); its result may be unavailable.`,
-    `Briefly tell the people in this conversation, in their own language, that`,
-    `the work was interrupted or unable to start and they can ask again if they`,
-    `still want it. Do not silently re-run it. Do not acknowledge or reply to this notice itself.`,
-    '',
-    '---',
-  ].join('\n')
-}
-
-// The synthetic "I'm back" wake, optionally carrying the lost-work directive
-// when the restart interrupted background subagents this session had promised
-// results for. With none, it is the plain wake reminder unchanged.
-export function buildRestartResumeWakeReminder(interruptedSubagents?: readonly string[]): string {
-  if (interruptedSubagents === undefined || interruptedSubagents.length === 0) {
-    return RESTART_RESUME_WAKE_REMINDER
-  }
-  return `${RESTART_RESUME_WAKE_REMINDER}\n\n${buildInterruptedSubagentNotice(interruptedSubagents)}`
-}
 // Ceiling on tool-source channel sends that a same-turn router policy DENIED
 // without delivering — `skip-locked`, `turn-cap`, or `duplicate`. Such denials
 // return a soft error and do NOT increment `consecutiveSends`, so a model that
@@ -835,7 +806,20 @@ type ChannelAgentSession = AgentSession & { getAbortReason?: () => string | unde
 // TEXT was rejected: a wakeup body that happened to equal a nudge constant
 // would silently misclassify, and every future enqueue site would inherit the
 // default instead of being forced to choose.
-type PendingSystemReminder = { text: string; kind: 'retry' | 'wakeup'; githubReviewRoundKey?: string }
+type PendingSystemReminder = {
+  text: string
+  kind: 'retry' | 'wakeup'
+  githubReviewRoundKey?: string
+  backgroundObligationId?: string
+  backgroundRetry?: {
+    turnId: string
+    obligationIds: string[]
+    emptyTurnRetries: number
+    toolLeakRetries: number
+    willingnessNudges: number
+    nextPromptMaxTokens: number | undefined
+  }
+}
 
 type PendingReloadHandoff = {
   key: ChannelKey
@@ -1030,6 +1014,10 @@ type LiveSession = {
   // the drain loop's run condition checks BOTH queues so a system
   // reminder alone is enough to trigger a turn.
   pendingSystemReminders: PendingSystemReminder[]
+  // Identity-only cache; every durable transition resolves ownership in its lane.
+  backgroundCoverage: string[]
+  backgroundTurnId: string
+  backgroundStopVersion: number
   // True only for the reminder-only iteration that consumed a willingness
   // nudge. `willingnessNudges` persists across the logical turn, so it remains
   // nonzero after a substantive result and would misclassify NO_REPLY from a
@@ -1400,6 +1388,20 @@ export const SKIP_RESPONSE_LOCK_ERROR =
 export type ChannelRouter = {
   route: (event: InboundMessage) => Promise<void>
   send: (msg: OutboundMessage, opts?: SendOptions) => Promise<SendResult>
+  acceptBackgroundResponse: (args: {
+    parentSessionId: string
+    parentSessionFile?: string
+    key: ChannelKey
+    taskId: string
+    subagentName: string
+    startedAt: number
+    accountIdentity: string
+    triggeringAuthorId?: string
+    parentChat?: string
+  }) => Promise<BackgroundObligationRef>
+  suppressUnstartedBackgroundResponse: (ref: BackgroundObligationRef, reason: string) => Promise<void>
+  attachBackgroundResultCoverage: (args: { parentSessionId: string; taskId: string }) => Promise<void>
+  captureBackgroundResultCoverage?: (parentSessionId: string) => Promise<BackgroundObligationRef[]>
   getConsecutiveSendCount: (target: {
     adapter: ChannelKey['adapter']
     workspace: string
@@ -1562,7 +1564,7 @@ export type ChannelRouter = {
     durationMs: number
     error?: string
     channelKey?: { adapter: string; workspace: string; chat: string; thread: string | null }
-  }) => { kind: 'delivered'; keyId: string } | { kind: 'no-live-session' }
+  }) => Promise<{ kind: 'delivered'; keyId: string } | { kind: 'no-live-session' }>
   // Fan a LANDED formal review verdict out to the OTHER live sessions reviewing
   // the same PR so they stand down from posting a redundant verdict. Targets every
   // live github session whose chat is `pr:<prNumber>` in `workspace`, EXCLUDING the
@@ -1603,7 +1605,8 @@ export type ChannelRouter = {
     workspace: string
     prNumber: number
     state: ReviewOutputState
-  }) => { kind: 'stamped' | 'no-live-session' }
+    backgroundCoverage?: BackgroundObligationRef[]
+  }) => Promise<{ kind: 'stamped' | 'no-live-session' }>
   hasOutstandingGithubReviewThreadCloseout?: (sessionId: string) => boolean
   // Record that the agent invoked `skip_response` during the current turn
   // for the channel session identified by `parentSessionId`. The reason is
@@ -1628,10 +1631,9 @@ export type ChannelRouter = {
   markTurnSkipped: (args: {
     parentSessionId: string
     reason: string
-  }) =>
-    | { kind: 'recorded'; keyId: string }
-    | { kind: 'recorded-after-send'; keyId: string }
-    | { kind: 'no-live-session' }
+  }) => Promise<
+    { kind: 'recorded'; keyId: string } | { kind: 'recorded-after-send'; keyId: string } | { kind: 'no-live-session' }
+  >
   // Force-clear every sticky credit for one channel key. Stickiness normally
   // expires on TTL or is consumed on the next inbound, but in a busy group each
   // reply re-grants a fresh credit, so the bot can stay force-engaged turn after
@@ -1724,6 +1726,7 @@ export type AliasesProvider = () => readonly string[]
 export type CreateChannelRouterOptions = {
   agentDir: string
   bootEpoch?: string
+  backgroundObligations?: BackgroundObligationStore
   configForAdapter: ConfigForAdapter
   configuredAliases?: AliasesProvider
   createSessionForChannel?: CreateSessionForChannel
@@ -1876,6 +1879,7 @@ const GRANT_ALL_PERMISSIONS: PermissionService = {
 export function createChannelRouter(options: CreateChannelRouterOptions): ChannelRouter {
   const logger = options.logger ?? consoleLogger
   const now = options.now ?? Date.now
+  const backgroundObligations = options.backgroundObligations ?? new BackgroundObligationStore(options.agentDir)
   const measureTranscriptBytes = options.measureTranscriptBytes ?? defaultMeasureTranscriptBytes
   const ensureLiveTimeoutMs = options.ensureLiveTimeoutMs ?? ENSURE_LIVE_TIMEOUT_MS
   const handoffRetryRetentionMs = options.handoffRetryRetentionMs ?? RELOAD_HANDOFF_RETENTION_MS
@@ -2746,6 +2750,9 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         pendingGithubReviewRoundCloseout: null,
         promptQueue: [],
         pendingSystemReminders: [],
+        backgroundCoverage: [],
+        backgroundStopVersion: 0,
+        backgroundTurnId: randomUUID(),
         willingnessReminderIteration: false,
         contextBuffer: [],
         currentTurnAttachments: [],
@@ -3234,12 +3241,96 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   // proceeds. The kimi 32k loop only recurs when the model genuinely has nothing
   // left to say after a reply, which `more_work_this_turn` asserts is not the
   // case; Layer 2's maxTokens cap still bounds any misuse.
+  // IDs are cache hints, never generation authority. Call only inside the lane.
+  const resolveBackgroundCoverage = async (
+    live: LiveSession,
+    ids: readonly string[],
+    ownedOnly = false,
+  ): Promise<BackgroundObligationRef[]> => {
+    const refs: BackgroundObligationRef[] = []
+    for (const id of new Set(ids)) {
+      const row = await backgroundObligations.get(id)
+      if (
+        !row ||
+        row.transfer ||
+        channelKeyId(row.target) !== live.keyId ||
+        (row.phase !== 'result-ready' && row.phase !== 'turn-owned')
+      )
+        continue
+      if (ownedOnly && (row.claim?.turnId !== live.backgroundTurnId || row.claim.ownerSessionId !== live.sessionId))
+        continue
+      refs.push({ obligationId: id, generation: row.generation })
+    }
+    if (refs.length > 0) backgroundObligations.assertAvailable()
+    return refs
+  }
+
+  const retireBackgroundCache = (live: LiveSession, covered: Set<string>): void => {
+    live.backgroundCoverage = live.backgroundCoverage.filter((id) => !covered.has(id))
+    live.pendingSystemReminders = live.pendingSystemReminders.filter(
+      (reminder) => !reminder.backgroundObligationId || !covered.has(reminder.backgroundObligationId),
+    )
+    for (const reminder of live.pendingSystemReminders) {
+      if (reminder.backgroundRetry) {
+        reminder.backgroundRetry.obligationIds = reminder.backgroundRetry.obligationIds.filter((id) => !covered.has(id))
+      }
+    }
+  }
+
+  const settleBackgroundCoverageInLane = async (
+    live: LiveSession,
+    kind: 'delivered' | 'intentionally-suppressed',
+    reason: string,
+    ids: readonly string[],
+  ): Promise<void> => {
+    const refs = await resolveBackgroundCoverage(live, ids)
+    if (refs.length > 0) {
+      await backgroundObligations.settle(refs, { kind, decisionId: randomUUID(), reason })
+    }
+    retireBackgroundCache(live, new Set(ids))
+  }
+
+  const settleBackgroundCoverage = async (
+    live: LiveSession,
+    kind: 'delivered' | 'intentionally-suppressed',
+    reason: string,
+    refs?: BackgroundObligationRef[],
+  ): Promise<void> => {
+    await backgroundObligations.withTargetLane(live.key, async () => {
+      await settleBackgroundCoverageInLane(
+        live,
+        kind,
+        reason,
+        refs ? refs.map((ref) => ref.obligationId) : live.backgroundCoverage,
+      )
+    })
+  }
+
+  // A landed response must never be replayed because its local outcome failed.
+  const recordLandedBackgroundResponse = async (
+    live: LiveSession,
+    reason: string,
+    refs: BackgroundObligationRef[],
+  ): Promise<void> => {
+    try {
+      await settleBackgroundCoverage(live, 'delivered', reason, refs)
+    } catch (error) {
+      logger.error(`[channels] background response outcome failed: ${describeError(error)}`)
+    }
+  }
+
   const installChannelReplyTerminalHook = (live: LiveSession): void => {
     const { agent } = live.session
     const prior = agent.afterToolCall
     agent.afterToolCall = async (context, signal) => {
       const result = prior ? await prior(context, signal) : undefined
-      const details = context.result.details as { ok?: unknown; more_work_this_turn?: unknown } | undefined
+      const details = context.result.details as
+        | {
+            ok?: unknown
+            more_work_this_turn?: unknown
+            backgroundCoverage?: BackgroundObligationRef[]
+          }
+        | undefined
       if (
         isQualifyingWorkResult({
           toolName: context.toolCall.name,
@@ -3256,6 +3347,10 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         // cannot distinguish channel_reply from channel_send, but here the
         // explicit more_work_this_turn flag tells us whether the delivered reply
         // renewed the promise or terminally fulfilled it.
+        const text = (context.toolCall.arguments as { text?: unknown } | undefined)?.text
+        if (!keepTurnAlive && !(typeof text === 'string' && detectContinuationWillingness(text))) {
+          await recordLandedBackgroundResponse(live, 'terminal-channel-reply', details?.backgroundCoverage ?? [])
+        }
         live.promisedWorkOutstandingThisLogicalTurn = keepTurnAlive
         if (keepTurnAlive) {
           live.continueReplyTurn = { turnSeq: live.turnSeq, sendCount: live.successfulChannelSends }
@@ -3793,17 +3888,42 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   }
 
   const stopCurrentChannelTurn = async (live: LiveSession, reason: string): Promise<boolean> => {
-    if (reason === 'user_stop') await recoveryStopHandler?.(live.key, live.sessionId)
-    live.userStoppedTurnSeq = live.turnSeq
-    live.lastTerminalReplyCompletion = null
-    live.pendingTerminalReplyStop = null
-    live.abortReasonThisTurn = { turnSeq: live.turnSeq, reason }
-    if (live.debounceTimer) clearTimeout(live.debounceTimer)
-    live.debounceTimer = null
-    live.firstUnprocessedAt = 0
-    live.promptQueue.length = 0
-    live.pendingSystemReminders.length = 0
-    live.continueReplyTurn = null
+    await backgroundObligations.withTargetLane(live.key, async () => {
+      try {
+        if (reason === 'user_stop') {
+          // Select after predecessors commit; queued entries contain IDs only.
+          const ids = [
+            ...live.backgroundCoverage,
+            ...live.pendingSystemReminders.flatMap((r) => (r.backgroundObligationId ? [r.backgroundObligationId] : [])),
+            ...live.pendingSystemReminders.flatMap((r) => r.backgroundRetry?.obligationIds ?? []),
+          ]
+          await settleBackgroundCoverageInLane(live, 'intentionally-suppressed', 'user-stop', ids)
+        }
+      } catch (error) {
+        // A failed withdrawal remains owed for conservative boot recovery.
+        // Bookkeeping must never prevent the user's parent abort.
+        logger.error(`[channels] background stop withdrawal failed: ${describeError(error)}`)
+      } finally {
+        live.backgroundStopVersion++
+        live.userStoppedTurnSeq = live.turnSeq
+        live.lastTerminalReplyCompletion = null
+        live.pendingTerminalReplyStop = null
+        live.abortReasonThisTurn = { turnSeq: live.turnSeq, reason }
+        clearTimeout(live.debounceTimer ?? undefined)
+        live.debounceTimer = null
+        live.firstUnprocessedAt = 0
+        live.promptQueue.length = 0
+        live.pendingSystemReminders.length = 0
+        live.continueReplyTurn = null
+      }
+    })
+    if (reason === 'user_stop') {
+      try {
+        await recoveryStopHandler?.(live.key, live.sessionId)
+      } catch (error) {
+        logger.error(`[channels] recovery stop withdrawal failed: ${describeError(error)}`)
+      }
+    }
     void dropContinuationReactions(live)
     enqueueTodoOutcomeWrite(live, {
       agentDir: options.agentDir,
@@ -4050,9 +4170,95 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         // without re-entering route(), the route() call site alone wouldn't
         // keep the indicator alive across multiple drain iterations.
         startTypingHeartbeat(live)
-        const batch = live.promptQueue.splice(0, live.promptQueue.length)
-        const observed = live.contextBuffer.splice(0, live.contextBuffer.length)
-        const reminders = live.pendingSystemReminders.splice(0, live.pendingSystemReminders.length)
+        // Result claims commit before content leaves the queues or enters a prompt.
+        const consume = async () => {
+          if (live.destroyed || live.pendingTeardown) return undefined
+          if (live.promptQueue.length === 0 && live.pendingSystemReminders.length === 0) return undefined
+          const batchCount = live.promptQueue.length
+          const observedCount = live.contextBuffer.length
+          const reminderCount = live.pendingSystemReminders.length
+          const queued = live.pendingSystemReminders.slice(0, reminderCount)
+          const eligible = new Set<PendingSystemReminder>()
+          const refs: BackgroundObligationRef[] = []
+          for (const reminder of queued) {
+            if (!reminder.backgroundObligationId) {
+              eligible.add(reminder)
+              continue
+            }
+            const row = await backgroundObligations.get(reminder.backgroundObligationId)
+            // Fetch/settlement may have overtaken this wake. Durable ownership
+            // wins: retire the obsolete entry instead of poisoning later input.
+            if (
+              !row ||
+              row.phase !== 'result-ready' ||
+              row.claim ||
+              row.transfer ||
+              channelKeyId(row.target) !== live.keyId
+            )
+              continue
+            eligible.add(reminder)
+            refs.push({ obligationId: row.obligationId, generation: row.generation })
+          }
+          const fresh = batchCount > 0 || queued.some((r) => eligible.has(r) && r.kind === 'wakeup')
+          const carried = fresh ? undefined : queued.find((r) => r.backgroundRetry)?.backgroundRetry
+          const turnId = fresh ? randomUUID() : (carried?.turnId ?? live.backgroundTurnId)
+          const claimed =
+            refs.length > 0
+              ? await backgroundObligations.claim(refs, {
+                  turnId,
+                  ownerSessionId: live.sessionId,
+                  target: live.key,
+                })
+              : []
+          const moved: BackgroundObligationRef[] = []
+          if (carried) {
+            for (const id of new Set(carried.obligationIds)) {
+              const row = await backgroundObligations.get(id)
+              if (
+                !row ||
+                row.transfer ||
+                row.phase !== 'turn-owned' ||
+                row.claim?.turnId !== carried.turnId ||
+                channelKeyId(row.target) !== live.keyId
+              )
+                continue
+              moved.push(
+                ...(await backgroundObligations.move([{ obligationId: id, generation: row.generation }], {
+                  fromTurnId: carried.turnId,
+                  turnId,
+                  ownerSessionId: live.sessionId,
+                  target: live.key,
+                })),
+              )
+            }
+          }
+          live.backgroundTurnId = turnId
+          if (fresh) live.backgroundCoverage = []
+          else
+            live.backgroundCoverage = (await resolveBackgroundCoverage(live, live.backgroundCoverage, true)).map(
+              (ref) => ref.obligationId,
+            )
+          live.backgroundCoverage.push(...claimed.map((ref) => ref.obligationId))
+          if (carried) {
+            live.backgroundCoverage = [...moved, ...claimed].map((ref) => ref.obligationId)
+            live.emptyTurnRetries = carried.emptyTurnRetries
+            live.toolLeakRetries = carried.toolLeakRetries
+            live.willingnessNudges = carried.willingnessNudges
+            live.nextPromptMaxTokens = carried.nextPromptMaxTokens
+          }
+          return {
+            batch: live.promptQueue.splice(0, batchCount),
+            observed: live.contextBuffer.splice(0, observedCount),
+            reminders: live.pendingSystemReminders
+              .splice(0, reminderCount)
+              .filter((reminder) => eligible.has(reminder)),
+            stopVersion: live.backgroundStopVersion,
+          }
+        }
+        const drained = await backgroundObligations.withTargetLane(live.key, consume)
+        if (drained === undefined) break
+        const { batch, observed, reminders, stopVersion } = drained
+        if (live.backgroundStopVersion !== stopVersion || (batch.length === 0 && reminders.length === 0)) continue
         live.currentTurnAttachments = collectTurnAttachments(observed, batch)
         // A reminder-only iteration carrying externally-injected work opens a
         // NEW logical turn. Without this, the completed-subagent wakeup that
@@ -4241,6 +4447,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           live.pendingUserTurnSignal = { signal: getQuestionSignal(retrievalQuery) }
         }
         const retrievalContext = await fireSessionTurnStart(live, retrievalQuery)
+        if (live.backgroundStopVersion !== stopVersion) continue
         const promptText = retrievalContext.results.length > 0 ? `${text}\n\n${retrievalContext.results}` : text
         applyTurnThinkingLevel(live.session, retrievalQuery, live.turnThinkingDefault, live.lastQuestionSignal)
         live.promptInFlight = true
@@ -4434,12 +4641,26 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       // BEFORE tearDownLive (its clearQueuedEngageReactions must not drop the
       // engage acks we are handing to the successor). Clear the source arrays so
       // the dying session owns nothing we are moving forward.
-      const carriedInbounds = live.promptQueue.splice(0, live.promptQueue.length)
-      const carriedObserved = live.contextBuffer.splice(0, live.contextBuffer.length)
-      const carriedReminders = live.pendingSystemReminders.splice(0, live.pendingSystemReminders.length)
-      const hasCarriedWork = carriedInbounds.length > 0 || carriedObserved.length > 0 || carriedReminders.length > 0
-      const retained =
-        hasCarriedWork && retainReloadHandoff(live.key, carriedInbounds, carriedObserved, carriedReminders)
+      const retained = await backgroundObligations.withTargetLane(live.key, async () => {
+        const retry =
+          live.promptQueue.length === 0 ? live.pendingSystemReminders.find((r) => r.kind === 'retry') : undefined
+        const refs = retry ? await resolveBackgroundCoverage(live, live.backgroundCoverage, true) : []
+        if (retry && refs.length > 0) {
+          retry.backgroundRetry = {
+            turnId: live.backgroundTurnId,
+            obligationIds: refs.map((ref) => ref.obligationId),
+            emptyTurnRetries: live.emptyTurnRetries,
+            toolLeakRetries: live.toolLeakRetries,
+            willingnessNudges: live.willingnessNudges,
+            nextPromptMaxTokens: live.nextPromptMaxTokens,
+          }
+        }
+        const carriedInbounds = live.promptQueue.splice(0, live.promptQueue.length)
+        const carriedObserved = live.contextBuffer.splice(0, live.contextBuffer.length)
+        const carriedReminders = live.pendingSystemReminders.splice(0, live.pendingSystemReminders.length)
+        const hasCarriedWork = carriedInbounds.length > 0 || carriedObserved.length > 0 || carriedReminders.length > 0
+        return hasCarriedWork && retainReloadHandoff(live.key, carriedInbounds, carriedObserved, carriedReminders)
+      })
       liveSessions.delete(live.keyId)
       await tearDownLive(live)
       if (retained) await handOffToSuccessor(live.key)
@@ -6499,6 +6720,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     logger.warn(
       `[channels] ${live.keyId}: recovering assistant_text_without_channel_tool source=${source} text_len=${assistantText.length}`,
     )
+    const capturedCoverage = await captureBackgroundResultCoverage(live.sessionId)
     const result = await send(
       {
         adapter: live.key.adapter,
@@ -6511,6 +6733,8 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     )
     if (!result.ok) {
       logger.warn(`[channels] ${live.keyId}: recovery send failed: ${result.error}`)
+    } else if (!detectContinuationWillingness(assistantText)) {
+      await recordLandedBackgroundResponse(live, 'recovered-terminal-response', capturedCoverage)
     }
   }
 
@@ -6874,27 +7098,8 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         // A real inbound coalesced onto the reservation during boot: it is the
         // wake. Adding the synthetic "I'm back" turn on top would duplicate
         // work / stack a spurious turn, so skip it and let the inbound drain.
-        // The interrupted-subagent directive is NOT part of that generic wake,
-        // though: it is the only signal that a promised result was lost, and the
-        // boot already consumed the handoff, so if we drop it here no later turn
-        // re-delivers it. Queue it AND drain ourselves: `sawInbound` is set
-        // before engagement is decided, so an observe-only inbound returns
-        // without draining and would strand the reminder. drain() is guarded
-        // (`draining || destroyed` no-ops) so if the inbound WILL engage this is
-        // a harmless second call, and its loop consumes pendingSystemReminders
-        // either way. Still skip the generic synthetic wake.
         if (reservation.sawInbound) {
-          if (handoff.interruptedSubagents !== undefined && handoff.interruptedSubagents.length > 0) {
-            live.pendingSystemReminders.push(
-              wakeupReminder(buildInterruptedSubagentNotice(handoff.interruptedSubagents)),
-            )
-            logger.info(
-              `[channels] ${keyId}: restart-resume coalesced with a real inbound; delivering interrupted-subagent notice`,
-            )
-            void drain(live)
-          } else {
-            logger.info(`[channels] ${keyId}: restart-resume coalesced with a real inbound; skipping synthetic wake`)
-          }
+          logger.info(`[channels] ${keyId}: restart-resume coalesced with a real inbound; skipping synthetic wake`)
           return
         }
 
@@ -6908,7 +7113,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           logger.error(`[channels] ${keyId}: restart-resume clear abort suppression failed: ${describeError(err)}`),
         )
 
-        live.pendingSystemReminders.push(wakeupReminder(buildRestartResumeWakeReminder(handoff.interruptedSubagents)))
+        live.pendingSystemReminders.push(wakeupReminder(RESTART_RESUME_WAKE_REMINDER))
         logger.info(`[channels] ${keyId}: restart-resume waking session ${live.sessionId}`)
         void drain(live)
       },
@@ -7002,6 +7207,90 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     return { kind: 'unknown-command', name: lowered }
   }
 
+  const acceptBackgroundResponse: ChannelRouter['acceptBackgroundResponse'] = async (args) =>
+    backgroundObligations.withTargetLane(args.key, async () => {
+      const row = await backgroundObligations.accept(args)
+      return { obligationId: row.obligationId, generation: row.generation }
+    })
+
+  const suppressUnstartedBackgroundResponse: ChannelRouter['suppressUnstartedBackgroundResponse'] = async (
+    ref,
+    reason,
+  ) => {
+    const row = await backgroundObligations.get(ref.obligationId)
+    if (!row) throw new Error('Missing background launch obligation')
+    await backgroundObligations.withTargetLane(row.target, async () => {
+      const current = await backgroundObligations.get(ref.obligationId)
+      if (!current || current.phase === 'closed') return
+      if (current.phase !== 'accepted') throw new Error('Background launch already progressed')
+      await backgroundObligations.settle([{ obligationId: current.obligationId, generation: current.generation }], {
+        kind: 'intentionally-suppressed',
+        decisionId: randomUUID(),
+        reason,
+      })
+    })
+  }
+
+  const attachBackgroundResultCoverage: ChannelRouter['attachBackgroundResultCoverage'] = async (args) => {
+    const live = [...liveSessions.values()].find(
+      (candidate) => !candidate.destroyed && candidate.sessionId === args.parentSessionId,
+    )
+    if (!live) return
+    await backgroundObligations.withTargetLane(live.key, async () => {
+      if (live.destroyed) return
+      const source =
+        (await backgroundObligations.lookup(args.parentSessionId, args.taskId)) ??
+        (await backgroundObligations.list()).find(
+          (row) => row.taskId === args.taskId && channelKeyId(row.target) === live.keyId,
+        )
+      if (!source || channelKeyId(source.target) !== live.keyId) return
+      const row = await backgroundObligations.resultReady(source.obligationId)
+      if (!row || row.phase === 'closed' || row.transfer) {
+        retireBackgroundCache(live, new Set([source.obligationId]))
+        return
+      }
+      const refs = [{ obligationId: row.obligationId, generation: row.generation }]
+      if (
+        row.claim &&
+        (row.claim.turnId !== live.backgroundTurnId ||
+          row.claim.ownerSessionId !== live.sessionId ||
+          row.claim.epoch !== backgroundObligations.epoch)
+      ) {
+        await backgroundObligations.move(refs, {
+          fromTurnId: row.claim.turnId,
+          turnId: live.backgroundTurnId,
+          ownerSessionId: live.sessionId,
+          target: live.key,
+        })
+      } else if (!row.claim) {
+        await backgroundObligations.claim(refs, {
+          turnId: live.backgroundTurnId,
+          ownerSessionId: live.sessionId,
+          target: live.key,
+        })
+      }
+      // Fetch consumed this result into the active prompt. Its queued wake must
+      // not advertise an old owner or start a second prompt for the same result.
+      retireBackgroundCache(live, new Set([row.obligationId]))
+      live.backgroundCoverage.push(row.obligationId)
+    })
+  }
+
+  const captureBackgroundResultCoverage: NonNullable<ChannelRouter['captureBackgroundResultCoverage']> = async (
+    parentSessionId,
+  ) => {
+    const live = [...liveSessions.values()].find(
+      (candidate) => !candidate.destroyed && candidate.sessionId === parentSessionId,
+    )
+    if (!live) return []
+    return backgroundObligations.withTargetLane(live.key, async () => {
+      if (live.destroyed) return []
+      const refs = await resolveBackgroundCoverage(live, live.backgroundCoverage, true)
+      live.backgroundCoverage = refs.map((ref) => ref.obligationId)
+      return refs
+    })
+  }
+
   const deliverCompletionReminder = (
     live: LiveSession,
     args: {
@@ -7012,6 +7301,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       durationMs: number
       error?: string
       hasRecoverableOutput?: boolean
+      backgroundObligationId?: string
     },
   ): { kind: 'delivered'; keyId: string } => {
     const adapter = live.keyId.split(':', 1)[0] ?? ''
@@ -7025,7 +7315,16 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       channel: true,
       adapter,
     })
-    live.pendingSystemReminders.push(wakeupReminder(text))
+    if (
+      args.backgroundObligationId &&
+      (live.backgroundCoverage.includes(args.backgroundObligationId) ||
+        live.pendingSystemReminders.some((r) => r.backgroundObligationId === args.backgroundObligationId))
+    )
+      return { kind: 'delivered', keyId: live.keyId }
+    live.pendingSystemReminders.push({
+      ...wakeupReminder(text),
+      ...(args.backgroundObligationId ? { backgroundObligationId: args.backgroundObligationId } : {}),
+    })
     // The reminder tells the agent to fetch this result now; clear the
     // subagent_output window so an earlier premature-polling streak can't
     // hard-block that legitimate fetch.
@@ -7042,7 +7341,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     return { kind: 'delivered', keyId: live.keyId }
   }
 
-  const injectSubagentCompletionReminder = (args: {
+  const injectSubagentCompletionReminder = async (args: {
     parentSessionId: string
     subagent: string
     taskId: string
@@ -7051,11 +7350,31 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     error?: string
     hasRecoverableOutput?: boolean
     channelKey?: { adapter: string; workspace: string; chat: string; thread: string | null }
-  }): { kind: 'delivered'; keyId: string } | { kind: 'no-live-session' } => {
+  }): Promise<{ kind: 'delivered'; keyId: string } | { kind: 'no-live-session' }> => {
+    // Completion admission is independent of the presence or health of a parent.
+    const existing = await backgroundObligations.lookup(args.parentSessionId, args.taskId)
+    const row = existing
+      ? await backgroundObligations.withTargetLane(existing.target, () =>
+          backgroundObligations.resultReady(existing.obligationId),
+        )
+      : undefined
+    if (existing && !row) return { kind: 'no-live-session' }
+    const queueCompletion = (
+      live: LiveSession,
+    ): Promise<{ kind: 'delivered'; keyId: string } | { kind: 'no-live-session' }> =>
+      backgroundObligations.withTargetLane(live.key, async () => {
+        const current = row ? await backgroundObligations.get(row.obligationId) : undefined
+        if (row && (!current || current.phase === 'closed' || current.transfer)) return { kind: 'no-live-session' }
+        return deliverCompletionReminder(live, {
+          ...args,
+          ...(current ? { backgroundObligationId: current.obligationId } : {}),
+        })
+      })
     for (const live of liveSessions.values()) {
       if (live.destroyed) continue
       if (live.sessionId !== args.parentSessionId) continue
-      return deliverCompletionReminder(live, args)
+      if (row && channelKeyId(row.target) !== live.keyId) continue
+      return queueCompletion(live)
     }
     // The exact parent session is gone. If the subagent was spawned from a
     // channel session, the conversation may have rolled over
@@ -7070,7 +7389,8 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         logger.info(
           `[channels] ${targetKeyId}: subagent-completion reminder rerouted to live successor (parent ${args.parentSessionId} gone) task=${args.taskId}`,
         )
-        return deliverCompletionReminder(successor, args)
+        if (row && channelKeyId(row.target) !== successor.keyId) return { kind: 'no-live-session' }
+        return queueCompletion(successor)
       }
     }
     return { kind: 'no-live-session' }
@@ -7279,18 +7599,22 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   // event.sessionId), and confirmed to be the right github PR live session so a
   // stray/mismatched signal can't suppress an unrelated turn's fallback. See
   // `githubReviewOutputTurn`.
-  const noteGithubReviewOutput = (args: {
+  const noteGithubReviewOutput = async (args: {
     sessionId: string
     workspace: string
     prNumber: number
     state: ReviewOutputState
-  }): { kind: 'stamped' | 'no-live-session' } => {
+    backgroundCoverage?: BackgroundObligationRef[]
+  }): Promise<{ kind: 'stamped' | 'no-live-session' }> => {
     const chat = `pr:${args.prNumber}`
     for (const live of liveSessions.values()) {
       if (live.destroyed) continue
       if (live.sessionId !== args.sessionId) continue
       if (live.key.adapter !== 'github') continue
       if (live.key.workspace !== args.workspace || live.key.chat !== chat) continue
+      // Only pre-publication coverage can be credited. An output-only recognizer
+      // still stamps ordinary review accounting, but cannot borrow current debt.
+      await recordLandedBackgroundResponse(live, 'formal-review', args.backgroundCoverage ?? [])
       live.githubReviewOutputTurn = live.turnSeq
       logger.info(`[channels] ${live.keyId}: github_review_output state=${args.state} turn=${live.turnSeq}`)
       return { kind: 'stamped' }
@@ -7298,16 +7622,16 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     return { kind: 'no-live-session' }
   }
 
-  const markTurnSkipped = (args: {
+  const markTurnSkipped = async (args: {
     parentSessionId: string
     reason: string
-  }):
-    | { kind: 'recorded'; keyId: string }
-    | { kind: 'recorded-after-send'; keyId: string }
-    | { kind: 'no-live-session' } => {
+  }): Promise<
+    { kind: 'recorded'; keyId: string } | { kind: 'recorded-after-send'; keyId: string } | { kind: 'no-live-session' }
+  > => {
     for (const live of liveSessions.values()) {
       if (live.destroyed) continue
       if (live.sessionId !== args.parentSessionId) continue
+      await settleBackgroundCoverage(live, 'intentionally-suppressed', 'explicit-skip')
       if (live.successfulChannelSends > live.successfulSendsAtTurnStart) {
         // Reply-first skip ("acked, now going quiet"): accept as a terminal
         // no-op, never stamp `skippedTurn`. The delivered reply stands and must
@@ -7470,6 +7794,10 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   return {
     route,
     send,
+    acceptBackgroundResponse,
+    suppressUnstartedBackgroundResponse,
+    attachBackgroundResultCoverage,
+    captureBackgroundResultCoverage,
     registerRecoveryAdapter,
     unregisterRecoveryAdapter,
     getRecoveryAccountIdentity,

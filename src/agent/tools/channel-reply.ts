@@ -1,6 +1,7 @@
 import { Type } from '@earendil-works/pi-ai'
 import { defineTool } from '@earendil-works/pi-coding-agent'
 
+import type { BackgroundObligationRef } from '@/channels/background-obligations'
 import { checkCompletionClaim } from '@/channels/completion-claim'
 import { checkFalseReceipt } from '@/channels/github-false-receipt'
 import { evaluateRereviewGuard } from '@/channels/github-rereview-guard'
@@ -297,6 +298,7 @@ export function createChannelReplyTool({
         }
       }
 
+      const backgroundCoverage = (await router.captureBackgroundResultCoverage?.(sessionId)) ?? []
       const result = await router.send({
         adapter: origin.adapter,
         workspace: origin.workspace,
@@ -339,9 +341,11 @@ export function createChannelReplyTool({
         more_work_this_turn?: boolean
         messageId?: string
         messageIds?: readonly string[]
+        backgroundCoverage?: BackgroundObligationRef[]
       } = result.ok
         ? {
             ok: true,
+            backgroundCoverage,
             ...(keepTurnAlive ? { more_work_this_turn: true } : {}),
             ...(result.messageId !== undefined ? { messageId: result.messageId } : {}),
             ...(result.messageIds !== undefined ? { messageIds: result.messageIds } : {}),
