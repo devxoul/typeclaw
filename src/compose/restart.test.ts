@@ -160,26 +160,49 @@ describe('composeRestart events', () => {
   })
 
   test('checks fleet memory once after every agent settled instead of per agent', async () => {
-    // given two agents that both restart successfully
+    // given two agents where bravo's restart is held open until released
     await makeValidAgent(root, 'alpha')
     await makeValidAgent(root, 'bravo')
     const skipFlags: Array<boolean | undefined> = []
+    const { promise: bravoReleased, resolve: releaseBravo } = Promise.withResolvers<void>()
+    const { promise: alphaDone, resolve: markAlphaDone } = Promise.withResolvers<void>()
     const restart: Controller['restart'] = async (options) => {
       skipFlags.push(options.skipMemoryOversubscriptionCheck)
+      if (options.cwd.endsWith('bravo')) await bravoReleased
       return { ok: true, stop: { ok: true, containerName: 'x', running: true }, start: successfulStart() }
     }
-    let checks = 0
+    const settled = new Set<string>()
+    const settledAtCheck: string[][] = []
     const checkMemory = async (): Promise<string[]> => {
-      checks += 1
+      settledAtCheck.push([...settled].toSorted())
       return ['Agent memory limits total 12.0GiB against 8.0GiB of Docker memory.']
     }
 
-    // when
-    const result = await composeRestart({ rootCwd: root, preferredHostPort: 8973 }, { restart, checkMemory })
+    // when alpha has finished but bravo is still restarting
+    const pending = composeRestart(
+      {
+        rootCwd: root,
+        preferredHostPort: 8973,
+        onProgress: (event) => {
+          if (event.kind !== 'agent-done') return
+          settled.add(event.name)
+          if (event.name === 'alpha') markAlphaDone()
+        },
+      },
+      { restart, checkMemory },
+    )
+    await alphaDone
 
-    // then
+    // then the fleet check has not run yet
+    expect(settledAtCheck).toEqual([])
+
+    // when bravo settles
+    releaseBravo()
+    const result = await pending
+
+    // then the fleet check runs exactly once, only after both agents settled
     expect(skipFlags).toEqual([true, true])
-    expect(checks).toBe(1)
+    expect(settledAtCheck).toEqual([['alpha', 'bravo']])
     expect(result.memoryWarning).toEqual(['Agent memory limits total 12.0GiB against 8.0GiB of Docker memory.'])
     expect(result.results.every((r) => r.ok && r.warnings?.length === 0)).toBe(true)
   })
