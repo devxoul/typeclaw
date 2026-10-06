@@ -67,9 +67,10 @@ export function decideMemoryOversubscription(options: {
 
 export function formatOversubscriptionWarning(warning: OversubscriptionWarning): string[] {
   const gib = (bytes: number): string => `${(bytes / (1024 * 1024 * 1024)).toFixed(1)}GiB`
+  const width = warning.claims.reduce((w, claim) => Math.max(w, claim.containerName.length), 0)
   const roster = warning.claims
-    .map((claim) => `  ${claim.containerName} ${claim.bytes === null ? 'unlimited' : gib(claim.bytes)}`)
-    .sort((a, b) => a.localeCompare(b))
+    .toSorted((a, b) => a.containerName.localeCompare(b.containerName))
+    .map((claim) => `  ${claim.containerName.padEnd(width)}  ${claim.bytes === null ? 'unlimited' : gib(claim.bytes)}`)
 
   const capacity = warning.totalMemoryBytes === null ? null : gib(warning.totalMemoryBytes)
   const names = warning.unbounded.map((claim) => claim.containerName).join(', ')
