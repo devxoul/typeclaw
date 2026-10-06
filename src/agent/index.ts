@@ -414,6 +414,7 @@ export async function createSessionWithDispose(options: CreateSessionOptions = {
               agentDir: options.plugins?.agentDir,
               parentSessionId: sessionManager.getSessionId(),
               getOrigin,
+              getSessionFile: () => sessionManager.getSessionFile(),
               permissions: options.permissions,
               stream: options.stream,
               allowBackgroundFromSubagent: options.allowBackgroundFromSubagent,
@@ -458,6 +459,7 @@ export async function createSessionWithDispose(options: CreateSessionOptions = {
               agentDir: options.plugins?.agentDir,
               parentSessionId: sessionManager.getSessionId(),
               getOrigin,
+              getSessionFile: () => sessionManager.getSessionFile(),
               permissions: options.permissions,
               stream: options.stream,
               coalescer: options.subagentCoalescer,
@@ -902,6 +904,7 @@ export function buildSubagentOrchestrationTools(opts: {
   agentDir: string | undefined
   parentSessionId: string
   getOrigin: () => SessionOrigin | undefined
+  getSessionFile?: () => string | undefined
   permissions: PermissionService | undefined
   stream: Stream | undefined
   allowBackgroundFromSubagent?: boolean
@@ -924,6 +927,7 @@ export function buildSubagentOrchestrationTools(opts: {
       agentDir: opts.agentDir,
       parentSessionId: opts.parentSessionId,
       getOrigin: opts.getOrigin,
+      ...(opts.getSessionFile !== undefined ? { getSessionFile: opts.getSessionFile } : {}),
       ...(opts.permissions ? { permissions: opts.permissions } : {}),
       ...(opts.stream ? { stream: opts.stream } : {}),
       ...(opts.allowBackgroundFromSubagent !== undefined

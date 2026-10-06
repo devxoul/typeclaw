@@ -10,15 +10,10 @@ export { restartHandoffPath } from './paths'
 
 export const RESTART_HANDOFF_TTL_MS = 60_000
 
-// Process-local serialization of the two same-process handoff producers that
-// race during a restart: the in-session `/restart` tool (which writes the
-// originating handoff post-ACK) and the SIGTERM writer (which peek-augments it).
-// hostd fires `docker stop` → SIGTERM before its ACK reaches the container, so
-// without this the SIGTERM read-modify-write can interleave with `/restart`'s
-// write and drop the originating session's origin/author or its interrupted
-// children. This is NOT a cross-process lock — both producers live in this one
-// container process; the event loop yields at every await, so a promise-chain
-// mutex is all that's needed. Keyed by handoff path so distinct agent dirs
+// Serialize ordinary restart-handoff reads and writes within one process.
+// This is not a cross-process lock. Background launch inventory has its own
+// per-parent serialization and contributes non-TTL input at boot; it no longer
+// augments this file from a SIGTERM sampler. Key by path so distinct agent dirs
 // (tests) never contend.
 const handoffLocks = new Map<string, Promise<void>>()
 
@@ -76,11 +71,9 @@ export type RestartHandoff = {
   // whatever bare-channel rule matches on every "I'm back" turn. Optional and
   // additive: pre-field v2 handoffs and tui handoffs omit it.
   triggeringAuthorId?: string
-  // Names of background subagents still running when the restart fired, so the
-  // resumed session can tell the thread its promised result was lost. Absent
-  // (never an empty array) when nothing was in flight. Rides the handoff's 60s
-  // TTL, so a stop→idle-for-hours→start drops it instead of replaying a stale
-  // notice into a moved-on conversation.
+  // Lost-work names accepted from older handoffs or merged inventory at boot.
+  // Persisted ordinary handoffs still have the greeting's 60s TTL; inventory
+  // recovery independently uses exact-parent mapping, not elapsed age.
   interruptedSubagents?: string[]
 }
 

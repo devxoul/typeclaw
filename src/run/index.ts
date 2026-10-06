@@ -7,7 +7,6 @@ import { createProviderAuthReloadable } from '@/agent/auth-reloadable'
 import { LiveSessionRegistry } from '@/agent/live-sessions'
 import { LiveSubagentRegistry, newestRunningBackgroundChildStartedAt } from '@/agent/live-subagents'
 import { requestContainerRestart } from '@/agent/restart'
-import { consumeRestartHandoff } from '@/agent/restart-handoff'
 import { sessionMetaPayload } from '@/agent/session-meta'
 import type { SessionOrigin } from '@/agent/session-origin'
 import {
@@ -40,6 +39,7 @@ import {
   type PrVerdictActivityBridge,
   type SubagentCompletionBridge,
 } from '@/channels'
+import { BackgroundHandoffInventory } from '@/channels/background-handoff'
 import { createTunnelBridge, type TunnelBridge } from '@/channels/tunnel-bridge'
 import { createConfigReloadable, getConfig, loadConfigBundleSync, reloadConfig, withDefaultPlugins } from '@/config'
 import {
@@ -86,6 +86,7 @@ import { createStream, type Stream } from '@/stream'
 import { createTui as createTuiDefault, type TuiOptions } from '@/tui'
 import { createTunnelManager, type TunnelManager, type TunnelManagerOptions } from '@/tunnels'
 
+import { bootBackgroundHandoffs } from './background-handoff-boot'
 import { BUNDLED_PLUGINS } from './bundled-plugins'
 import { buildChannelSessionFactory } from './channel-session-factory'
 import { installFatalGuard } from './fatal-guard'
@@ -478,7 +479,10 @@ async function startAgentRuntime(
     },
   })
 
-  const liveSubagentRegistry = new LiveSubagentRegistry()
+  const backgroundInventory = new BackgroundHandoffInventory(cwd, {
+    onError: (error) => console.warn(`[run] background inventory failed: ${error}`),
+  })
+  const liveSubagentRegistry = new LiveSubagentRegistry(backgroundInventory)
   const subagentCoalescer = new SubagentCoalescer()
   const liveSessionRegistry = new LiveSessionRegistry()
 
@@ -514,11 +518,6 @@ async function startAgentRuntime(
     stream,
     newestRunningChildSubagentStartedAt: (sessionId) =>
       newestRunningBackgroundChildStartedAt(liveSubagentRegistry.list({ parentSessionId: sessionId })),
-    listRunningBackgroundSubagentNames: (sessionId) =>
-      liveSubagentRegistry
-        .list({ parentSessionId: sessionId })
-        .filter((child) => child.status === 'running' && child.background === true)
-        .map((child) => child.subagentName),
     cancelRunningSubagentsByWorkKey: (workKey, reason) => liveSubagentRegistry.cancelRunningByWorkKey(workKey, reason),
     onReload: async () => {
       const { results } = await reloadAllNonDestructive()
@@ -907,36 +906,15 @@ async function startAgentRuntime(
 
   reloadRegistry.register(createChannelsReloadable({ manager: channelManager }))
 
-  // Two-phase channel restart-resume around adapter startup, to close the race
-  // where an adapter starts receiving before the resume claims the handoff:
-  //   1. Claim the channel handoff and RESERVE the originating key BEFORE
-  //      channelManager.start(). The reservation installs a per-key gate, so an
-  //      inbound that arrives the instant an adapter connects coalesces onto the
-  //      resume instead of stale-rolling the mapping or creating a rival session.
-  //   2. start() the adapters (registers outbound callbacks the wake reply needs).
-  //   3. resume() the reservation: reopen the exact session and enqueue the wake
-  //      — skipped automatically if a real inbound already coalesced in (2)→(3).
-  // Claims ONLY channel handoffs; tui handoffs are left on disk (peek-then-delete
-  // never removes an unclaimed handoff) for the websocket open handler to claim.
-  // Best-effort throughout: any failure leaves the todo to resume on the next inbound.
-  let restartReservation: ReturnType<typeof channelManager.router.reserveRestartHandoff> = null
-  try {
-    const handoff = await consumeRestartHandoff(cwd, { accept: (h) => h.origin.kind === 'channel' })
-    if (handoff !== null) restartReservation = channelManager.router.reserveRestartHandoff(handoff)
-  } catch (err) {
-    console.warn(`[run] channel restart-resume reserve failed: ${err instanceof Error ? err.message : err}`)
-  }
-
   registerBootCleanup(() => channelManager.stop())
-  await channelManager.start()
-
-  if (restartReservation !== null) {
-    try {
-      await restartReservation.resume()
-    } catch (err) {
-      console.warn(`[run] channel restart-resume failed: ${err instanceof Error ? err.message : err}`)
-    }
-  }
+  await bootBackgroundHandoffs({
+    agentDir: cwd,
+    inventory: backgroundInventory,
+    router: channelManager.router,
+    configured: (key) => getConfig().channels[key.adapter] !== undefined,
+    startAdapters: () => channelManager.start(),
+    onError: (error) => console.warn(`[run] channel restart-resume failed: ${error}`),
+  })
 
   // Captured separately from setSpawnSubagent so both the plugin context and
   // the plugin-command runner can dispatch through the same path. The setter
@@ -1111,6 +1089,9 @@ async function startAgentRuntime(
       await channelManager.stop()
       await mcpManager?.closeAll()
     } finally {
+      await backgroundInventory
+        .flush()
+        .catch((error) => console.warn(`[run] background inventory flush failed: ${error}`))
       await pluginsLoaded.disposePlugins()
       disposeProcessGlobals()
     }
@@ -1133,10 +1114,6 @@ async function startAgentRuntime(
     forceExit.unref()
     void (async () => {
       if (containerName !== undefined) {
-        // Persist the interrupted-subagent handoff BEFORE markRestartAbortForAllLive
-        // aborts the sessions and stop() tears them down — both read the same live
-        // set this write depends on.
-        await channelManager.router.writeInterruptedSubagentHandoff().catch(() => undefined)
         await markRestartAbortPendingForOrigin(cwd, { kind: 'tui', sessionId: 'tui' }).catch(() => undefined)
         await channelManager.router.markRestartAbortForAllLive().catch(() => undefined)
       }
