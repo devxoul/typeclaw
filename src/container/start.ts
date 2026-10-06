@@ -158,6 +158,8 @@ export type StartOptions = {
   // disables process output so child progress and warnings cannot corrupt it.
   streamOutput?: boolean
   onWarning?: (warning: string) => void
+  // Compose runs one fleet-wide check after every agent settled instead.
+  skipMemoryOversubscriptionCheck?: boolean
   exec?: DockerExec
   // Test seam: allows tests to inject a deterministic port allocator. In
   // production we go through the real kernel via `findFreePort`.
@@ -273,6 +275,7 @@ async function runStart({
   forceBuild = false,
   streamOutput = true,
   onWarning,
+  skipMemoryOversubscriptionCheck = false,
   exec = defaultDockerExec,
   allocatePort = findFreePort,
   cliEntry,
@@ -608,14 +611,16 @@ async function runStart({
       totalMemoryBytes,
     })
 
-    await warnOnMemoryOversubscription({
-      exec,
-      containerName,
-      memoryLimitBytes: plan.memoryLimitBytes,
-      totalMemoryBytes,
-      onWarning,
-      streamOutput,
-    })
+    if (!skipMemoryOversubscriptionCheck) {
+      await warnOnMemoryOversubscription({
+        exec,
+        containerName,
+        memoryLimitBytes: plan.memoryLimitBytes,
+        totalMemoryBytes,
+        onWarning,
+        streamOutput,
+      })
+    }
 
     let built = false
     if (plan.needsBuild) {

@@ -8,6 +8,7 @@ export type RestartOptions = {
   forceBuild?: boolean
   streamOutput?: boolean
   onWarning?: (warning: string) => void
+  skipMemoryOversubscriptionCheck?: boolean
   cliEntry?: string
   reuseCurrentHostDaemon?: boolean
   currentHostDaemon?: CurrentHostDaemon
@@ -53,6 +54,7 @@ async function restartWithLease(
     forceBuild: options.forceBuild,
     streamOutput: options.streamOutput,
     onWarning: options.onWarning,
+    skipMemoryOversubscriptionCheck: options.skipMemoryOversubscriptionCheck,
     cliEntry: options.cliEntry,
     reuseCurrentHostDaemon: options.reuseCurrentHostDaemon,
     currentHostDaemon: options.currentHostDaemon,
