@@ -40,6 +40,10 @@ export type ReconcileOpenPrsOptions = {
   cooldownStore?: ReconcileCooldownStore
   cooldownMs?: number
   now?: () => number
+  // The pass runs detached from adapter start(), so it can outlive stop(). Once
+  // cancelled it must not persist cooldowns, route, or prune for a lifecycle
+  // that no longer owns the channel.
+  isCancelled?: () => boolean
 }
 
 export type ReconcileOutcome = { repo: string; scanned: number; replayed: number } | { repo: string; error: string }
@@ -56,6 +60,7 @@ export async function reconcileOpenPrs(options: ReconcileOpenPrsOptions): Promis
 
   const outcomes: ReconcileOutcome[] = []
   for (const repo of new Set(options.repos)) {
+    if (options.isCancelled?.() === true) break
     const target = parseRepo(repo)
     if (target === null) {
       outcomes.push({ repo, error: 'malformed repo slug' })
@@ -95,13 +100,16 @@ async function reconcileRepo(
   for (const pr of prs) {
     const needs = await prNeedsReview({ pr, options, target, token, selfLogin, decoyLogin, fetchImpl })
     if (!needs) continue
+    if (options.isCancelled?.() === true) return { repo, scanned: prs.length, replayed }
     if (cooldownStore !== undefined) {
       if (cooldownStore.isCoolingDown(repo, pr.id, now(), cooldownMs)) continue
       try {
         // Persist the marker before routing: if the write fails the marker is
         // rolled back and this throws, so we skip the route rather than replay a
         // PR with no durable record (a restart would otherwise replay it again).
-        await cooldownStore.markReplayed(repo, pr.id, now())
+        if (!(await cooldownStore.markReplayed(repo, pr.id, now(), options.isCancelled))) {
+          return { repo, scanned: prs.length, replayed }
+        }
       } catch (err) {
         options.logger.warn(
           `[github] reconcile ${repo}: skipping PR #${pr.number} replay, cooldown persist failed: ${describeError(
@@ -111,11 +119,15 @@ async function reconcileRepo(
         continue
       }
     }
+    if (options.isCancelled?.() === true) {
+      await cooldownStore?.clear(repo, pr.id)
+      return { repo, scanned: prs.length, replayed }
+    }
     await options.route(buildSyntheticInbound(pr, target))
     replayed += 1
   }
 
-  if (cooldownStore !== undefined) {
+  if (cooldownStore !== undefined && options.isCancelled?.() !== true) {
     await cooldownStore.prune(repo, new Set(prs.map((pr) => pr.id)), now())
   }
   return { repo, scanned: prs.length, replayed }

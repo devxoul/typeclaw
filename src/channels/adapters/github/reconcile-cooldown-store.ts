@@ -74,9 +74,36 @@ export type ReconcileCooldownStore = {
   isCoolingDown: (repo: string, prId: number, now: number, cooldownMs: number) => boolean
   // Flush BEFORE routing the synthetic inbound: a crash between marking and
   // session creation must not re-trigger a replay on the next restart.
-  markReplayed: (repo: string, prId: number, now: number) => Promise<void>
+  // Resolves false when `isCancelled` flipped during the write; the marker is
+  // then rolled back within the same tracked write, because the replay it
+  // guarded will never be dispatched.
+  markReplayed: (repo: string, prId: number, now: number, isCancelled?: () => boolean) => Promise<boolean>
   clear: (repo: string, prId: number) => Promise<void>
   prune: (repo: string, openPrIds: ReadonlySet<number>, now: number) => Promise<void>
+}
+
+// Writes in flight per cooldown file, shared across store instances. A stopped
+// adapter's detached reconcile pass may still be persisting or rolling back a
+// marker when a replacement adapter loads the file; loading waits for those
+// writes (never for router receipts) so it can't read a marker about to vanish.
+const pendingWrites = new Map<string, Set<Promise<unknown>>>()
+
+function trackWrite<T>(path: string, write: Promise<T>): Promise<T> {
+  let pending = pendingWrites.get(path)
+  if (pending === undefined) {
+    pending = new Set()
+    pendingWrites.set(path, pending)
+  }
+  const settled = write.then(
+    () => undefined,
+    () => undefined,
+  )
+  pending.add(settled)
+  void settled.then(() => {
+    pending.delete(settled)
+    if (pending.size === 0 && pendingWrites.get(path) === pending) pendingWrites.delete(path)
+  })
+  return write
 }
 
 export async function loadReconcileCooldownStore(
@@ -84,6 +111,7 @@ export async function loadReconcileCooldownStore(
   logger: ReconcileCooldownLogger = consoleLogger,
 ): Promise<ReconcileCooldownStore> {
   const path = reconcileCooldownPath(agentDir)
+  await Promise.all(pendingWrites.get(path) ?? [])
   const markers = new Map<string, ReconcileMarker>()
   for (const marker of await readMarkers(path, logger)) {
     markers.set(markerKey(marker.repo, marker.prId), marker)
@@ -106,29 +134,46 @@ export async function loadReconcileCooldownStore(
     // Roll the in-memory marker back and rethrow if the disk write fails, so the
     // caller skips routing rather than replaying a PR with no durable record —
     // otherwise a restart would replay it immediately, defeating the cooldown.
-    async markReplayed(repo, prId, now): Promise<void> {
+    markReplayed(repo, prId, now, isCancelled): Promise<boolean> {
       const key = markerKey(repo, prId)
       const previous = markers.get(key)
-      markers.set(key, { repo, prId, lastReplayAt: now })
-      try {
-        await flush()
-      } catch (err) {
+      const restore = () => {
         if (previous === undefined) markers.delete(key)
         else markers.set(key, previous)
-        throw err
       }
+      return trackWrite(
+        path,
+        (async () => {
+          markers.set(key, { repo, prId, lastReplayAt: now })
+          try {
+            await flush()
+          } catch (err) {
+            restore()
+            throw err
+          }
+          if (isCancelled?.() !== true) return true
+          restore()
+          await flush()
+          return false
+        })(),
+      )
     },
-    async clear(repo, prId): Promise<void> {
+    clear(repo, prId): Promise<void> {
       const key = markerKey(repo, prId)
       const previous = markers.get(key)
-      if (previous === undefined) return
-      markers.delete(key)
-      try {
-        await flush()
-      } catch (err) {
-        markers.set(key, previous)
-        throw err
-      }
+      if (previous === undefined) return Promise.resolve()
+      return trackWrite(
+        path,
+        (async () => {
+          markers.delete(key)
+          try {
+            await flush()
+          } catch (err) {
+            markers.set(key, previous)
+            throw err
+          }
+        })(),
+      )
     },
     async prune(repo, openPrIds, now): Promise<void> {
       let changed = false
@@ -142,7 +187,7 @@ export async function loadReconcileCooldownStore(
       }
       if (changed) {
         try {
-          await flush()
+          await trackWrite(path, flush())
         } catch (err) {
           logger.error(`[github] failed to persist reconcile cooldown: ${describeError(err)}`)
         }
