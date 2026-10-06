@@ -43,6 +43,32 @@ describe('ReconcileCooldownStore', () => {
     ).toBe(false)
   })
 
+  test('cancellation during the marker write rolls it back before a replacement store loads', async () => {
+    // given a pass whose adapter stops while its marker write is in flight
+    const stale = await loadReconcileCooldownStore(agentDir, silentLogger)
+    let loading: ReturnType<typeof loadReconcileCooldownStore> | undefined
+
+    // when a replacement adapter loads the store once the marker is on disk but
+    // before the stale pass has observed its cancellation
+    const marking = stale.markReplayed('acme/widgets', 700, 1_000, () => {
+      loading = loadReconcileCooldownStore(agentDir, silentLogger)
+      return true
+    })
+    const replacement = await marking.then(() => loading!)
+
+    // then the unlaunched replay left no cooldown, so it can still be replayed
+    expect(await marking).toBe(false)
+    expect(replacement.isCoolingDown('acme/widgets', 700, 1_001, DEFAULT_RECONCILE_COOLDOWN_MS)).toBe(false)
+    const reloaded = await loadReconcileCooldownStore(agentDir, silentLogger)
+    expect(reloaded.isCoolingDown('acme/widgets', 700, 1_001, DEFAULT_RECONCILE_COOLDOWN_MS)).toBe(false)
+  })
+
+  test('an uncancelled marker write reports the marker as kept', async () => {
+    const store = await loadReconcileCooldownStore(agentDir, silentLogger)
+    expect(await store.markReplayed('acme/widgets', 700, 1_000, () => false)).toBe(true)
+    expect(store.isCoolingDown('acme/widgets', 700, 1_001, DEFAULT_RECONCILE_COOLDOWN_MS)).toBe(true)
+  })
+
   test('markers survive a reload (persist to disk)', async () => {
     const first = await loadReconcileCooldownStore(agentDir, silentLogger)
     await first.markReplayed('acme/widgets', 700, 5_000)

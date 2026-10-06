@@ -250,6 +250,7 @@ function fakeCooldownStore(initial: ReadonlyArray<{ repo: string; prId: number; 
     },
     markReplayed: async (repo, prId, now) => {
       markers.set(`${repo}#${prId}`, now)
+      return true
     },
     clear: async (repo, prId) => {
       markers.delete(`${repo}#${prId}`)

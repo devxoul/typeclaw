@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { createHmac, generateKeyPairSync } from 'node:crypto'
 import { mkdirSync } from 'node:fs'
-import { mkdir, mkdtemp, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -113,6 +113,14 @@ afterEach(async () => {
   await Promise.all(routers.splice(0).map((router) => router.stop()))
   await rm(agentDir, { recursive: true, force: true })
 })
+
+async function waitUntil(predicate: () => boolean, timeoutMs = 2000): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (!predicate()) {
+    if (Date.now() > deadline) throw new Error('waitUntil timed out')
+    await new Promise((resolve) => setTimeout(resolve, 5))
+  }
+}
 
 function freshRouter(): ChannelRouter {
   const routerDir = join(agentDir, `router-${routers.length}`)
@@ -1412,7 +1420,7 @@ describe('createGithubAdapter lifecycle', () => {
       expect(calls.some((c) => c.url.includes('/pulls'))).toBe(false)
     })
 
-    function unreviewedPrFetch(): { fetch: typeof fetch; routedPrs: () => number } {
+    function unreviewedPrFetch(prNumbers: readonly number[] = [7]): { fetch: typeof fetch; routedPrs: () => number } {
       let routed = 0
       const { fetch: fetchImpl } = fakeFetchRecording(({ url, method }) => {
         if (url.endsWith('/user') && method === 'GET') return Response.json({ login: 'bot', id: 1 })
@@ -1421,13 +1429,13 @@ describe('createGithubAdapter lifecycle', () => {
           if (method === 'GET') return Response.json([])
           if (method === 'POST') return Response.json({ id: 1 }, { status: 201 })
         }
-        if (url.match(/\/pulls\/7\/reviews/)) return Response.json([])
+        if (url.match(/\/pulls\/\d+\/reviews/)) return Response.json([])
         if (url.includes('/pulls?')) {
           routed += 1
-          return Response.json([
-            {
-              number: 7,
-              id: 700,
+          return Response.json(
+            prNumbers.map((number) => ({
+              number,
+              id: number * 100,
               title: 'Add thing',
               draft: false,
               updated_at: '2026-01-01T00:00:00Z',
@@ -1435,8 +1443,8 @@ describe('createGithubAdapter lifecycle', () => {
               head: { ref: 'feature' },
               base: { ref: 'main' },
               requested_reviewers: [],
-            },
-          ])
+            })),
+          )
         }
         return new Response('unexpected', { status: 500 })
       })
@@ -1454,8 +1462,8 @@ describe('createGithubAdapter lifecycle', () => {
           return originalRoute(m)
         }
 
-        const build = () => {
-          const { fetch: fetchImpl } = unreviewedPrFetch()
+        const build = (prNumbers: readonly number[]) => {
+          const { fetch: fetchImpl } = unreviewedPrFetch(prNumbers)
           return createGithubAdapter({
             router,
             configRef: reviewConfig('opened'),
@@ -1470,15 +1478,118 @@ describe('createGithubAdapter lifecycle', () => {
           })
         }
 
-        const first = build()
+        const first = build([7])
         await first.start()
+        await waitUntil(() => routes.length === 1)
         await first.stop()
 
-        const second = build()
+        // PR 8 follows PR 7 in the second scan, so its route proves the second
+        // background pass has already decided PR 7.
+        const second = build([7, 8])
         await second.start()
+        await waitUntil(() => routes.includes('pr:8'))
         await second.stop()
 
         expect(routes.filter((c) => c === 'pr:7')).toHaveLength(1)
+      } finally {
+        await rm(agentDir, { recursive: true, force: true })
+      }
+    })
+
+    test('start() resolves while a reconcile replay is still being routed', async () => {
+      const agentDir = await mkdtemp(join(tmpdir(), 'gh-reconcile-lifecycle-'))
+      try {
+        // given a router whose route() for the replayed PR never settles
+        const router = freshRouter()
+        const routed: string[] = []
+        router.route = (m) => {
+          routed.push(m.chat)
+          return new Promise(() => {})
+        }
+        const { fetch: fetchImpl } = unreviewedPrFetch()
+        const adapter = createGithubAdapter({
+          router,
+          configRef: reviewConfig('opened'),
+          secrets: patSecrets(),
+          agentDir,
+          logger: silentLogger(),
+          fetchImpl,
+          httpListenImpl: () => ({ stop: async () => {} }),
+          webhookRegistrationDelayMs: 0,
+          tokenRefreshIntervalMs: 0,
+          reconcileIntervalMs: 0,
+        })
+
+        // when the adapter starts
+        await adapter.start()
+        await waitUntil(() => routed.length === 1)
+
+        // then start() has already resolved and the replay was still dispatched
+        expect(routed).toEqual(['pr:7'])
+        await adapter.stop()
+      } finally {
+        await rm(agentDir, { recursive: true, force: true })
+      }
+    })
+
+    test('stop() while the startup reconcile is pending leaves no cooldown, so a re-enable still replays', async () => {
+      const agentDir = await mkdtemp(join(tmpdir(), 'gh-reconcile-lifecycle-'))
+      try {
+        // given a pulls scan that stays pending until released
+        const router = freshRouter()
+        const routed: string[] = []
+        const originalRoute = router.route.bind(router)
+        router.route = (m) => {
+          routed.push(m.chat)
+          return originalRoute(m)
+        }
+        const scanReleased = Promise.withResolvers<void>()
+        let scanRequested = false
+        const { fetch: baseFetch } = unreviewedPrFetch()
+        const deferredFetch = Object.assign(
+          async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+            const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url
+            if (url.includes('/pulls?')) {
+              scanRequested = true
+              await scanReleased.promise
+            }
+            return baseFetch(input, init)
+          },
+          { preconnect: () => {} },
+        ) as typeof fetch
+        const build = (fetchImpl: typeof fetch) =>
+          createGithubAdapter({
+            router,
+            configRef: reviewConfig('opened'),
+            secrets: patSecrets(),
+            agentDir,
+            logger: silentLogger(),
+            fetchImpl,
+            httpListenImpl: () => ({ stop: async () => {} }),
+            webhookRegistrationDelayMs: 0,
+            tokenRefreshIntervalMs: 0,
+            reconcileIntervalMs: 0,
+          })
+
+        // when the adapter stops before the startup scan resolves
+        const first = build(deferredFetch)
+        await first.start()
+        await waitUntil(() => scanRequested)
+        await first.stop()
+        scanReleased.resolve()
+        await new Promise((resolve) => setTimeout(resolve, 50))
+
+        // then the stale pass neither routed nor persisted a cooldown
+        expect(routed).toEqual([])
+        const cooldown = await readFile(join(agentDir, 'channels', 'github-reconcile.json'), 'utf8').catch(() => null)
+        expect(cooldown === null || !cooldown.includes('"prId": 700')).toBe(true)
+
+        // and a re-enabled adapter still replays the PR
+        const second = build(unreviewedPrFetch().fetch)
+        await second.start()
+        await waitUntil(() => routed.length === 1)
+        await second.stop()
+        expect(routed).toEqual(['pr:7'])
       } finally {
         await rm(agentDir, { recursive: true, force: true })
       }
@@ -1509,8 +1620,7 @@ describe('createGithubAdapter lifecycle', () => {
         })
 
         await adapter.start()
-        const afterStart = routedPrs()
-        expect(afterStart).toBe(1)
+        await waitUntil(() => routedPrs() === 1)
         expect(handlers).toHaveLength(1)
 
         handlers[0]!()
@@ -1555,7 +1665,7 @@ describe('createGithubAdapter lifecycle', () => {
         })
 
         await adapter.start()
-        expect(routedPrs()).toBe(1)
+        await waitUntil(() => routedPrs() === 1)
 
         reviewOn = 'off'
         handlers[0]!()

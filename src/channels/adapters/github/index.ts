@@ -135,6 +135,7 @@ export function createGithubAdapter(options: GithubAdapterOptions): GithubAdapte
   let deliveryRecoveryTimer: { clear: () => void } | null = null
   let reconcileTimer: { clear: () => void } | null = null
   let reconcileCooldownStore: ReconcileCooldownStore | null = null
+  let lifecycleGeneration = 0
   let unregisterTokenBridge: (() => void) | null = null
   const workspaceByChat = new Map<string, string>()
   const setIntervalFn =
@@ -410,6 +411,7 @@ export function createGithubAdapter(options: GithubAdapterOptions): GithubAdapte
       // Resolve review.on per call, not from the captured startup cfg: review.on
       // is live-reloadable, so a periodic tick must honor a change to `off`
       // (reconcileOpenPrs short-circuits on `off`) instead of scanning forever.
+      const reconcileGeneration = lifecycleGeneration
       const runReconcile = (store: ReconcileCooldownStore): Promise<unknown> =>
         reconcileOpenPrs({
           repos,
@@ -422,11 +424,16 @@ export function createGithubAdapter(options: GithubAdapterOptions): GithubAdapte
           isBotInTeam,
           fetchImpl,
           cooldownStore: store,
+          isCancelled: () => reconcileGeneration !== lifecycleGeneration,
         }).catch((err: unknown) => {
           logger.warn(`[github] reconcile pass failed: ${describeError(err)}`)
         })
       if (loadedReconcileCooldownStore !== null) {
-        await runReconcile(loadedReconcileCooldownStore)
+        // Detached on purpose: the pass awaits each replay's router receipt, and
+        // routing can depend on boot progress that itself waits for this start()
+        // to resolve. Awaiting it here stalled boot before tunnels started, so
+        // webhooks never registered and no PR was reviewed.
+        void runReconcile(loadedReconcileCooldownStore)
         const reconcileIntervalMs = options.reconcileIntervalMs ?? DEFAULT_RECONCILE_INTERVAL_MS
         if (reconcileIntervalMs > 0) {
           reconcileTimer = setIntervalFn(() => void runReconcile(loadedReconcileCooldownStore), reconcileIntervalMs)
@@ -464,6 +471,7 @@ export function createGithubAdapter(options: GithubAdapterOptions): GithubAdapte
     async stop(): Promise<void> {
       if (!started) return
       started = false
+      lifecycleGeneration += 1
       // Stop the recovery sweep first: its async work outlives the synchronous
       // unregister calls below, and a tick landing mid-teardown would query a
       // hook we're about to deregister and could route during shutdown.
