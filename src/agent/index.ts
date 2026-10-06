@@ -63,11 +63,15 @@ import type { RestartHandoffOrigin } from './restart-handoff'
 import type { SubagentBashPolicy } from './reviewer-bash-policy'
 import { loadSelf } from './self'
 import { SESSION_META_CUSTOM_TYPE, sessionMetaPayload } from './session-meta'
-import { renderSessionOrigin, type SessionOrigin, type SessionRoleContext } from './session-origin'
+import {
+  renderInteractiveSessionContext,
+  renderSessionOrigin,
+  type SessionOrigin,
+  type SessionRoleContext,
+} from './session-origin'
 import type { CreateSessionForSubagent, SubagentCoalescer, SubagentRegistry } from './subagents'
 import {
-  buildDefaultSystemPrompt,
-  buildSlimSystemPrompt,
+  buildSystemPolicy,
   DEFAULT_SUBAGENT_ROSTER,
   renderRuntimeBlock,
   renderRuntimeNondisclosureRule,
@@ -139,8 +143,12 @@ export type CreateSessionOptions = {
   stream?: Stream
   channelRouter?: ChannelRouter
   mcpManager?: McpManager
-  // Bypass the file-based resource loader (IDENTITY.md, SOUL.md, MEMORY.md,
-  // memory/, bundled skills) and use this string verbatim as the system prompt.
+  // Replace TypeClaw's standard composition with this string: the shared
+  // policy, IDENTITY.md/SOUL.md, the interactive context, and the skill paths
+  // TypeClaw adds (bundled, plugin, `.agents/skills/`, `memory/skills/`) are
+  // not injected. Runtime metadata and the origin block are still appended,
+  // and pi's own default discovery still runs, so project context files such
+  // as AGENTS.md still reach the final system message.
   systemPromptOverride?: string
   // Identifies the kind of session and (for channels) its addressing fields.
   // Rendered into the system prompt so the agent knows who's listening, where
@@ -1125,31 +1133,31 @@ export type CreateResourceLoaderOptions = {
   mcpManager?: McpManager
   permissions?: PermissionService
   runtimeVersion?: string
-  // Public subagents whose names + `rosterDescription`s render the full-mode
-  // "## Subagent orchestration" roster. When omitted (no-registry callers, the
-  // debug dumper), the prompt falls back to `DEFAULT_SUBAGENT_ROSTER`. Threaded
-  // from `createSessionWithDispose`, where the merged registry is already in
-  // scope.
+  // Public subagents whose names + `rosterDescription`s render the roster in
+  // the full-mode interactive context. When omitted (registry-free callers,
+  // the debug dumper), the context falls back to `DEFAULT_SUBAGENT_ROSTER`.
+  // Threaded from `createSessionWithDispose`, where the merged registry is
+  // already in scope.
   subagentRegistry?: SubagentRegistry
-  // Explicit override for the prompt mode. When omitted, the mode is derived
-  // from `origin.kind`: cron + subagent → slim, tui + channel → full. Pass
-  // 'full' to force the heavy prompt even on an unattended origin (rarely
+  // Explicit override for the session-context mode. When omitted, the mode is
+  // derived from `origin.kind`. It never changes the shared policy; pass
+  // 'full' to add the interactive context to an unattended origin (rarely
   // useful; mostly an escape hatch for ad-hoc debugging).
   mode?: SystemPromptMode
   proactiveNextStepNudge?: boolean
 }
 
-// Origins where the operator-facing DEFAULT_SYSTEM_PROMPT, git-nudge, and the
-// agent-folder commit guidance carry their weight: there is a human reading
-// the output, the agent is expected to maintain its folder over time, and
-// conversational register matters. For everything else (cron fires, default
-// subagents), the slim prompt is the right default — the origin block already
-// names the unattended context and tells the agent what's expected of it.
+// Origins with a conversation partner waiting on the reply get the full-mode
+// session context: the interactive orchestration context with the live public
+// roster, the MCP catalog, and the git nudge. Unattended origins (cron fires,
+// default subagents, system processes) skip that context and the roster/git/MCP
+// work it needs — their origin block already says what is expected. Every
+// origin gets the same shared policy either way.
 //
 // Exhaustive switch (not a boolean expression) so a future origin kind forces
 // the author to make an explicit full-or-slim decision at compile time. The
 // previous form silently defaulted new origins to slim, which would have
-// stripped the operator-facing prompt from a new interactive surface by
+// stripped the interactive context from a new interactive surface by
 // accident.
 export function deriveSystemPromptMode(origin: SessionOrigin | undefined): SystemPromptMode {
   if (origin === undefined) return 'full'
@@ -1176,28 +1184,27 @@ export function deriveSystemPromptMode(origin: SessionOrigin | undefined): Syste
 // pipeline `createResourceLoader` uses, with no risk of drift if the
 // section order changes.
 //
-// `mode` selects the base prompt:
-//   - 'full' (default) — DEFAULT_SYSTEM_PROMPT (~2155 tok of operator-facing
-//     guidance: agent folder layout, version-control rules, register matching,
-//     workspace boundary). Right choice for TUI and channel sessions where a
-//     human is reading the output and the agent maintains its folder.
-//   - 'slim' — SLIM_SYSTEM_PROMPT (~80 tok). Right choice for cron jobs and
-//     default subagents — unattended sessions where most of the operator
-//     guidance is irrelevant and the origin block already covers per-kind
-//     specifics (no human, side effects via tools, narrow scope).
+// `mode` selects only the optional session context, never the policy: every
+// standard session starts with `buildSystemPolicy(branding)`.
+//   - 'full' (default) — TUI, channel, and origin-less sessions: appends the
+//     interactive context (`renderInteractiveSessionContext`) with the roster.
+//   - 'slim' — cron, default subagents, system processes: no interactive
+//     context; the origin block covers per-kind specifics (no human, side
+//     effects via tools, narrow scope).
 export type SystemPromptMode = 'full' | 'slim'
 
 export type SystemPromptComposition = {
   mode?: SystemPromptMode
   // Whether the prompt discloses that the agent runs on TypeClaw. When false,
-  // the base prompt's opening is phrased generically and the `## Runtime`
-  // version block is dropped. Defaults to true. Mirrors `config.branding`.
+  // the policy's opening is phrased generically, the `## Runtime` version
+  // block is dropped, and the runtime-disclosure rule is appended. Defaults to
+  // true. Mirrors `config.branding`.
   branding?: boolean
   self: string
-  // Pre-rendered full-mode orchestration roster (from `renderPublicSubagentRoster`).
+  // Pre-rendered interactive-context roster (from `renderPublicSubagentRoster`).
   // Kept as a ready string so this composer stays pure and registry-free; the
-  // registry-aware caller renders it. Ignored in slim mode (no roster section).
-  // Falls back to `DEFAULT_SUBAGENT_ROSTER` when omitted.
+  // registry-aware caller renders it. Ignored in slim mode (no interactive
+  // context). Falls back to `DEFAULT_SUBAGENT_ROSTER` when omitted.
   subagentRoster?: string
   runtimeVersion?: string
   origin?: SessionOrigin
@@ -1215,12 +1222,19 @@ export type SystemPromptComposition = {
 // section changes (the provider's prompt cache hits up to the first byte
 // that differs).
 //
-// 0. runtime block — most stable: only changes on typeclaw releases (rare).
-// 1. origin block — stable across all sessions of the same kind.
-// 2. gitNudge — rare changes; agent folders force-commit sessions/ and
+// 0. shared policy — identical for every standard session of an agent.
+// 1. self — IDENTITY.md + SOUL.md (plus any plugin `session.prompt` append).
+// 2. runtime block (or the runtime-disclosure rule when branding is off) —
+//    only changes on typeclaw releases.
+// 3. interactive context (full mode) — stable per agent registry, so it
+//    precedes the per-session origin block.
+// 4. origin block + role — stable across sessions of the same kind; channel
+//    origins carry per-conversation details.
+// 5. MCP catalog — changes when servers connect or disconnect.
+// 6. gitNudge — rare changes; agent folders force-commit sessions/ and
 //    memory/ after every turn, so the dirty-files list is empty most of
 //    the time.
-// 3. proactive next-step nudge — deterministic per model family.
+// 7. proactive next-step nudge — deterministic per model family.
 //
 // The wall-clock anchor that used to live here as `## Now` moved out
 // entirely. It is now injected into the user turn at each `session.prompt`
@@ -1228,19 +1242,22 @@ export type SystemPromptComposition = {
 // stamp reflects the moment of THIS turn, not session creation. Per-turn
 // injection costs zero cached bytes — the user turn is the non-cacheable
 // suffix anyway — and removes the staleness failure mode where a session
-// opened Friday answered "today is Friday" on Thursday.
+// opened Friday answered "today is Friday" on Thursday. Retrieved memory and
+// the live channel role ride in the user turn for the same reason.
+//
+// pi appends project context (AGENTS.md), the skill catalog, and the cwd
+// after this preamble when it builds the final system message.
 export function composeSystemPrompt(parts: SystemPromptComposition): string {
   const branding = parts.branding ?? true
-  const base =
-    parts.mode === 'slim'
-      ? buildSlimSystemPrompt(branding)
-      : buildDefaultSystemPrompt(parts.subagentRoster ?? DEFAULT_SUBAGENT_ROSTER, branding)
-  let prompt = `${base}\n\n${parts.self}`
+  let prompt = `${buildSystemPolicy(branding)}\n\n${parts.self}`
   if (branding && parts.runtimeVersion !== undefined) {
     prompt = `${prompt}\n\n${renderRuntimeBlock(parts.runtimeVersion)}`
   }
   if (!branding) {
     prompt = `${prompt}\n\n${renderRuntimeNondisclosureRule()}`
+  }
+  if (parts.mode !== 'slim') {
+    prompt = `${prompt}\n\n${renderInteractiveSessionContext(parts.subagentRoster ?? DEFAULT_SUBAGENT_ROSTER)}`
   }
   if (parts.origin !== undefined) {
     prompt = `${prompt}\n\n${renderSessionOrigin(parts.origin, Date.now(), parts.roleContext)}`
@@ -1260,10 +1277,10 @@ export function composeSystemPrompt(parts: SystemPromptComposition): string {
 export async function createResourceLoader(options: CreateResourceLoaderOptions = {}): Promise<DefaultResourceLoader> {
   const agentDir = options.agentDir ?? process.cwd()
   const mode: SystemPromptMode = options.mode ?? deriveSystemPromptMode(options.origin)
-  // Slim mode (cron/subagent) has no orchestration section, so it never reads
-  // the roster. Skip rendering it there — `renderPublicSubagentRoster` throws on
-  // a public subagent with a missing/blank `rosterDescription`, and a slim
-  // session must not fail on a roster it will never show.
+  // Slim mode (cron/subagent/system) has no interactive context, so it never
+  // reads the roster. Skip rendering it there — `renderPublicSubagentRoster`
+  // throws on a public subagent with a missing/blank `rosterDescription`, and
+  // a slim session must not fail on a roster it will never show.
   const subagentRoster =
     mode === 'slim'
       ? undefined
@@ -1271,10 +1288,7 @@ export async function createResourceLoader(options: CreateResourceLoaderOptions 
         ? renderPublicSubagentRoster(options.subagentRegistry)
         : DEFAULT_SUBAGENT_ROSTER
   const branding = getConfig().branding
-  const basePrompt =
-    mode === 'slim'
-      ? buildSlimSystemPrompt(branding)
-      : buildDefaultSystemPrompt(subagentRoster ?? DEFAULT_SUBAGENT_ROSTER, branding)
+  const policy = buildSystemPolicy(branding)
 
   // Kick off the independent I/O paths concurrently. Sequential awaits
   // here used to be the dominant cold-start cost amplifier: loadSelf is 2
@@ -1309,25 +1323,24 @@ export async function createResourceLoader(options: CreateResourceLoaderOptions 
   let self = await selfPromise
 
   if (options.plugins) {
-    // The plugin hook receives the partially-assembled prompt (base + identity)
-    // so plugins can rewrite either section before the cache-suffix blocks are
-    // appended. The base reflects the resolved mode, so a slim cron session's
-    // plugin hook sees the slim base — plugins that read the base text get
-    // the same shape the agent will see.
-    const preHook = `${basePrompt}\n\n${self}`
+    // The plugin hook receives the partially-assembled prompt (shared policy +
+    // identity) so plugins can rewrite either section before the session
+    // context and cache-suffix blocks are appended. Every standard origin
+    // hands the hook the same policy text.
+    const preHook = `${policy}\n\n${self}`
     const event = { prompt: preHook, sessionId: options.plugins.sessionId, agentDir, origin: options.origin }
     await options.plugins.hooks.runSessionPrompt(event)
-    // Recover `self` by stripping the leading base so the rest of the
-    // composition stays section-shaped. If a plugin rewrote the base prompt as
+    // Recover `self` by stripping the leading policy so the rest of the
+    // composition stays section-shaped. If a plugin rewrote the policy as
     // well, the recovered `self` carries the full mutated remainder.
-    self = event.prompt.startsWith(`${basePrompt}\n\n`) ? event.prompt.slice(basePrompt.length + 2) : event.prompt
+    self = event.prompt.startsWith(`${policy}\n\n`) ? event.prompt.slice(policy.length + 2) : event.prompt
   }
 
   const roleContext = options.origin !== undefined ? resolveRoleContext(options.origin, options.permissions) : undefined
-  // Slim mode skips git-nudge entirely: cron + subagent sessions are not the
-  // right actor to drive interactive commit decisions, and the operator-facing
-  // commit guidance the nudge points back to is itself excluded from the slim
-  // base prompt.
+  // Slim mode skips git-nudge entirely: cron, subagent, and system sessions
+  // are not the right actor to drive commit decisions about dirty files they
+  // did not touch. The shared policy's commit rules still cover their own
+  // changes.
   const gitNudgeResult = await gitNudgeSettled
   const gitNudge = unwrapSettled(gitNudgeResult)
 

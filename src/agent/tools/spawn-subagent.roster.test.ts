@@ -9,6 +9,7 @@ import { createScoutSubagent } from '@/bundled-plugins/scout/scout'
 import type { Subagent as PluginSubagent } from '@/plugin'
 
 import { composeSystemPrompt } from '../index'
+import { renderInteractiveSessionContext } from '../session-origin'
 import type { Subagent, SubagentRegistry } from '../subagents'
 import { renderPublicSubagentRoster, spawnSubagentDescription } from './spawn-subagent'
 
@@ -100,7 +101,7 @@ describe('renderPublicSubagentRoster', () => {
 })
 
 describe('composeSystemPrompt with the registry-rendered roster', () => {
-  test('the full prompt names every public subagent', () => {
+  test('the interactive context names every public subagent', () => {
     // given
     const roster = renderPublicSubagentRoster(BUNDLED_PUBLIC)
 
@@ -113,23 +114,26 @@ describe('composeSystemPrompt with the registry-rendered roster', () => {
     })
 
     // then
-    expect(prompt).toContain('## Subagent orchestration')
+    expect(prompt).toContain(renderInteractiveSessionContext(roster))
     for (const name of PUBLIC_NAMES) {
       expect(prompt).toContain(`\`${name}\``)
     }
   })
 
-  test('slim mode renders no orchestration roster', () => {
+  test('slim mode renders no roster', () => {
+    // given
+    const roster = renderPublicSubagentRoster(BUNDLED_PUBLIC)
+
     // when
     const prompt = composeSystemPrompt({
       mode: 'slim',
       self: 'IDENTITY',
-      subagentRoster: renderPublicSubagentRoster(BUNDLED_PUBLIC),
+      subagentRoster: roster,
       gitNudge: '',
     })
 
     // then
-    expect(prompt).not.toContain('## Subagent orchestration')
+    expect(prompt).not.toContain(roster)
   })
 })
 

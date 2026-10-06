@@ -131,7 +131,7 @@ bun run debug:prompt --origin cron       # just one
 bun run debug:prompt --origin channel --no-git-nudge
 ```
 
-The renderer is `composeSystemPrompt` in `src/agent/index.ts`. The cache-suffix ordering (least-volatile first → identity → runtime → origin+role → git → memory → now) is enforced by `scripts/dump-system-prompt.test.ts`; reorder one without the other and CI fails.
+The renderer is `composeSystemPrompt` in `src/agent/index.ts`. Every standard origin starts with the same shared policy (`buildSystemPolicy`); the cache-suffix ordering (least-volatile first: shared policy → identity → runtime → interactive context (full mode) → origin → role → MCP → git → proactive-model nudge) is pinned by the composition tests; reorder one without the other and CI fails. Time, live role, and memory are per-turn user-prompt context, not system-prompt sections. The dump is TypeClaw's preamble only — pi appends project context (`AGENTS.md`), the skill catalog, and cwd when it builds the session — and its token column is a chars/4 estimate, not a tokenizer count.
 
 ## Commit and PR conventions
 

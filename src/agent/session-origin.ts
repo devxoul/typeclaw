@@ -276,6 +276,39 @@ export function renderSessionOrigin(
   }
 }
 
+// Optional context for interactive sessions (TUI, channel, and origin-less
+// sessions), appended by `composeSystemPrompt` in full mode only. It holds how
+// to stay responsive and delegate — never permission, honesty, or filesystem
+// rules, which live once in the shared policy every standard session gets.
+// Deliberately separate from `renderSessionOrigin`: override loaders render
+// origins too and must not inherit this context. The `spawn_subagent`
+// parameter descriptions point at this heading and the
+// [CONTEXT]/[GOAL]/[REQUEST] structure.
+export function renderInteractiveSessionContext(subagentRoster: string): string {
+  return [
+    '## Subagent orchestration',
+    '',
+    'Keep the conversation responsive. Answer quick, single-shot requests inline. Delegate heavy, side-effectful, long-running, or multi-step work — installs, builds, `docker`, long test runs, refactors, a bug that resisted a quick fix — to a subagent (usually `operator`) instead of grinding through it here; use `tmux` only for long work that belongs in this session.',
+    '',
+    `Delegate with \`spawn_subagent\`, \`subagent_output\`, and \`subagent_cancel\`; each subagent has its own context and tools, and the tool description has the mechanics. Briefly: ${subagentRoster}.`,
+    '',
+    '- Spawns run in the background by default: a `<system-reminder>` arrives when the subagent completes — do not poll `subagent_output`. Pass `run_in_foreground: true` for a quick result you need this turn; deep-profile subagents always run in the background from here. In channel sessions a completion reminder is not a user message: surface the result via `channel_reply`/`channel_send`.',
+    '- Broad search: spawn 2-5 `explorer`/`scout` workers in parallel, end your response, then collect each completion once. Use `scout` for narrow lookups and `researcher` for decomposed, multi-source, cross-validated synthesis. When the user *explicitly* asks to research or investigate, you MUST spawn `researcher`: answering from training memory or one inline `web_search` does not satisfy the request, and `scout`/`explorer` fan-out does not replace `researcher`.',
+    '- Delegate-and-converse: for side-effectful or noisy work over ~30s, spawn one background subagent and stay responsive — `operator` for side effects, `scout` for a quick lookup, `researcher` for deep investigation, `planner` for risk-aware sequencing. Pass `profile: "deep"` only when the work needs stronger reasoning than the default tier.',
+    '- Troubleshooting: after ~3 non-converging attempts at the same failure, stop and hand the loop to `operator` (background; `profile: "deep"` when genuinely hard) with the symptom, attempts, and success condition. Read `typeclaw-troubleshooting` before spawning.',
+    "- Status: when asked about a running subagent, call `subagent_output({ task_id })` and report its `status_summary` — don't guess.",
+    "- Don't fire more than 5 subagents per turn, spawn for known answers or single-file lookups, poll output in a loop, or ask research subagents to decide: they report; you decide. Most subagents are leaves; only `operator` and `reviewer` may delegate one level deeper.",
+    '',
+    'Spawn prompt structure (mandatory — the subagent does not see this conversation):',
+    '',
+    '```',
+    "[CONTEXT]: What I'm working on, which files/modules are involved, what approach.",
+    '[GOAL]: The specific decision or output I need to unlock.',
+    '[REQUEST]: Concrete instructions — what to find/do/produce, what format, what to SKIP.',
+    '```',
+  ].join('\n')
+}
+
 function withRoleContext(block: string, ctx: SessionRoleContext | undefined, kind: SessionOrigin['kind']): string {
   if (ctx === undefined) return block
   const roleBlock = kind === 'channel' ? renderChannelRolePolicy() : renderRoleContext(ctx)
