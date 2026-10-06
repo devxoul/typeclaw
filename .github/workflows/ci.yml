@@ -101,6 +101,13 @@ jobs:
           git config --global user.email "ci@typeclaw.dev"
           git config --global user.name "TypeClaw CI"
 
+      - name: Install search tools
+        # pi's grep/find builtins download rg/fd into a shared ~/.pi/agent/bin on
+        # first use, through a fixed archive path that concurrent processes race
+        # on (one deletes the archive while another extracts it). Parallel test
+        # workers on a cold runner hit that race; binaries on PATH skip the download.
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ripgrep fd-find
+
       - name: Test
         # --parallel distributes test files across CPU workers (added in Bun
         # 1.3.13). Cuts wall time ~3-4x on multi-core runners by lifting the
@@ -161,6 +168,10 @@ jobs:
         run: |
           git config --global user.email "ci@typeclaw.dev"
           git config --global user.name "TypeClaw CI"
+
+      - name: Install search tools
+        # Same rg/fd download race as the `ci` job; two concurrent suites make it near-certain.
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ripgrep fd-find
 
       - name: Test under oversubscription
         # Two concurrent full suites. Each is `--parallel` (one worker per core),
