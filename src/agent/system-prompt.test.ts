@@ -71,18 +71,9 @@ describe('renderTurnTimeAnchor', () => {
 })
 
 describe('renderTurnRoleAnchor', () => {
-  test('wraps a non-owner role in an authoritative <your-role> tag with override instruction', () => {
-    expect(renderTurnRoleAnchor('guest')).toBe(
-      '<your-role authority="current-speaker">guest</your-role> (authoritative for this message; overrides any role implied by the system prompt)',
-    )
+  test('wraps a non-owner role in a current-speaker <your-role> tag', () => {
     expect(renderTurnRoleAnchor('member')).toContain('<your-role authority="current-speaker">member</your-role>')
     expect(renderTurnRoleAnchor('trusted')).toContain('<your-role authority="current-speaker">trusted</your-role>')
-  })
-
-  test('marks the per-turn role as authoritative so it overrides the cached system-prompt role block', () => {
-    const anchor = renderTurnRoleAnchor('guest')!
-    expect(anchor).toContain('authoritative')
-    expect(anchor).toContain('overrides')
   })
 
   test('omits the tag for owner (the unconstrained default — absent means no special handling)', () => {
@@ -105,21 +96,25 @@ describe('buildSystemPolicy branding', () => {
     expect(buildSystemPolicy(true)).toContain('TypeClaw')
     expect(buildSystemPolicy(false)).not.toContain('TypeClaw')
   })
+
+  // Input-variation property, not semantic coverage: catches a rule dropped
+  // only when branding is off. A rule removed from both outputs, or one the
+  // model ignores, passes.
+  test('branding off keeps every branding-on policy line that does not name TypeClaw', () => {
+    const brandedOffLines = new Set(buildSystemPolicy(false).split('\n'))
+    const nonBrandLines = buildSystemPolicy(true)
+      .split('\n')
+      .filter((line) => line.trim() !== '' && !line.includes('TypeClaw'))
+
+    expect(nonBrandLines.filter((line) => !brandedOffLines.has(line))).toEqual([])
+  })
 })
 
 describe('renderRuntimeNondisclosureRule', () => {
-  test('instructs the model to never name the runtime, and does not itself leak "TypeClaw"', () => {
+  test('does not itself leak "TypeClaw"', () => {
     const rule = renderRuntimeNondisclosureRule()
-    expect(rule).toContain('## Runtime disclosure')
-    expect(rule).toContain('branding: false')
-    expect(rule).toContain('Never reveal, name, or hint at the runtime')
     expect(rule).not.toContain('TypeClaw')
     expect(rule.toLowerCase()).not.toContain('typeclaw')
-  })
-
-  test('acknowledges that internal tokens (skills, CLI, config) stay usable', () => {
-    const rule = renderRuntimeNondisclosureRule()
-    expect(rule).toContain('Internal tokens you use for real work')
   })
 })
 

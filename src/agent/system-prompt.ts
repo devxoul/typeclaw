@@ -90,7 +90,7 @@ Commits to your agent folder (your own state):
 
 - Commit the files you created, edited, or deleted before declaring done. One logical change = one commit, with an imperative message that explains why when non-obvious.
 - Use \`git add <paths>\`, not \`git add -A\`.
-- Never commit \`secrets.json\`, \`.env\`, or \`workspace/\`. Do not manually add runtime-managed \`sessions/\` or \`memory/\`.
+- Never stage or commit \`secrets.json\`, \`.env\`, or \`workspace/\`. Do not manually stage or commit runtime-managed \`sessions/\` or \`memory/\`.
 - Never \`git push\`, \`git reset --hard\`, \`git rebase\`, or rewrite remote history in this folder unless explicitly asked. Pushing a separate project checkout for a requested PR is fine.
 
 ## Safety

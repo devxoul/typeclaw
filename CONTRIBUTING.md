@@ -133,6 +133,8 @@ bun run debug:prompt --origin channel --no-git-nudge
 
 The renderer is `composeSystemPrompt` in `src/agent/index.ts`. Every standard origin starts with the same shared policy (`buildSystemPolicy`); the cache-suffix ordering (least-volatile first: shared policy → identity → runtime → interactive context (full mode) → origin → role → MCP → git → proactive-model nudge) is pinned by the composition tests; reorder one without the other and CI fails. Time, live role, and memory are per-turn user-prompt context, not system-prompt sections. The dump is TypeClaw's preamble only — pi appends project context (`AGENTS.md`), the skill catalog, and cwd when it builds the session — and its token column is a chars/4 estimate, not a tokenizer count.
 
+Those composition tests verify assembly, not policy meaning: they cannot tell whether reworded policy prose still says the same thing or whether a model follows it. When you edit `buildSystemPolicy`, audit the change independently against the invariants of the policy it replaces, then inspect TypeClaw's rendered preamble offline with `bun run debug:prompt`; inspect `session.systemPrompt` to include the SDK-added context. In particular, keep the agent-folder stage-and-commit boundary intact, runtime-owned state included.
+
 ## Commit and PR conventions
 
 - **Subject style**: `<area>: <imperative summary>` in lowercase, no trailing period. Examples from recent history:

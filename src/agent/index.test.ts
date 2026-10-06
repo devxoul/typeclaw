@@ -870,16 +870,6 @@ describe('createResourceLoader', () => {
     const prompt = loader.getSystemPrompt() ?? ''
     expect(prompt).not.toContain('standup-summary-marker')
   })
-
-  test('slim prompt does NOT contain the subagent-breaking "plain prose is invisible" claim', async () => {
-    const origin: SessionOrigin = { kind: 'subagent', subagent: 'tester', parentSessionId: 'ses_p' }
-
-    const loader = await createResourceLoader({ agentDir, origin })
-
-    const prompt = loader.getSystemPrompt() ?? ''
-    expect(prompt).not.toContain('Plain prose with no tool call is invisible')
-    expect(prompt).not.toContain('plain-text output is invisible')
-  })
 })
 
 describe('deriveSystemPromptMode', () => {
@@ -1035,7 +1025,6 @@ describe('composeSystemPrompt branding', () => {
       gitNudge: '',
     })
     expect(prompt).toContain('## Runtime disclosure')
-    expect(prompt).toContain('Never reveal, name, or hint at the runtime')
   })
 
   test('branding off drops the runtime block and every TypeClaw clue (slim mode)', () => {

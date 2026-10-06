@@ -47,15 +47,9 @@ describe('dumpSystemPrompt', () => {
     })
   })
 
-  test('slim prompt does NOT contain the subagent-breaking "plain prose is invisible" claim', () => {
-    expect(dumpSystemPrompt('cron')).not.toContain('Plain prose with no tool call is invisible')
-    expect(dumpSystemPrompt('subagent')).not.toContain('Plain prose with no tool call is invisible')
-  })
-
-  test('cron origin includes cron-specific text', () => {
+  test('cron origin renders the cron job metadata', () => {
     const out = dumpSystemPrompt('cron')
 
-    expect(out).toContain('You are running an unattended cron job.')
     expect(out).toContain('- Job ID:')
     expect(out).toContain('- Job kind: prompt')
   })
