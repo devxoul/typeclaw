@@ -47,6 +47,21 @@ describe('decideMemoryOversubscription', () => {
     expect(result).toBeNull()
   })
 
+  test('checks an already-running fleet without an incoming agent', () => {
+    // given compose's post-start check, where every agent is already listed
+    const result = decideMemoryOversubscription({
+      running: [
+        { containerName: 'alpha', bytes: 6 * GIB },
+        { containerName: 'beta', bytes: 6 * GIB },
+        { containerName: 'gamma', bytes: 6 * GIB },
+      ],
+      totalMemoryBytes: 16 * GIB,
+    })
+
+    expect(result?.claimedBytes).toBe(18 * GIB)
+    expect(result?.claims.map((claim) => claim.containerName)).toEqual(['alpha', 'beta', 'gamma'])
+  })
+
   test('stays quiet when Docker memory is unknown and every agent is bounded', () => {
     // given no capacity figure, the arithmetic cannot be done and there is
     // nothing else to report

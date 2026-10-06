@@ -2,7 +2,7 @@ import { validateConfig } from '@/config'
 import { type Controller, resolveController } from '@/container'
 
 import { discoverAgents, type AgentEntry } from './discover'
-import type { AgentResult, StartSuccess } from './start'
+import { checkFleetMemory, type AgentResult, type StartSuccess } from './start'
 import type { StopSuccess } from './stop'
 
 export type RestartData = { stop: StopSuccess; start: StartSuccess }
@@ -22,16 +22,21 @@ export type ComposeRestartOptions = {
 
 export type ComposeRestartDeps = {
   restart?: Controller['restart']
+  checkMemory?: () => Promise<string[] | null>
 }
 
 export type ComposeRestartResult = {
   agents: AgentEntry[]
   results: AgentResult<RestartData>[]
+  memoryWarning: string[] | null
 }
 
 export async function composeRestart(
   { rootCwd, preferredHostPort, forceBuild = false, cliEntry, onProgress }: ComposeRestartOptions,
-  { restart = (options) => resolveController().restart(options) }: ComposeRestartDeps = {},
+  {
+    restart = (options) => resolveController().restart(options),
+    checkMemory = checkFleetMemory,
+  }: ComposeRestartDeps = {},
 ): Promise<ComposeRestartResult> {
   const agents = discoverAgents(rootCwd)
   const results = await Promise.all(
@@ -50,7 +55,8 @@ export async function composeRestart(
       return result
     }),
   )
-  return { agents, results }
+  const memoryWarning = results.some((r) => r.ok) ? await checkMemory() : null
+  return { agents, results, memoryWarning }
 }
 
 async function runOne(
@@ -73,6 +79,7 @@ async function runOne(
       cliEntry,
       onStopped,
       streamOutput: false,
+      skipMemoryOversubscriptionCheck: true,
       onWarning: (warning) => warnings.push(warning),
     })
     if (!restarted.ok) return { name, ok: false, reason: restarted.reason, warnings }

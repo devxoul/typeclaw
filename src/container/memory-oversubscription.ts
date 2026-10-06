@@ -1,5 +1,5 @@
 import { COMPOSE_PROJECT } from './compose-project'
-import { HOST_HEADROOM_BYTES } from './memory-limit'
+import { HOST_HEADROOM_BYTES, readDockerTotalMemory } from './memory-limit'
 import type { DockerExec } from './shared'
 
 // `bytes: null` means the container runs with NO memory limit. That is a
@@ -34,7 +34,8 @@ export type OversubscriptionWarning = {
 // crowded host. The operator gets the arithmetic and decides.
 export function decideMemoryOversubscription(options: {
   running: AgentMemoryClaim[]
-  incoming: AgentMemoryClaim
+  // Omitted for a fleet-wide check run after every agent is already up.
+  incoming?: AgentMemoryClaim
   totalMemoryBytes: number | undefined
 }): OversubscriptionWarning | null {
   const { running, incoming, totalMemoryBytes } = options
@@ -42,8 +43,10 @@ export function decideMemoryOversubscription(options: {
   // A restart re-runs start for a container that is already listed, so drop any
   // running claim under the incoming name before summing. Counting it twice
   // would fire the warning on a plain `typeclaw restart` of a single agent.
-  const others = running.filter((claim) => claim.containerName !== incoming.containerName)
-  const claims = [...others, incoming]
+  const claims =
+    incoming === undefined
+      ? running
+      : [...running.filter((claim) => claim.containerName !== incoming.containerName), incoming]
   const unbounded = claims.filter((claim) => claim.bytes === null)
   const claimedBytes = claims.reduce((sum, claim) => sum + (claim.bytes ?? 0), 0)
 
@@ -64,9 +67,10 @@ export function decideMemoryOversubscription(options: {
 
 export function formatOversubscriptionWarning(warning: OversubscriptionWarning): string[] {
   const gib = (bytes: number): string => `${(bytes / (1024 * 1024 * 1024)).toFixed(1)}GiB`
+  const width = warning.claims.reduce((w, claim) => Math.max(w, claim.containerName.length), 0)
   const roster = warning.claims
-    .map((claim) => `  ${claim.containerName} ${claim.bytes === null ? 'unlimited' : gib(claim.bytes)}`)
-    .sort((a, b) => a.localeCompare(b))
+    .toSorted((a, b) => a.containerName.localeCompare(b.containerName))
+    .map((claim) => `  ${claim.containerName.padEnd(width)}  ${claim.bytes === null ? 'unlimited' : gib(claim.bytes)}`)
 
   const capacity = warning.totalMemoryBytes === null ? null : gib(warning.totalMemoryBytes)
   const names = warning.unbounded.map((claim) => claim.containerName).join(', ')
@@ -95,6 +99,18 @@ function oversubscriptionRemedy(claimedBytes: number): string[] {
     `      Colima:         colima stop && colima start --memory ${targetGib}`,
     '      Linux Engine:   Docker uses host RAM directly; stop an agent instead.',
   ]
+}
+
+// Fleet-wide variant for `typeclaw compose`: agents start concurrently, so a
+// per-agent check sees whichever siblings happened to be up and repeats the same
+// advice once per agent. Checking once after the whole fleet settled reports the
+// real total exactly once.
+export async function readFleetMemoryOversubscription(exec: DockerExec): Promise<OversubscriptionWarning | null> {
+  const [running, totalMemoryBytes] = await Promise.all([
+    readRunningAgentMemoryClaims(exec),
+    readDockerTotalMemory(exec),
+  ])
+  return decideMemoryOversubscription({ running, totalMemoryBytes })
 }
 
 // Reads the memory cap Docker actually applied to every running agent. Docker

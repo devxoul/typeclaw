@@ -20,7 +20,7 @@ import { formatComposeStats } from './compose-stats'
 import { formatComposeStatus } from './compose-status'
 import { formatComposeUsage, formatComposeUsageJson } from './compose-usage'
 import { preflightDocker, printDockerGuidance } from './docker-preflight'
-import { c, errorLine, spinner } from './ui'
+import { c, errorLine, log, spinner } from './ui'
 import { parseSince, parseUntil } from './usage-args'
 
 // Compose fans a docker command out across every agent folder. A down daemon
@@ -54,7 +54,7 @@ const startSub = defineCommand({
     await requireDockerOrExit()
     const board = makeBoard('Starting agents')
     const s = spinner()
-    const { agents, results } = await composeStart({
+    const { agents, results, memoryWarning } = await composeStart({
       rootCwd: process.cwd(),
       preferredHostPort: Number(args.port),
       forceBuild: args.build,
@@ -73,6 +73,7 @@ const startSub = defineCommand({
     }
     const failed = results.reduce((n, r) => (r.ok ? n : n + 1), 0)
     board.finish(s, results, 'started', failed)
+    if (memoryWarning !== null) log.warn(memoryWarning.join('\n'))
     if (failed > 0) process.exit(1)
   },
 })
@@ -121,7 +122,7 @@ const restartSub = defineCommand({
     await requireDockerOrExit()
     const board = makeBoard('Restarting agents')
     const s = spinner()
-    const { agents, results } = await composeRestart({
+    const { agents, results, memoryWarning } = await composeRestart({
       rootCwd: process.cwd(),
       preferredHostPort: Number(args.port),
       forceBuild: args.build,
@@ -142,6 +143,7 @@ const restartSub = defineCommand({
     }
     const failed = results.reduce((n, r) => (r.ok ? n : n + 1), 0)
     board.finish(s, results, 'restarted', failed)
+    if (memoryWarning !== null) log.warn(memoryWarning.join('\n'))
     if (failed > 0) process.exit(1)
   },
 })
@@ -381,7 +383,8 @@ function formatRestartDone<T extends { start: { hostPort: number } }>(result: Ag
 // line so compose start/restart don't silently drop what `typeclaw start` prints.
 function appendWarnings(head: string, warnings: string[] | undefined): string {
   if (warnings === undefined || warnings.length === 0) return head
-  return [head, ...warnings.map((w) => `  ${c.yellow('⚠')} ${w}`)].join('\n')
+  // Continuation lines of a multi-line warning stay under its first line.
+  return [head, ...warnings.map((w) => `  ${c.yellow('⚠')} ${w.replaceAll('\n', '\n    ')}`)].join('\n')
 }
 
 function emitComposeDoctor(report: ComposeDoctorReport, opts: { verbose: boolean; json: boolean }): void {

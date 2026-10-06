@@ -158,4 +158,70 @@ describe('composeRestart events', () => {
 
     expect(results[0]?.warnings).toEqual(['dead logs unavailable'])
   })
+
+  test('checks fleet memory once after every agent settled instead of per agent', async () => {
+    // given two agents that both restart successfully
+    await makeValidAgent(root, 'alpha')
+    await makeValidAgent(root, 'bravo')
+    const skipFlags: Array<boolean | undefined> = []
+    const restart: Controller['restart'] = async (options) => {
+      skipFlags.push(options.skipMemoryOversubscriptionCheck)
+      return { ok: true, stop: { ok: true, containerName: 'x', running: true }, start: successfulStart() }
+    }
+    let checks = 0
+    const checkMemory = async (): Promise<string[]> => {
+      checks += 1
+      return ['Agent memory limits total 12.0GiB against 8.0GiB of Docker memory.']
+    }
+
+    // when
+    const result = await composeRestart({ rootCwd: root, preferredHostPort: 8973 }, { restart, checkMemory })
+
+    // then
+    expect(skipFlags).toEqual([true, true])
+    expect(checks).toBe(1)
+    expect(result.memoryWarning).toEqual(['Agent memory limits total 12.0GiB against 8.0GiB of Docker memory.'])
+    expect(result.results.every((r) => r.ok && r.warnings?.length === 0)).toBe(true)
+  })
+
+  test('skips the fleet memory check when no agent came up', async () => {
+    await makeValidAgent(root, 'alpha')
+    const restart: Controller['restart'] = async () => ({ ok: false, reason: 'simulated failure' })
+    let checks = 0
+    const checkMemory = async (): Promise<null> => {
+      checks += 1
+      return null
+    }
+
+    const result = await composeRestart({ rootCwd: root, preferredHostPort: 8973 }, { restart, checkMemory })
+
+    expect(checks).toBe(0)
+    expect(result.memoryWarning).toBeNull()
+  })
 })
+
+function successfulStart() {
+  return {
+    ok: true as const,
+    plan: {
+      containerName: 'x',
+      imageTag: 'x:latest',
+      buildContext: '/tmp/test-agent',
+      dockerfile: '/tmp/test-agent/Dockerfile',
+      runArgs: [],
+      needsBuild: false,
+      hostPort: 8973,
+      tuiToken: null,
+      memoryLimitBytes: 6 * 1024 * 1024 * 1024,
+    },
+    containerId: 'a'.repeat(64),
+    built: false,
+    hostPort: 8973,
+    tuiToken: null,
+    hostd: { state: 'disabled' as const },
+    alreadyRunning: false,
+    autoUpgrade: { kind: 'up-to-date' as const, installedVersion: '0.0.0' },
+    skippedPlugins: [],
+    dockerfileWarnings: [],
+  }
+}

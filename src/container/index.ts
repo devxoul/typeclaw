@@ -62,3 +62,8 @@ export {
   type WithAgentOperationLock,
   withAgentOperationLock,
 } from './agent-operation-lock'
+export {
+  formatOversubscriptionWarning,
+  readFleetMemoryOversubscription,
+  type OversubscriptionWarning,
+} from './memory-oversubscription'
