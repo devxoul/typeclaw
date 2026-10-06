@@ -42,6 +42,7 @@ import { chunkMarkdown } from '@/markdown'
 
 import { describeError } from '../describe-error'
 import { addSlackMentionHints } from './mention-hints'
+import { withOutboundAccount } from './outbound-account'
 import { createBotRecoveryCallbacks, sendBotRecovery } from './recovery-correlation'
 import { downloadSlackAttachment, type SlackAttachmentFetch } from './slack-attachment-download'
 import { createSlackAuthorResolver, type SlackAuthorResolver } from './slack-bot-author-resolver'
@@ -55,7 +56,7 @@ import {
   type SlackInboundAppMentionEvent,
   type SlackInboundMessageEvent,
 } from './slack-bot-classify'
-import { createSlackDedupe } from './slack-bot-dedupe'
+import { createSlackDedupe, type SlackDedupeReservation } from './slack-bot-dedupe'
 import { createSlackEditMessageCallback } from './slack-bot-edit'
 import {
   createSlackReactionCallback,
@@ -74,6 +75,7 @@ import {
 } from './slack-bot-slash-commands'
 import { slackTsToMillis } from './slack-bot-time'
 import { toSlackMrkdwn } from './slack-format'
+import { normalizeSlackInbound } from './slack-inbound-revision'
 import { invalidSlackThreadTs } from './slack-thread-ts'
 
 // One slash command per logical agent gesture. Mirrors the discord-bot
@@ -1227,14 +1229,17 @@ export function createSlackBotAdapter(options: SlackBotAdapterOptions): SlackBot
     historyCallback,
   })
 
-  const outboundCallback = createOutboundCallback({
-    client,
-    token: options.token,
-    fetchImpl,
-    logger,
-    formatChannelTag,
-    typingTracker,
-  })
+  const outboundCallback = withOutboundAccount(
+    createOutboundCallback({
+      client,
+      token: options.token,
+      fetchImpl,
+      logger,
+      formatChannelTag,
+      typingTracker,
+    }),
+    (workspace) => recoveryCallbacks.cachedAccountIdentity?.(workspace),
+  )
 
   const fetchAttachmentCallback = createFetchAttachmentCallback({ client, logger, token: options.token })
 
@@ -1276,24 +1281,29 @@ export function createSlackBotAdapter(options: SlackBotAdapterOptions): SlackBot
     },
   })
 
+  // Normalize edits before dedupe, commands and reference enrichment.
   const handleMessageEvent = async (
     event: SlackInboundMessageEvent,
     source: 'message' | 'app_mention',
   ): Promise<void> => {
+    const inboundTeamId = teamId
+    const inboundBotId = botUserId
+    event = normalizeSlackInbound(event)
+    let admissionReservation: SlackDedupeReservation | undefined
     inflightInbounds++
     try {
       const text = event.text ?? ''
       const userId = event.user ?? 'unknown'
-      const inboundWorkspace = event.channel_type === 'im' ? '@dm' : (teamId ?? 'unknown')
+      const inboundWorkspace = event.channel_type === 'im' ? '@dm' : (inboundTeamId ?? 'unknown')
 
-      if (teamId === null) {
+      if (inboundTeamId === null) {
         logger.warn(`[slack-bot] dropped ts=${event.ts} reason=pre_connected (team_id unknown)`)
         return
       }
 
       const verdict = classifyInbound(event, options.configRef(), {
-        teamId,
-        botUserId,
+        teamId: inboundTeamId,
+        botUserId: inboundBotId,
         ...(options.selfAliasesRef ? { selfAliases: options.selfAliasesRef() } : {}),
       })
       const isBotMention = verdict.kind === 'route' && verdict.payload.isBotMention
@@ -1309,7 +1319,7 @@ export function createSlackBotAdapter(options: SlackBotAdapterOptions): SlackBot
       // control traffic, not agent messages. Retain self-author/userless floors.
       // The handler reserves synchronously before executing, and a consumed
       // command cannot later promote into a mention.
-      if (event.user !== undefined && event.user !== '' && (botUserId === null || event.user !== botUserId)) {
+      if (event.user !== undefined && event.user !== '' && (inboundBotId === null || event.user !== inboundBotId)) {
         let commandReserved = false
         const reserve = (): boolean => {
           if (dedupe.check(event, isBotMention) !== null) return false
@@ -1323,7 +1333,7 @@ export function createSlackBotAdapter(options: SlackBotAdapterOptions): SlackBot
             channel: event.channel,
             threadTs: event.thread_ts ?? null,
             isDm: event.channel_type === 'im',
-            teamId,
+            teamId: inboundTeamId,
             invokerId: event.user,
           },
           reserve,
@@ -1341,7 +1351,7 @@ export function createSlackBotAdapter(options: SlackBotAdapterOptions): SlackBot
         return
       }
 
-      dedupe.mark(event, isBotMention)
+      admissionReservation = dedupe.reserve(event, isBotMention)
       const [resolvedUserName, inboundTag] = await Promise.all([
         event.user !== undefined && event.user !== '' ? authorResolver.resolve(event.user) : Promise.resolve(userId),
         formatChannelTag(inboundWorkspace, event.channel),
@@ -1349,7 +1359,9 @@ export function createSlackBotAdapter(options: SlackBotAdapterOptions): SlackBot
       logger.info(
         `[slack-bot] inbound source=${source} ts=${event.ts} user=${formatLabel(resolvedUserName, userId)} ${inboundTag} text_len=${text.length}`,
       )
-      const hintedText = await addSlackMentionHints(verdict.payload.text, authorResolver.resolve, { botUserId })
+      const hintedText = await addSlackMentionHints(verdict.payload.text, authorResolver.resolve, {
+        botUserId: inboundBotId,
+      })
       const slackAttachments = Array.isArray(event.attachments) ? event.attachments : undefined
       const referenceResult = await enrichSlackReferenceContext({
         text: hintedText,
@@ -1371,7 +1383,9 @@ export function createSlackBotAdapter(options: SlackBotAdapterOptions): SlackBot
         `[slack-bot] routed ts=${event.ts} ${routedTag} mention=${enriched.isBotMention} reply=${enriched.replyToBotMessageId !== null}`,
       )
       await options.router.route(enriched)
+      admissionReservation.commit()
     } catch (err) {
+      admissionReservation?.rollback()
       logger.error(`[slack-bot] handleInbound failed: ${describeError(err)}`)
     } finally {
       inflightInbounds--

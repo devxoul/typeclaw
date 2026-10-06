@@ -93,6 +93,7 @@ function router(): ChannelRouter & { routed: InboundMessage[]; registered: strin
     unregistered,
     route: async (msg: InboundMessage) => {
       routed.push(msg)
+      return { kind: 'accepted' as const, inputId: msg.externalMessageId, generation: 0 }
     },
     registerOutbound: (adapter: string) => registered.push(`outbound:${adapter}`),
     unregisterOutbound: (adapter: string) => unregistered.push(`outbound:${adapter}`),

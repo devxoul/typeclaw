@@ -2,7 +2,12 @@ import { createHmac, randomUUID, timingSafeEqual } from 'node:crypto'
 
 import { registerOrJoinReplyReviewRound } from '@/channels/github-review-verdict-coordinator'
 import type { GithubReviewOn } from '@/channels/schema'
-import type { GithubReviewFollowupRound, GithubReviewThreadCloseout, InboundMessage } from '@/channels/types'
+import type {
+  GithubReviewFollowupRound,
+  GithubReviewThreadCloseout,
+  InboundMessage,
+  RouteReceipt,
+} from '@/channels/types'
 
 import { describeError } from '../../describe-error'
 import type { GithubAuthContext } from './auth'
@@ -38,7 +43,7 @@ export type GithubWebhookHandlerOptions = {
   // eventAllowlist (the outer "process this webhook?" gate) — this is the inner
   // "does an admitted pull_request event become a review-trigger inbound?" gate.
   reviewOn?: () => GithubReviewOn
-  route: (message: InboundMessage) => void
+  route: (message: InboundMessage) => Promise<RouteReceipt>
   logger: GithubInboundLogger
   // Optional: resolves whether the bot is a member of the given team. When
   // omitted, team-reviewer requests are silently dropped (the v1 fallback
@@ -178,7 +183,7 @@ export async function processVerifiedGithubDelivery(
   // session when an obligation is outstanding. Returning here also keeps
   // synchronize out of the generic awareness-only fallthrough below.
   if (isSynchronize) {
-    scheduleReviewFollowup({ payload, selfLogin, options })
+    scheduleReviewFollowup({ payload, selfId, selfLogin, options })
     return
   }
 
@@ -206,7 +211,23 @@ export async function processVerifiedGithubDelivery(
           }
         : classified
 
-  options.route(withApprovalPolicy(routed, options.allowApprove?.() ?? true))
+  // GitHub transport acknowledgment is not a durable admission receipt.
+  void Promise.resolve()
+    .then(() =>
+      options.route(
+        withApprovalPolicy(
+          {
+            ...routed,
+            receiptId: delivery,
+            accountIdentity: selfId === null ? undefined : `github:${selfId}`,
+          },
+          options.allowApprove?.() ?? true,
+        ),
+      ),
+    )
+    .catch((error: unknown) => {
+      options.logger.error(`[github] route failed: ${describeError(error)}`)
+    })
 }
 
 export const PR_APPROVAL_DISABLED_NOTE =
@@ -433,10 +454,11 @@ function reviewFollowupDedup(options: GithubWebhookHandlerOptions): ReviewFollow
 
 function scheduleReviewFollowup(input: {
   payload: Record<string, unknown>
+  selfId: string | null
   selfLogin: string | null
   options: GithubWebhookHandlerOptions
 }): void {
-  const { payload, selfLogin, options } = input
+  const { payload, selfId, selfLogin, options } = input
   if (selfLogin === null) return
   const authToken = options.authToken
   if (authToken === undefined) return
@@ -511,7 +533,7 @@ function scheduleReviewFollowup(input: {
       if (threads.threads.length === 0) {
         if (selfBlocking) {
           const round = buildReviewRound(repository, pullNumber, headSha, null, generateReviewRoundId)
-          options.route(
+          await options.route(
             withApprovalPolicy(
               buildReviewFollowupInbound({
                 repository,
@@ -521,6 +543,7 @@ function scheduleReviewFollowup(input: {
                 selfBlocking: true,
                 round,
                 title: readString(pr, 'title'),
+                accountIdentity: selfId === null ? undefined : `github:${selfId}`,
               }),
               options.allowApprove?.() ?? true,
               true,
@@ -545,7 +568,7 @@ function scheduleReviewFollowup(input: {
         // sibling PR session by injectPrVerdictActivity, while asking all of them
         // to submit it would recreate a cross-session verdict race.
         const carriesBlockingObligation = selfBlocking && index === 0
-        options.route(
+        await options.route(
           withApprovalPolicy(
             buildReviewFollowupInbound({
               repository,
@@ -555,6 +578,7 @@ function scheduleReviewFollowup(input: {
               selfBlocking: carriesBlockingObligation,
               ...(round !== undefined ? { round } : {}),
               title: readString(pr, 'title'),
+              accountIdentity: selfId === null ? undefined : `github:${selfId}`,
             }),
             options.allowApprove?.() ?? true,
             carriesBlockingObligation,
@@ -597,6 +621,7 @@ function buildReviewFollowupInbound(input: {
   selfBlocking: boolean
   round?: GithubReviewFollowupRound
   title: string | null
+  accountIdentity?: string
 }): InboundMessage {
   const { repository, pullNumber, headSha, thread, selfBlocking, round, title } = input
   const titleSegment = title !== null && title.trim() !== '' ? `: "${title}"` : ''
@@ -612,6 +637,11 @@ function buildReviewFollowupInbound(input: {
     ...(round !== undefined ? { githubReviewRound: round } : {}),
     text,
     externalMessageId: `pr-${pullNumber}-recheck-${headSha}${thread === null ? '' : `-thread-${thread.rootCommentId}`}`,
+    eventKind: 'pull_request:synchronize:review-followup',
+    // Verdict coordination round IDs are attempt-local. Durable admission uses
+    // the platform head revision, stable across partial retries and redelivery.
+    revision: headSha,
+    accountIdentity: input.accountIdentity,
     authorId: 'github-system',
     authorName: 'github',
     authorIsBot: false,
@@ -679,6 +709,22 @@ export async function verifySignature(body: string, secret: string, sigHeader: s
   return timingSafeEqual(a, b)
 }
 
+function githubEventRevision(payload: Record<string, unknown>): string {
+  const subject =
+    readRecord(payload.comment) ??
+    readRecord(payload.review) ??
+    readRecord(payload.pull_request) ??
+    readRecord(payload.issue) ??
+    readRecord(payload.discussion)
+  const head = readRecord(readRecord(payload.pull_request)?.head)
+  const reviewer = readRecord(payload.requested_reviewer) ?? readRecord(payload.requested_team)
+  return JSON.stringify([
+    readString(subject, 'updated_at') ?? readString(subject, 'submitted_at') ?? readString(subject, 'created_at'),
+    readString(head, 'sha'),
+    readNumber(reviewer, 'id'),
+  ])
+}
+
 export function classifyGithubInbound(
   event: string,
   payload: Record<string, unknown>,
@@ -696,6 +742,8 @@ export function classifyGithubInbound(
   const base = {
     adapter: 'github' as const,
     workspace: `${repository.owner}/${repository.name}`,
+    eventKind: `${event}:${readString(payload, 'action') ?? 'event'}`,
+    revision: githubEventRevision(payload),
     isDm: false,
     mentionsOthers: false,
     replyToOtherMessageId: null,

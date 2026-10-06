@@ -47,7 +47,7 @@ class FakeSlackBotListener {
 function lifecycleRouter(): ChannelRouter {
   const noop = (): void => {}
   return {
-    route: async () => {},
+    route: async () => ({ kind: 'observed' as const }),
     executeCommand: async () => ({ kind: 'unknown-command' }),
     registerOutbound: noop,
     unregisterOutbound: noop,
@@ -1021,6 +1021,7 @@ describe('slack-bot edited mention ingress', () => {
     router.route = async (payload) => {
       routed.push(payload)
       firstRoute.resolve()
+      return { kind: 'observed' }
     }
     const adapter = createSlackBotAdapter({
       router,
@@ -1077,6 +1078,73 @@ describe('slack-bot edited mention ingress', () => {
       expect(routed[1]?.text).toContain('질문입니다')
     } finally {
       fetchSpy.mockRestore()
+    }
+  })
+
+  test('failed durable admission allows a suppressed retry alias to route again', async () => {
+    const listener = new FakeSlackBotListener()
+    const entered = Promise.withResolvers<void>()
+    const fail = Promise.withResolvers<void>()
+    const failed = Promise.withResolvers<void>()
+    const accepted = Promise.withResolvers<void>()
+    const duplicate = Promise.withResolvers<void>()
+    const routed: string[] = []
+    const router = lifecycleRouter()
+    router.route = async (payload) => {
+      routed.push(payload.externalMessageId)
+      if (routed.length === 1) {
+        entered.resolve()
+        await fail.promise
+        throw new Error('durable admission failed')
+      }
+      accepted.resolve()
+      return { kind: 'accepted', inputId: 'accepted-retry', generation: 1 }
+    }
+    const adapter = createSlackBotAdapter({
+      router,
+      configRef: () => channelsSchema.parse({ 'slack-bot': {} })['slack-bot']!,
+      token: 'xoxb-test',
+      appToken: 'xapp-test',
+      logger: {
+        info: (message) => {
+          if (message.includes('duplicate_delivery')) duplicate.resolve()
+        },
+        warn: () => {},
+        error: () => failed.resolve(),
+      },
+      createClient: () =>
+        ({
+          login: async () => {},
+          testAuth: async () => ({ user_id: 'UBOT', team_id: 'T0ACME' }),
+        }) as unknown as SlackBotClient,
+      createListener: () => listener as unknown as SlackBotListener,
+      fetchImpl: (async () =>
+        new Response(JSON.stringify({ ok: false, error: 'missing_scope' }))) as unknown as typeof fetch,
+    })
+    const event = {
+      type: 'message',
+      channel: 'C0CHANNEL',
+      channel_type: 'channel',
+      user: 'UALICE',
+      ts: '1700000000.000100',
+      client_msg_id: 'cmid-failed',
+      text: '<@UBOT> 질문입니다',
+    }
+    const emit = (payload: unknown): void => listener.emit('message', { ack: () => {}, event: payload })
+    try {
+      await adapter.start()
+      emit(event)
+      await entered.promise
+      emit({ ...event, ts: '1700000000.000200' })
+      await duplicate.promise
+      fail.resolve()
+      await failed.promise
+      emit({ ...event, ts: '1700000000.000200', client_msg_id: undefined })
+      await accepted.promise
+      expect(routed).toEqual(['1700000000.000100', '1700000000.000200'])
+    } finally {
+      fail.resolve()
+      await adapter.stop()
     }
   })
 })

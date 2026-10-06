@@ -10,6 +10,8 @@ import type { SessionEntry } from '@earendil-works/pi-coding-agent'
 import type { AgentSession } from '@/agent'
 
 import { BackgroundObligationStore } from './background-obligations'
+import { InboundJournal } from './inbound-journal'
+import { RecoveryOutbox } from './recovery-outbox'
 import { createChannelRouter, SESSION_GRACE_HARD_TTL_MS } from './router'
 import { defaultHistoryConfig } from './schema'
 import type { ChannelKey, InboundMessage } from './types'
@@ -137,6 +139,7 @@ async function fixture(
       ...KEY,
       text,
       externalMessageId: `message-${++messageId}`,
+      accountIdentity: 'test-account',
       authorId: 'human',
       authorName: 'Human',
       authorIsBot: false,
@@ -173,12 +176,13 @@ async function fixture(
     })
   async function reply(session: ParentSession, text: string, parentSessionId = 'parent-1') {
     const backgroundCoverage = await router.captureBackgroundResultCoverage!(parentSessionId)
+    const inboundCoverage = await router.captureInboundResultCoverage!(parentSessionId)
     expect((await router.send({ ...KEY, text })).ok).toBe(true)
     await session.agent.afterToolCall!({
       assistantMessage: assistant(''),
       toolCall: { type: 'toolCall', id: 'reply', name: 'channel_reply', arguments: { text } },
       args: { text },
-      result: { content: [{ type: 'text', text: 'sent' }], details: { ok: true, backgroundCoverage } },
+      result: { content: [{ type: 'text', text: 'sent' }], details: { ok: true, backgroundCoverage, inboundCoverage } },
       isError: false,
       context: { messages: [] },
     } as AfterToolCallContext)
@@ -243,17 +247,15 @@ test('an active parent fetch retires its queued completion before terminal reply
 })
 
 test('stop waits for an in-flight real claim and withdraws its current generation without another notice', async () => {
-  const f = await fixture()
+  const entered = Promise.withResolvers<void>()
+  const release = Promise.withResolvers<void>()
+  const f = await fixture(async (phase, row) => {
+    if (phase !== 'temp-synced' || row.taskId !== 'stop-claim' || row.phase !== 'turn-owned') return
+    entered.resolve()
+    await release.promise
+  })
   try {
     const ref = await f.accept('stop-claim')
-    const entered = Promise.withResolvers<void>()
-    const release = Promise.withResolvers<void>()
-    const claim = f.store.claim.bind(f.store)
-    f.store.claim = async (...args) => {
-      entered.resolve()
-      await release.promise
-      return claim(...args)
-    }
     const parent = f.sessions[0]!
     parent.onPrompt = async () => {
       if (!parent.agent.signal.aborted)
@@ -289,7 +291,71 @@ test('stop waits for an in-flight real claim and withdraws its current generatio
   }
 })
 
-test('a genuine filesystem settlement failure reports an error but stop still aborts and later input progresses', async () => {
+test('stop suppresses active and queued requests from different accounts before restart recovery', async () => {
+  const f = await fixture()
+  let account = 'test-account'
+  f.router.registerRecoveryAdapter(KEY.adapter, {
+    accountIdentity: async () => account,
+    cachedAccountIdentity: () => account,
+    reconcile: async () => ({ status: 'unreconcilable' }),
+  })
+  const entered = Promise.withResolvers<void>()
+  const parent = f.sessions[0]!
+  parent.onPrompt = async () => {
+    entered.resolve()
+    if (!parent.agent.signal.aborted)
+      await new Promise<void>((resolve) =>
+        parent.agent.signal.addEventListener('abort', () => resolve(), { once: true }),
+      )
+    parent.finish('NO_REPLY')
+  }
+  try {
+    const active = await f.router.route(f.inbound('account A active request'))
+    if (active.kind !== 'accepted') throw new Error('Expected active admission')
+    const drain = f.flush()
+    await entered.promise
+    const child = await f.accept('account-A-child')
+    await f.router.attachBackgroundResultCoverage({ parentSessionId: 'parent-1', taskId: 'account-A-child' })
+    account = 'account-B'
+    const queued = await f.router.route({ ...f.inbound('account B queued request'), accountIdentity: account })
+    if (queued.kind !== 'accepted') throw new Error('Expected queued admission')
+    const queuedChild = await f.router.acceptBackgroundResponse({
+      parentSessionId: 'parent-1',
+      key: KEY,
+      taskId: 'account-B-child',
+      subagentName: 'explorer',
+      startedAt: 1000,
+      accountIdentity: account,
+      triggeringAuthorId: 'human',
+    })
+    await f.complete('account-B-child')
+    await f.router.route({ ...f.inbound('/stop'), accountIdentity: account })
+    await drain
+    expect(parent.aborted).toBeGreaterThan(0)
+    expect(parent.prompts.some((text) => text.includes('account B queued request'))).toBe(false)
+    expect((await f.store.get(child.obligationId))?.outcome?.kind).toBe('intentionally-suppressed')
+    expect((await f.store.get(queuedChild.obligationId))?.outcome?.kind).toBe('intentionally-suppressed')
+    await f.router.stop()
+    const background = new BackgroundObligationStore(f.dir, { epoch: 'reboot' })
+    const journal = new InboundJournal(f.dir, { backgroundObligations: background })
+    const outbox = new RecoveryOutbox(f.dir, { epoch: background.epoch })
+    try {
+      await journal.initialize()
+      for (const inputId of [active.inputId, queued.inputId])
+        expect(journal.get(inputId)).toMatchObject({ phase: 'closed', outcome: { kind: 'intentionally-suppressed' } })
+      await journal.importOldEpoch(outbox)
+      expect(await outbox.list()).toEqual([])
+      expect(f.logs.some((message) => message.includes('background stop withdrawal failed'))).toBe(false)
+    } finally {
+      await journal.close()
+    }
+  } finally {
+    await f.router.stop()
+    await rm(f.dir, { recursive: true, force: true })
+  }
+})
+
+test('a mixed filesystem settlement failure still aborts stop and rejects admission until journal repair', async () => {
   let obstructed = false
   let failSettlement = false
   const f = await fixture(async (phase, row) => {
@@ -332,7 +398,8 @@ test('a genuine filesystem settlement failure reports an error but stop still ab
     failSettlement = false
     await drain
     expect((await f.store.get(ref.obligationId))?.phase).toBe('turn-owned')
-    await f.independent('unrelated human question after failed withdrawal')
+    await expect(f.router.route(f.inbound('new question after failed withdrawal'))).rejects.toThrow('frozen')
+    expect(parent.prompts.some((prompt) => prompt.includes('new question after failed withdrawal'))).toBe(false)
   } finally {
     if (obstructed) {
       await unlink(directory)

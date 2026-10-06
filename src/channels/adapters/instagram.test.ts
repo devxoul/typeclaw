@@ -306,6 +306,46 @@ describe('createInstagramAdapter lifecycle', () => {
     await second.stop()
   })
 
+  test('does not checkpoint until durable admission completes and retries a failed admission', async () => {
+    const listener = new FakeListener()
+    const entered = deferred<void>()
+    const durable = deferred<void>()
+    const marks: string[] = []
+    let attempts = 0
+    const router = makeRouterStub(() => {})
+    router.route = async (message) => {
+      attempts++
+      entered.resolve()
+      await durable.promise
+      if (attempts === 1) throw new Error('journal sync failed')
+      return { kind: 'duplicate', inputId: message.externalMessageId }
+    }
+    const store = await memoryContinuityStore({ onMark: (id) => marks.push(id) })
+    const adapter = createInstagramAdapter({
+      router,
+      configRef: () => ({}) as ChannelAdapterConfig,
+      logger: SILENT,
+      now: () => Date.parse('2025-01-02T00:00:00.000Z'),
+      client: fakeClient({ getMessages: async () => [] }),
+      continuityStore: store,
+      listenerCtorResolver: listenerResolver(listener),
+    })
+    await adapter.start()
+    const incoming = msg({ id: 'M-durable', timestamp: '2025-01-02T00:00:01.000Z' })
+    listener.message?.(incoming)
+    await entered.promise
+    expect(marks).toEqual([])
+    durable.resolve()
+    await adapter.stop()
+    expect(marks).toEqual([])
+    await adapter.start()
+    listener.message?.(incoming)
+    await waitFor(() => marks.includes('M-durable'))
+    expect(attempts).toBe(2)
+    expect(marks).toEqual(['M-durable'])
+    await adapter.stop()
+  })
+
   test('routes messages that arrive during bootstrap before checkpointing them', async () => {
     const listener = new FakeListener()
     const historyFetchEntered = deferred<void>()
@@ -609,7 +649,10 @@ function makeRouterStub(onRoute: (m: InboundMessage) => void) {
   const registered = { outbound: false, history: false, nameResolver: false }
   return {
     registered,
-    route: async (m: InboundMessage) => onRoute(m),
+    route: async (m: InboundMessage) => {
+      onRoute(m)
+      return { kind: 'accepted' as const, inputId: m.externalMessageId, generation: 0 }
+    },
     registerSelfIdentity: () => {},
     unregisterSelfIdentity: () => {},
     registerOutbound: () => {

@@ -14,6 +14,7 @@ import {
 
 import type { ChannelRouter } from '@/channels/router'
 import type { ChannelAdapterConfig } from '@/channels/schema'
+import { fallbackChannelAccountIdentity } from '@/channels/types'
 import type {
   ChannelSelfIdentityResolver,
   ChannelHistoryMessage,
@@ -32,6 +33,7 @@ import { createLineChannelResolver } from './line-channel-resolver'
 import { classifyInbound } from './line-classify'
 import { toLinePlainText } from './line-format'
 import { LINE_TOKEN_REFRESH_SKEW_MS, nextRefreshDelayMs } from './line-token'
+import { withOutboundAccount } from './outbound-account'
 
 // Structural duck-type of the upstream LineClient class. Declaring this as an
 // interface (rather than reusing the nominal class type) lets test fakes
@@ -216,7 +218,10 @@ export function createLineAdapter(options: LineAdapterOptions): LineAdapter {
     selfUserIdRef: () => selfUserId,
   })
 
-  const outboundCallback = createOutboundCallback({ client, logger, formatChannelTag })
+  const outboundCallback = withOutboundAccount(
+    createOutboundCallback({ client, logger, formatChannelTag }),
+    (workspace) => fallbackChannelAccountIdentity('line', workspace, selfUserId),
+  )
 
   // The SDK's AuthService updates the LIVE client's token in-place and emits this
   // event; we mirror it into secrets.json so the next container start boots from a
@@ -264,6 +269,7 @@ export function createLineAdapter(options: LineAdapterOptions): LineAdapter {
   }
 
   const processInbound = async (event: LinePushMessageEvent): Promise<void> => {
+    const inboundSelfId = selfUserId
     inflightInbounds++
     try {
       if (channelResolver.lookupChat(event.chat_id) === null) {
@@ -288,7 +294,7 @@ export function createLineAdapter(options: LineAdapterOptions): LineAdapter {
       )
 
       const verdict = classifyInbound(event, options.configRef(), {
-        selfUserId,
+        selfUserId: inboundSelfId,
         lookupChat: (id) => channelResolver.lookupChat(id),
         text,
         attachments,
@@ -302,7 +308,12 @@ export function createLineAdapter(options: LineAdapterOptions): LineAdapter {
       logger.info(
         `[line] routed message_id=${event.message_id} ${inboundTag} mention=${verdict.payload.isBotMention} dm=${verdict.payload.isDm}`,
       )
-      await options.router.route(verdict.payload)
+      await options.router.route({
+        ...verdict.payload,
+        accountIdentity: fallbackChannelAccountIdentity('line', verdict.payload.workspace, inboundSelfId),
+        eventKind: 'message',
+        revision: 'original',
+      })
     } catch (err) {
       logger.error(`[line] handleInbound failed: ${describeError(err)}`)
     } finally {

@@ -76,6 +76,7 @@ import {
 } from './discord-bot-slash-commands'
 import { createDiscordThreadRoomResolver } from './discord-bot-thread-room'
 import { addDiscordMentionHints, type DiscordMentionUser } from './mention-hints'
+import { withOutboundAccount } from './outbound-account'
 import { createBotRecoveryCallbacks, sendBotRecovery } from './recovery-correlation'
 
 // One declared slash command per logical agent gesture. /stop maps to the
@@ -1129,13 +1130,16 @@ export function createDiscordBotAdapter(options: DiscordBotAdapterOptions): Disc
     historyCallback,
   })
 
-  const outboundCallback = createOutboundCallback({
-    client,
-    logger,
-    formatChannelTag,
-    token: options.token,
-    fetchImpl,
-  })
+  const outboundCallback = withOutboundAccount(
+    createOutboundCallback({
+      client,
+      logger,
+      formatChannelTag,
+      token: options.token,
+      fetchImpl,
+    }),
+    (workspace) => recoveryCallbacks.cachedAccountIdentity?.(workspace),
+  )
 
   const fetchAttachmentCallback = createFetchAttachmentCallback({ token: options.token, logger })
 
@@ -1167,6 +1171,7 @@ export function createDiscordBotAdapter(options: DiscordBotAdapterOptions): Disc
   }
 
   const handleMessageCreate = async (event: DiscordGatewayMessageCreateEvent): Promise<void> => {
+    const inboundBotId = botUserId
     inflightInbounds++
     try {
       // One log line per gateway event is non-negotiable: it's the only way to
@@ -1178,7 +1183,7 @@ export function createDiscordBotAdapter(options: DiscordBotAdapterOptions): Disc
         `[discord-bot] inbound id=${event.id} author=${formatLabel(event.author.username, event.author.id)} ${inboundTag} content_len=${event.content.length}`,
       )
 
-      const verdict = classifyInbound(event, options.configRef(), botUserId)
+      const verdict = classifyInbound(event, options.configRef(), inboundBotId)
       if (verdict.kind === 'drop') {
         logger.info(`[discord-bot] dropped id=${event.id} reason=${verdict.reason}${dropHint(verdict.reason)}`)
         return
@@ -1225,7 +1230,12 @@ export function createDiscordBotAdapter(options: DiscordBotAdapterOptions): Disc
       logger.info(
         `[discord-bot] routed id=${event.id} ${routedTag} mention=${payload.isBotMention} reply=${payload.replyToBotMessageId !== null}`,
       )
-      await options.router.route(payload)
+      await options.router.route({
+        ...payload,
+        accountIdentity: inboundBotId === null ? undefined : `discord-bot:${inboundBotId}`,
+        eventKind: 'message',
+        revision: 'original',
+      })
     } catch (err) {
       logger.error(`[discord-bot] handleInbound failed: ${describeError(err)}`)
     } finally {

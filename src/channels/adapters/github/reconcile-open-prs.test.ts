@@ -76,7 +76,10 @@ function baseOptions(
     selfLogin: 'bot',
     authType: 'pat',
     token: async () => 'tok',
-    route: (m) => routed.push(m),
+    route: async (m) => {
+      routed.push(m)
+      return { kind: 'observed' as const }
+    },
     logger: { info: () => {}, warn: () => {} },
     fetchImpl: fakeGithub([]),
     ...rest,

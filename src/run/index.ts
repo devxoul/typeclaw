@@ -33,15 +33,16 @@ import {
   createGithubTokenBridge,
   createPrVerdictActivityBridge,
   createSubagentCompletionBridge,
+  setReviewCoverageCapture,
   setReviewObserver,
   setReviewOutputObserver,
-  setReviewCoverageCapture,
   type ChannelManager,
   type PrVerdictActivityBridge,
   type SubagentCompletionBridge,
 } from '@/channels'
 import { LegacyBackgroundHandoffReader } from '@/channels/background-handoff'
 import { BackgroundObligationStore } from '@/channels/background-obligations'
+import { InboundJournal } from '@/channels/inbound-journal'
 import { RecoveryDispatcher } from '@/channels/recovery-dispatcher'
 import { RecoveryOutbox } from '@/channels/recovery-outbox'
 import { createTunnelBridge, type TunnelBridge } from '@/channels/tunnel-bridge'
@@ -498,10 +499,17 @@ async function startAgentRuntime(
     epoch: backgroundObligations.epoch,
     onError: (error) => console.warn(`[run] recovery outbox failed: ${error}`),
   })
+  const inboundJournal = new InboundJournal(cwd, {
+    backgroundObligations,
+    onError: (error) => console.warn(`[run] inbound continuity recovery blocked: ${error}`),
+  })
+  registerBootCleanup(() => inboundJournal.close())
   let recoveryDispatcher: RecoveryDispatcher | undefined
   const channelManager = createChannelManagerFor({
     agentDir: cwd,
     backgroundObligations,
+    inboundJournal,
+    recoveryOutbox,
     secretsProvider: caps.secrets,
     channelsConfigRef: () => getConfig().channels,
     aliasesRef: () => getConfig().alias,
@@ -906,6 +914,8 @@ async function startAgentRuntime(
   // through the GitHub API, not the channel send path. In-process router call — no
   // stream fan-out, since this is the recording session's own bookkeeping.
   setReviewCoverageCapture(async (sessionId) => ({
+    expectedAccountIdentity: await channelManager.router.captureTurnAccountIdentity?.(sessionId),
+    inboundCoverage: (await channelManager.router.captureInboundResultCoverage?.(sessionId)) ?? [],
     backgroundCoverage: (await channelManager.router.captureBackgroundResultCoverage?.(sessionId)) ?? [],
   }))
   registerBootCleanup(() => setReviewCoverageCapture(null))
@@ -929,13 +939,25 @@ async function startAgentRuntime(
   recoveryDispatcher = new RecoveryDispatcher(recoveryOutbox, channelManager.router, {
     onError: (error) => console.warn(`[run] recovery dispatch failed: ${error}`),
     backgroundObligations,
+    inboundJournal,
   })
   registerBootCleanup(() => recoveryDispatcher?.stop())
-  await bootBackgroundObligations({
-    obligations: backgroundObligations,
-    outbox: recoveryOutbox,
-    inventory: legacyBackgroundHandoffs,
-  })
+  try {
+    // Mixed source decisions are repaired before any child or notice can progress.
+    await inboundJournal.initialize()
+    await inboundJournal.repair()
+    await inboundJournal.importOldEpoch(recoveryOutbox)
+    await bootBackgroundObligations({
+      obligations: backgroundObligations,
+      outbox: recoveryOutbox,
+      inventory: legacyBackgroundHandoffs,
+    })
+  } catch (error) {
+    // Keep the operator/adapter surface and verified inventory-only notices alive.
+    // Journal failure freezes dependent work; valid-looking child JSON is not proof of independence.
+    backgroundObligations.setFrozen(error)
+    console.warn(`[run] continuity blocked pending operator repair: ${error}`)
+  }
   await bootChannelRestartGreeting({
     agentDir: cwd,
     router: channelManager.router,
@@ -1114,11 +1136,14 @@ async function startAgentRuntime(
       subagentCompletionBridge.stop()
       prVerdictActivityBridge.stop()
       setReviewObserver(null)
+      setReviewCoverageCapture(null)
+      setReviewOutputObserver(null)
       await tunnelManager.stop()
       await recoveryDispatcher?.stop()
       await channelManager.stop()
       await mcpManager?.closeAll()
     } finally {
+      await inboundJournal.close().catch((error) => console.warn(`[run] inbound continuity close failed: ${error}`))
       await backgroundObligations
         .flush()
         .catch((error) => console.warn(`[run] background continuity flush failed: ${error}`))

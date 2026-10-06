@@ -80,6 +80,7 @@ function router(): ChannelRouter & {
     unregistered,
     route: async (msg: InboundMessage) => {
       routed.push(msg)
+      return { kind: 'accepted' as const, inputId: msg.externalMessageId, generation: 0 }
     },
     registerOutbound: (adapter: string, cb: OutboundCallback) => {
       registered.push(`outbound:${adapter}`)
@@ -294,6 +295,46 @@ describe('createDiscordAdapter', () => {
     expect(log.lines).toContain(
       'info:[discord] historical provenance enrichment scanned=1 attempted=1 resolved=1 failed=0 timed_out=0 changed=true',
     )
+  })
+
+  test('captured sender accepts its admitted account and refuses another account or a stopped actor', async () => {
+    const sent: unknown[] = []
+    const r = router()
+    const adapter = createDiscordAdapter({
+      router: r,
+      configRef: () => config,
+      logger: logger(),
+      credentialsStore: { getAccount: async () => account() },
+      createClient: () => fakeClient({ sendMessage: async (...args: unknown[]) => void sent.push(args) }),
+      createListener: () => new FakeListener() as unknown as DiscordListener,
+    })
+    await adapter.start()
+    const sender = r.outbound!
+    const message = {
+      adapter: 'discord' as const,
+      workspace: '200000000000000002',
+      chat: '300000000000000003',
+      text: 'owned answer',
+      sendOptions: {
+        accounting: 'live-turn' as const,
+        expectedAccountIdentity: 'discord:200000000000000002:100000000000000001',
+      },
+    }
+    try {
+      const denied = await sender({
+        ...message,
+        sendOptions: { ...message.sendOptions, expectedAccountIdentity: 'discord:200000000000000002:another-actor' },
+      })
+      expect(denied.ok).toBe(false)
+      expect(sent).toEqual([])
+      expect((await sender(message)).ok).toBe(true)
+      expect(sent).toEqual([['300000000000000003', 'owned answer']])
+      await adapter.stop()
+      expect((await sender(message)).ok).toBe(false)
+      expect(sent).toEqual([['300000000000000003', 'owned answer']])
+    } finally {
+      await adapter.stop()
+    }
   })
 
   test('outbound sends messages through DiscordClient.sendMessage', async () => {

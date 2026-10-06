@@ -1,12 +1,13 @@
 import type { GithubTokenBridge } from '@/channels/github-token-bridge'
 import type { ChannelRouter } from '@/channels/router'
 import type { ChannelAdapterConfig, GithubAdapterConfig } from '@/channels/schema'
-import type { ChannelSelfIdentityResolver, InboundMessage } from '@/channels/types'
+import type { ChannelSelfIdentityResolver, InboundMessage, RouteReceipt } from '@/channels/types'
 import { resolveSecret } from '@/secrets/resolve'
 import type { GithubSecretsBlock } from '@/secrets/schema'
 
 import { describeError } from '../../describe-error'
 import { canonicalGithubRepo } from '../../github-repo'
+import { withOutboundAccount } from '../outbound-account'
 import { buildAuthStrategy, type GithubAuthContext } from './auth'
 import { createGithubChannelNameResolver } from './channel-resolver'
 import { createDeliveryDedup } from './dedup'
@@ -156,13 +157,16 @@ export function createGithubAdapter(options: GithubAdapterOptions): GithubAdapte
   const recoveryCallbacks = createGithubRecoveryCallbacks(auth, fetchImpl, () =>
     selfId !== null ? `github:${selfId}` : undefined,
   )
-  const outbound = createGithubOutboundCallback({
-    token: authToken,
-    authType: options.secrets.auth.type,
-    logger,
-    fetchImpl,
-    accountIdentity: recoveryCallbacks.accountIdentity,
-  })
+  const outbound = withOutboundAccount(
+    createGithubOutboundCallback({
+      token: authToken,
+      authType: options.secrets.auth.type,
+      logger,
+      fetchImpl,
+      accountIdentity: recoveryCallbacks.accountIdentity,
+    }),
+    () => recoveryCallbacks.cachedAccountIdentity?.(),
+  )
   const ownReaction = createGithubOwnReactionCallbacks({
     token: authToken,
     getSelf: () => auth.getSelf(),
@@ -199,6 +203,7 @@ export function createGithubAdapter(options: GithubAdapterOptions): GithubAdapte
   const reviewSubmitter = createGithubReviewSubmitter({
     token: authToken,
     allowApprove: () => options.configRef().review.approve,
+    accountIdentity: recoveryCallbacks.accountIdentity,
     fetchImpl,
   })
   const channelNameResolver = createGithubChannelNameResolver({ token: authToken, fetchImpl })
@@ -214,15 +219,15 @@ export function createGithubAdapter(options: GithubAdapterOptions): GithubAdapte
   // Shared inbound entry. Both the live webhook handler and the startup
   // reconciliation pass route through this so a replayed PR takes the exact
   // same path a real delivery would.
-  const routeInbound = (message: InboundMessage): void => {
+  const routeInbound = async (message: InboundMessage): Promise<RouteReceipt> => {
     rememberWorkspace(message.workspace, message.chat)
-    // Ack-first: wrap in Promise.resolve so a synchronous throw inside
-    // router.route() cannot prevent the 200 response from being returned.
-    void Promise.resolve()
-      .then(() => options.router.route(message))
-      .catch((err: unknown) => {
-        logger.error(`[github] route failed: ${describeError(err)}`)
-      })
+    // The webhook handler schedules this outside its acknowledgment path.
+    return options.router.route({
+      ...message,
+      accountIdentity: message.accountIdentity ?? (selfId === null ? undefined : `github:${selfId}`),
+      eventKind: message.eventKind ?? 'review-followup',
+      revision: message.revision ?? 'original',
+    })
   }
   const handlerOptions: GithubWebhookHandlerOptions = {
     webhookSecret,
@@ -322,7 +327,9 @@ export function createGithubAdapter(options: GithubAdapterOptions): GithubAdapte
         // on — a cross-tenant leak under a multi-owner App. Enforced here, not in
         // the parser, because this adapter is the authority that owns repos[].
         unregisterTokenBridge = options.githubTokenBridge.registerResolver(
-          (repoSlug) => {
+          async (repoSlug) => {
+            const capturedSelfId = selfId
+            if (capturedSelfId === null) throw new Error('GitHub authenticated account is unavailable')
             const allowed = new Set((options.configRef().repos ?? []).map(canonicalGithubRepo))
             if (!allowed.has(canonicalGithubRepo(repoSlug))) {
               throw new Error(
@@ -331,7 +338,8 @@ export function createGithubAdapter(options: GithubAdapterOptions): GithubAdapte
                   'or add it to `repos[]` if the agent is meant to operate there.',
               )
             }
-            return auth.token({ repoSlug })
+            const token = await auth.token({ repoSlug })
+            return { token, accountIdentity: `github:${capturedSelfId}` }
           },
           () => selfLogin,
         )

@@ -1,6 +1,7 @@
-import { describe, expect, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { createHmac, generateKeyPairSync } from 'node:crypto'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdirSync } from 'node:fs'
+import { mkdir, mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -100,14 +101,31 @@ function githubConfig(
   return config
 }
 
+let agentDir: string
+const routers: ChannelRouter[] = []
+
+beforeEach(async () => {
+  agentDir = await mkdtemp(join(tmpdir(), 'typeclaw-github-lifecycle-'))
+  await mkdir(join(agentDir, 'coder'))
+})
+
+afterEach(async () => {
+  await Promise.all(routers.splice(0).map((router) => router.stop()))
+  await rm(agentDir, { recursive: true, force: true })
+})
+
 function freshRouter(): ChannelRouter {
-  return createChannelRouter({
-    agentDir: '/tmp/agent',
+  const routerDir = join(agentDir, `router-${routers.length}`)
+  mkdirSync(routerDir)
+  const router = createChannelRouter({
+    agentDir: routerDir,
     configForAdapter: () => ({
       ...ADAPTER_DEFAULTS,
       engagement: { ...ADAPTER_DEFAULTS.engagement, trigger: [...ADAPTER_DEFAULTS.engagement.trigger] },
     }),
   })
+  routers.push(router)
+  return router
 }
 
 describe('createGithubAdapter lifecycle', () => {
@@ -143,7 +161,7 @@ describe('createGithubAdapter lifecycle', () => {
       router,
       configRef: () => config,
       secrets: patSecrets(),
-      agentDir: '/tmp/agent',
+      agentDir,
       logger,
       fetchImpl,
       httpListenImpl: (_port, handler) => {
@@ -199,7 +217,7 @@ describe('createGithubAdapter lifecycle', () => {
       router: freshRouter(),
       configRef: () => githubConfig(['acme/widgets', 'acme/gadgets']),
       secrets: patSecrets(),
-      agentDir: '/tmp/agent',
+      agentDir,
       logger: silentLogger(),
       fetchImpl,
       httpListenImpl: () => ({ stop: async () => {} }),
@@ -232,7 +250,7 @@ describe('createGithubAdapter lifecycle', () => {
       router: freshRouter(),
       configRef: () => githubConfig(['acme/widgets', 'acme/gadgets'], null),
       secrets: patSecrets(),
-      agentDir: '/tmp/agent',
+      agentDir,
       logger,
       fetchImpl,
       httpListenImpl: () => ({ stop: async () => {} }),
@@ -267,7 +285,7 @@ describe('createGithubAdapter lifecycle', () => {
       router: freshRouter(),
       configRef: () => githubConfig(['acme/widgets']),
       secrets: patSecrets(),
-      agentDir: '/tmp/agent',
+      agentDir,
       logger: silentLogger(),
       fetchImpl,
       httpListenImpl: () => ({ stop: async () => {} }),
@@ -295,7 +313,7 @@ describe('createGithubAdapter lifecycle', () => {
       router: freshRouter(),
       configRef: () => githubConfig(['acme/widgets'], null),
       secrets: patSecrets(),
-      agentDir: '/tmp/agent',
+      agentDir,
       logger: silentLogger(),
       fetchImpl,
       httpListenImpl: () => ({ stop: async () => {} }),
@@ -325,7 +343,7 @@ describe('createGithubAdapter lifecycle', () => {
       router: freshRouter(),
       configRef: () => githubConfig(['acme/widgets'], 'https://configured.example.com/gh'),
       secrets: patSecrets(),
-      agentDir: '/tmp/agent',
+      agentDir,
       logger,
       fetchImpl,
       httpListenImpl: () => ({ stop: async () => {} }),
@@ -355,7 +373,7 @@ describe('createGithubAdapter lifecycle', () => {
       router: freshRouter(),
       configRef: () => githubConfig(['acme/widgets'], null),
       secrets: patSecrets(),
-      agentDir: '/tmp/agent',
+      agentDir,
       logger,
       fetchImpl,
       httpListenImpl: () => ({ stop: async () => {} }),
@@ -385,7 +403,7 @@ describe('createGithubAdapter lifecycle', () => {
       router: freshRouter(),
       configRef: () => githubConfig(['acme/widgets'], null),
       secrets: patSecrets(),
-      agentDir: '/tmp/agent',
+      agentDir,
       logger,
       fetchImpl,
       httpListenImpl: () => ({ stop: async () => {} }),
@@ -416,7 +434,7 @@ describe('createGithubAdapter lifecycle', () => {
       router: freshRouter(),
       configRef: () => githubConfig([], null),
       secrets: patSecrets(),
-      agentDir: '/tmp/agent',
+      agentDir,
       logger,
       fetchImpl,
       httpListenImpl: () => ({ stop: async () => {} }),
@@ -451,7 +469,7 @@ describe('createGithubAdapter lifecycle', () => {
       router: freshRouter(),
       configRef: () => githubConfig(['acme/widgets']),
       secrets: patSecrets(),
-      agentDir: '/tmp/agent',
+      agentDir,
       logger: silentLogger(),
       fetchImpl,
       httpListenImpl: () => ({ stop: async () => {} }),
@@ -474,7 +492,7 @@ describe('createGithubAdapter lifecycle', () => {
       router: freshRouter(),
       configRef: () => githubConfig([]),
       secrets: patSecrets(),
-      agentDir: '/tmp/agent',
+      agentDir,
       logger: silentLogger(),
       fetchImpl,
       httpListenImpl: () => ({ stop: async () => {} }),
@@ -498,7 +516,7 @@ describe('createGithubAdapter lifecycle', () => {
       router: freshRouter(),
       configRef: () => githubConfig(['acme/widgets']),
       secrets: patSecrets(),
-      agentDir: '/tmp/agent',
+      agentDir,
       logger: silentLogger(),
       fetchImpl,
       httpListenImpl: () => ({ stop: async () => {} }),
@@ -524,7 +542,7 @@ describe('createGithubAdapter lifecycle', () => {
       router: freshRouter(),
       configRef: () => githubConfig(['acme/widgets', 'acme/gadgets']),
       secrets: patSecrets(),
-      agentDir: '/tmp/agent',
+      agentDir,
       logger,
       fetchImpl,
       httpListenImpl: () => ({ stop: async () => {} }),
@@ -557,7 +575,7 @@ describe('createGithubAdapter lifecycle', () => {
       router: freshRouter(),
       configRef: () => githubConfig(['acme/widgets']),
       secrets: patSecrets(),
-      agentDir: '/tmp/agent',
+      agentDir,
       logger,
       fetchImpl,
       httpListenImpl: () => ({ stop: async () => {} }),
@@ -612,7 +630,7 @@ describe('createGithubAdapter lifecycle', () => {
       router: router1,
       configRef: () => githubConfig(['acme/widgets'], null),
       secrets: patSecrets(),
-      agentDir: '/tmp/coder',
+      agentDir: join(agentDir, 'coder'),
       logger: silentLogger(),
       fetchImpl,
       httpListenImpl: () => ({ stop: async () => {} }),
@@ -631,7 +649,7 @@ describe('createGithubAdapter lifecycle', () => {
       router: router2,
       configRef: () => githubConfig(['acme/widgets'], null),
       secrets: patSecrets(),
-      agentDir: '/tmp/coder',
+      agentDir: join(agentDir, 'coder'),
       logger: silentLogger(),
       fetchImpl,
       httpListenImpl: () => ({ stop: async () => {} }),
@@ -646,6 +664,7 @@ describe('createGithubAdapter lifecycle', () => {
 
     await adapter2.stop()
     expect(repoHooks.length).toBe(0)
+    await adapter1.stop()
   })
 
   test('legacy unmarked *.trycloudflare.com orphans (the reported bug) are cleaned up on the next adapter start', async () => {
@@ -691,7 +710,7 @@ describe('createGithubAdapter lifecycle', () => {
       router: freshRouter(),
       configRef: () => githubConfig(['acme/widgets'], null),
       secrets: patSecrets(),
-      agentDir: '/tmp/coder',
+      agentDir: join(agentDir, 'coder'),
       logger: silentLogger(),
       fetchImpl,
       httpListenImpl: () => ({ stop: async () => {} }),
@@ -725,7 +744,7 @@ describe('createGithubAdapter lifecycle', () => {
       router: freshRouter(),
       configRef: () => githubConfig(['acme/widgets']),
       secrets: patSecrets(),
-      agentDir: '/tmp/agent',
+      agentDir,
       logger: silentLogger(),
       fetchImpl,
       httpListenImpl: () => ({ stop: async () => {} }),
@@ -766,7 +785,7 @@ describe('createGithubAdapter lifecycle', () => {
       router: freshRouter(),
       configRef: () => githubConfig([], null),
       secrets: appSecrets(),
-      agentDir: '/tmp/agent',
+      agentDir,
       logger,
       fetchImpl,
       httpListenImpl: () => ({ stop: async () => {} }),
@@ -814,7 +833,7 @@ describe('createGithubAdapter lifecycle', () => {
       router: freshRouter(),
       configRef: () => githubConfig([], null),
       secrets: appSecrets(),
-      agentDir: '/tmp/agent',
+      agentDir,
       logger,
       fetchImpl,
       httpListenImpl: () => ({ stop: async () => {} }),
@@ -838,7 +857,7 @@ describe('createGithubAdapter lifecycle', () => {
       router: freshRouter(),
       configRef: () => githubConfig([], null),
       secrets: patSecrets(),
-      agentDir: '/tmp/agent',
+      agentDir,
       logger,
       fetchImpl,
       httpListenImpl: () => ({ stop: async () => {} }),
@@ -877,7 +896,7 @@ describe('createGithubAdapter lifecycle', () => {
       router: freshRouter(),
       configRef: () => githubConfig([], null),
       secrets: appSecrets(),
-      agentDir: '/tmp/agent',
+      agentDir,
       logger,
       fetchImpl,
       httpListenImpl: () => ({ stop: async () => {} }),
@@ -911,7 +930,7 @@ describe('createGithubAdapter lifecycle', () => {
       router: freshRouter(),
       configRef: () => githubConfig(['acme/widgets']),
       secrets: patSecrets(),
-      agentDir: '/tmp/agent',
+      agentDir,
       logger: silentLogger(),
       fetchImpl,
       httpListenImpl: () => ({ stop: async () => {} }),
@@ -947,7 +966,7 @@ describe('createGithubAdapter lifecycle', () => {
       router: freshRouter(),
       configRef: () => githubConfig(['acme/widgets']),
       secrets: patSecrets(),
-      agentDir: '/tmp/agent',
+      agentDir,
       logger: silentLogger(),
       fetchImpl,
       httpListenImpl: () => ({ stop: async () => {} }),
@@ -1004,7 +1023,7 @@ describe('createGithubAdapter lifecycle', () => {
       router: freshRouter(),
       configRef: () => githubConfig(['acme/widgets']),
       secrets: appSecrets(),
-      agentDir: '/tmp/agent',
+      agentDir,
       logger: silentLogger(),
       fetchImpl,
       httpListenImpl: () => ({ stop: async () => {} }),
@@ -1043,7 +1062,7 @@ describe('createGithubAdapter lifecycle', () => {
       router: freshRouter(),
       configRef: () => githubConfig([], null),
       secrets: patSecrets(),
-      agentDir: '/tmp/agent',
+      agentDir,
       logger: silentLogger(),
       fetchImpl,
       httpListenImpl: () => ({ stop: async () => {} }),
@@ -1081,7 +1100,7 @@ describe('createGithubAdapter lifecycle', () => {
       router: freshRouter(),
       configRef: () => githubConfig(['acme/widgets', 'acme/gadgets']),
       secrets: appSecrets(),
-      agentDir: '/tmp/agent',
+      agentDir,
       logger: silentLogger(),
       fetchImpl,
       httpListenImpl: () => ({ stop: async () => {} }),
@@ -1129,7 +1148,7 @@ describe('createGithubAdapter lifecycle', () => {
       router: freshRouter(),
       configRef: () => githubConfig(['octocat/hello']),
       secrets: appSecrets(),
-      agentDir: '/tmp/agent',
+      agentDir,
       logger: silentLogger(),
       fetchImpl,
       httpListenImpl: () => ({ stop: async () => {} }),
@@ -1167,7 +1186,7 @@ describe('createGithubAdapter lifecycle', () => {
       router: freshRouter(),
       configRef: () => githubConfig(['acme/widgets', 'globex/gizmos']),
       secrets: appSecrets(),
-      agentDir: '/tmp/agent',
+      agentDir,
       logger: silentLogger(),
       fetchImpl,
       httpListenImpl: () => ({ stop: async () => {} }),
@@ -1199,7 +1218,7 @@ describe('createGithubAdapter lifecycle', () => {
       router: freshRouter(),
       configRef: () => githubConfig([], null),
       secrets: appSecrets(),
-      agentDir: '/tmp/agent',
+      agentDir,
       logger: silentLogger(),
       fetchImpl,
       httpListenImpl: () => ({ stop: async () => {} }),
@@ -1235,7 +1254,7 @@ describe('createGithubAdapter lifecycle', () => {
         router: freshRouter(),
         configRef: () => githubConfig(['acme/widgets']),
         secrets: appSecrets(),
-        agentDir: '/tmp/agent',
+        agentDir,
         logger: silentLogger(),
         fetchImpl,
         httpListenImpl: () => ({ stop: async () => {} }),
@@ -1249,6 +1268,7 @@ describe('createGithubAdapter lifecycle', () => {
         await expect(bridge.resolveTokenForRepo('acme/widgets')).resolves.toEqual({
           kind: 'token',
           token: 'ghs_minted',
+          accountIdentity: 'github:1',
         })
         await adapter.stop()
         expect(process.env.GH_TOKEN).toBe('ghp_operator')
@@ -1267,7 +1287,7 @@ describe('createGithubAdapter lifecycle', () => {
         router: freshRouter(),
         configRef: () => githubConfig(['acme/widgets']),
         secrets: appSecrets(),
-        agentDir: '/tmp/agent',
+        agentDir,
         logger: silentLogger(),
         fetchImpl,
         httpListenImpl: () => ({ stop: async () => {} }),
@@ -1279,7 +1299,7 @@ describe('createGithubAdapter lifecycle', () => {
       const result = await bridge.resolveTokenForRepo('acme/widgets')
       await adapter.stop()
 
-      expect(result).toEqual({ kind: 'token', token: 'ghs_minted' })
+      expect(result).toEqual({ kind: 'token', token: 'ghs_minted', accountIdentity: 'github:1' })
     })
 
     test('refuses to mint for a repo not in repos[] (blocks cross-repo token minting)', async () => {
@@ -1290,7 +1310,7 @@ describe('createGithubAdapter lifecycle', () => {
         router: freshRouter(),
         configRef: () => githubConfig(['acme/widgets']),
         secrets: appSecrets(),
-        agentDir: '/tmp/agent',
+        agentDir,
         logger: silentLogger(),
         fetchImpl,
         httpListenImpl: () => ({ stop: async () => {} }),
@@ -1350,7 +1370,7 @@ describe('createGithubAdapter lifecycle', () => {
         router: freshRouter(),
         configRef: reviewConfig('opened'),
         secrets: patSecrets(),
-        agentDir: '/tmp/agent',
+        agentDir,
         logger: silentLogger(),
         fetchImpl,
         httpListenImpl: () => ({ stop: async () => {} }),
@@ -1379,7 +1399,7 @@ describe('createGithubAdapter lifecycle', () => {
         router: freshRouter(),
         configRef: reviewConfig('off'),
         secrets: patSecrets(),
-        agentDir: '/tmp/agent',
+        agentDir,
         logger: silentLogger(),
         fetchImpl,
         httpListenImpl: () => ({ stop: async () => {} }),

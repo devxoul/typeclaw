@@ -16,9 +16,11 @@ import {
   __resetReviewVerdictGuardForTest,
   createApproveIdempotencyGuard,
 } from '@/channels/github-review-verdict-coordinator'
+import { InboundJournal } from '@/channels/inbound-journal'
 import type { ToolResult } from '@/plugin'
 
 import {
+  capturedReviewAccountIdentity,
   commitReviewIfSucceeded,
   discardReviewCommand,
   dismissalMutationSucceeded,
@@ -53,11 +55,16 @@ describe('review recorder', () => {
     async ({ lane, flags, state }) => {
       const a = { obligationId: 'background-a', generation: 1 }
       const b = { obligationId: 'background-b', generation: 2 }
-      let current: ReviewResultCoverage = { backgroundCoverage: [a] }
+      const inbound = { inputId: 'request-a', generation: 1 }
+      let current: ReviewResultCoverage = {
+        inboundCoverage: [inbound],
+        backgroundCoverage: [a],
+        expectedAccountIdentity: 'github:1',
+      }
       setReviewCoverageCapture(async () => current)
       const observed: ReviewResultCoverage[] = []
       setReviewOutputObserver((output) => {
-        observed.push({ backgroundCoverage: output.backgroundCoverage })
+        observed.push({ inboundCoverage: output.inboundCoverage, backgroundCoverage: output.backgroundCoverage })
       })
       const callId = `coverage-${lane}`
       const command = `gh api /repos/${WS}/pulls/5/reviews ${flags}`
@@ -70,14 +77,24 @@ describe('review recorder', () => {
       // current turn and the original reference changes. Neither belongs to it.
       current.backgroundCoverage?.push(b)
       a.generation = 9
+      current.inboundCoverage?.push({ inputId: 'request-b', generation: 2 })
+      inbound.generation = 9
+      current.expectedAccountIdentity = 'github:2'
+      expect(capturedReviewAccountIdentity(callId)).toBe('github:1')
       remote.resolve(result)
       await after
-      expect(observed).toEqual([{ backgroundCoverage: [{ obligationId: 'background-a', generation: 1 }] }])
+      expect(observed).toEqual([
+        {
+          inboundCoverage: [{ inputId: 'request-a', generation: 1 }],
+          backgroundCoverage: [{ obligationId: 'background-a', generation: 1 }],
+        },
+      ])
+      expect(capturedReviewAccountIdentity(callId)).toBeUndefined()
 
       current = { backgroundCoverage: [b] }
       await noteReviewCommand({ sessionId: SESSION, callId, command })
       await commitReviewIfSucceeded({ sessionId: SESSION, callId, result })
-      expect(observed[1]).toEqual({ backgroundCoverage: [b] })
+      expect(observed[1]).toEqual({ inboundCoverage: [], backgroundCoverage: [b] })
       await commitReviewIfSucceeded({ sessionId: SESSION, callId, result })
       expect(observed).toHaveLength(2)
     },
@@ -126,6 +143,85 @@ describe('review recorder', () => {
     await noteReviewCommand({ sessionId: SESSION, callId: 'replaced', command: `gh pr view 5 -R ${WS}` })
     await commitReviewIfSucceeded({ sessionId: SESSION, callId: 'replaced', result: textResult(SUCCESS_OUTPUT) })
     expect(observed).toEqual([])
+    expect(hasReview({ sessionId: SESSION, workspace: WS, prNumber: 5, verdict: 'APPROVE' })).toBe(false)
+  })
+
+  test.each(['APPROVE', 'COMMENT'] as const)(
+    'late %s callback cannot close newer same-target ownership',
+    async (state) => {
+      const dir = mkdtempSync(join(tmpdir(), 'review-coverage-'))
+      const journal = new InboundJournal(dir)
+      const target = { adapter: 'github' as const, workspace: WS, chat: 'pr:5', thread: null }
+      try {
+        const admitted = await journal.admit({
+          target,
+          accountIdentity: 'github:bot',
+          principal: { kind: 'channel', adapter: 'github', workspace: WS, chat: 'pr:5', lastInboundAuthorId: 'human' },
+          messageId: 'request',
+          eventKind: 'message',
+          revision: '1',
+        })
+        if (admitted.kind !== 'accepted') throw new Error('Expected new admission')
+        const claimed = await journal.claim([{ inputId: admitted.inputId, generation: admitted.generation }], {
+          target,
+          turnId: 'old-turn',
+          ownerSessionId: SESSION,
+        })
+        setReviewCoverageCapture(async () => ({ inboundCoverage: claimed.inboundRefs, backgroundCoverage: [] }))
+        await noteReviewCommand({
+          callId: 'stale-coverage',
+          sessionId: SESSION,
+          command: `gh api /repos/${WS}/pulls/5/reviews -f event=${state}`,
+        })
+        const moved = await journal.move(claimed.inboundRefs, {
+          target,
+          fromTurnId: 'old-turn',
+          turnId: 'new-turn',
+          ownerSessionId: SESSION,
+        })
+        setReviewCoverageCapture(async () => ({ inboundCoverage: moved.inboundRefs, backgroundCoverage: [] }))
+        setReviewOutputObserver(async (args) => {
+          await journal.settle(
+            args.inboundCoverage ?? [],
+            { kind: 'delivered', decisionId: 'landed-review' },
+            [],
+            target,
+          )
+        })
+        const result = await commitReviewIfSucceeded({
+          sessionId: SESSION,
+          callId: 'stale-coverage',
+          result: textResult(`{"id":1,"state":"${state === 'COMMENT' ? 'COMMENTED' : 'APPROVED'}"}`),
+        })
+        expect(result.committed).toBe(state === 'APPROVE')
+        expect(journal.get(admitted.inputId)).toMatchObject({ phase: 'turn-owned', claim: { turnId: 'new-turn' } })
+        await journal.settle(moved.inboundRefs, { kind: 'delivered', decisionId: 'new-result' }, [], target)
+        expect(journal.get(admitted.inputId)?.phase).toBe('closed')
+      } finally {
+        await journal.close()
+        rmSync(dir, { recursive: true, force: true })
+      }
+    },
+  )
+
+  test('failed pre-execution coverage capture discards the submission attempt', async () => {
+    setReviewCoverageCapture(async () => {
+      throw new Error('journal frozen')
+    })
+    await expect(
+      noteReviewCommand({
+        sessionId: SESSION,
+        callId: 'failed-capture',
+        command: `gh api /repos/${WS}/pulls/5/reviews -f event=APPROVE`,
+      }),
+    ).rejects.toThrow('journal frozen')
+    expect(
+      await commitReviewIfSucceeded({
+        sessionId: SESSION,
+        callId: 'failed-capture',
+        result: textResult(SUCCESS_OUTPUT),
+      }),
+    ).toEqual({ committed: false, landedFromResult: null })
     expect(hasReview({ sessionId: SESSION, workspace: WS, prNumber: 5, verdict: 'APPROVE' })).toBe(false)
   })
 

@@ -30,7 +30,7 @@ const fakeCtx = {} as Parameters<ReturnType<typeof createChannelReplyTool>['exec
 
 function fakeRouter(handler: (msg: OutboundMessage) => Promise<SendResult>): ChannelRouter {
   return {
-    route: async () => {},
+    route: async () => ({ kind: 'observed' }),
     acceptBackgroundResponse: async () => {
       throw new Error('Unexpected background admission')
     },
@@ -159,8 +159,9 @@ async function classifyWebhook(payload: Record<string, unknown>): Promise<Inboun
     selfId: () => '99',
     selfLogin: () => 'typeclaw-bot',
     logger: silent,
-    route: (msg) => {
+    route: async (msg) => {
       routed = msg
+      return { kind: 'observed' as const }
     },
   })
   const body = JSON.stringify(payload)

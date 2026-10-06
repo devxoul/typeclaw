@@ -683,6 +683,7 @@ class FakeRouter {
       const waiters = this.waiters
       this.waiters = []
       for (const waiter of waiters) waiter()
+      return { kind: 'accepted' as const, inputId: msg.externalMessageId, generation: 0 }
     },
     registerOutbound: () => this.registered.push('outbound'),
     unregisterOutbound: () => this.unregistered.push('outbound'),

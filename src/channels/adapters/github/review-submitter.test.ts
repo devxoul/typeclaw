@@ -73,6 +73,40 @@ function submitter(fetchImpl: typeof fetch, allowApprove = true) {
 }
 
 describe('github review submitter', () => {
+  test('account rotation before the review POST cannot submit old account coverage', async () => {
+    const seen: SeenPost[] = []
+    let actor = 'github:account-a'
+    const transport = fakeGithub({ seen })
+    const submit = githubReviewSubmitter.createGithubReviewSubmitter({
+      token: async () => 'example-token',
+      allowApprove: () => true,
+      accountIdentity: async () => actor,
+      fetchImpl: Object.assign(
+        async (url: string | URL | Request, init?: RequestInit) => {
+          if (String(url).endsWith('/files?per_page=100')) actor = 'github:account-b'
+          return transport(url, init)
+        },
+        { preconnect: () => {} },
+      ),
+    })
+    const oldAccount = await submit(request({ event: 'APPROVE', expectedAccountIdentity: 'github:account-a' }))
+    expect(oldAccount).toMatchObject({ ok: false, code: 'permission-denied' })
+    expect(seen).toEqual([])
+    const currentAccount = await submit(request({ event: 'APPROVE', expectedAccountIdentity: 'github:account-b' }))
+    expect(currentAccount).toMatchObject({ ok: true, state: 'APPROVED' })
+    expect(seen.map((review) => review.event)).toEqual(['APPROVE'])
+  })
+
+  test('scoped formal review fails closed when the authenticated actor is unavailable', async () => {
+    const seen: SeenPost[] = []
+    const submit = submitter(fakeGithub({ seen }))
+    expect(await submit(request({ expectedAccountIdentity: 'github:account-a' }))).toMatchObject({
+      ok: false,
+      code: 'permission-denied',
+    })
+    expect(seen).toEqual([])
+  })
+
   test('posts valid anchors against the resolved PR head and verifies the exact review', async () => {
     const seen: SeenPost[] = []
     const result = await submitter(fakeGithub({ seen }))(request())

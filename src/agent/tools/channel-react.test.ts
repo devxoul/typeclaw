@@ -7,7 +7,7 @@ import { createChannelReactTool, type ChannelReactOrigin } from './channel-react
 
 function fakeRouter(queueReactionAfterReply: (req: ReactionRequest) => Promise<ReactionResult>): ChannelRouter {
   return {
-    route: async () => {},
+    route: async () => ({ kind: 'observed' }),
     send: async () => ({ ok: true }),
     getConsecutiveSendCount: () => 0,
     getSendRate: () => ({ count: 0, windowMs: 5_000 }),

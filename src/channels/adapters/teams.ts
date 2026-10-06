@@ -3,6 +3,7 @@ import type { TeamsListenerEventMap, TeamsMessage, TeamsUser } from 'agent-messe
 
 import type { ChannelRouter } from '@/channels/router'
 import type { ChannelAdapterConfig } from '@/channels/schema'
+import { fallbackChannelAccountIdentity } from '@/channels/types'
 import type {
   ChannelHistoryMessage,
   ChannelSelfIdentityResolver,
@@ -16,6 +17,7 @@ import type {
 import type { TeamsAccountRecord } from '@/secrets/schema'
 
 import { describeError } from '../describe-error'
+import { withOutboundAccount } from './outbound-account'
 import {
   classifyChannelInbound,
   classifyChatInbound,
@@ -204,7 +206,9 @@ export function createTeamsAdapter(options: TeamsAdapterOptions): TeamsAdapter {
     return false
   }
 
-  const outboundCallback = createOutboundCallback({ client, logger, reserveEcho })
+  const outboundCallback = withOutboundAccount(createOutboundCallback({ client, logger, reserveEcho }), (workspace) =>
+    fallbackChannelAccountIdentity('teams', workspace, self?.id),
+  )
   const historyCallback = createTeamsHistoryCallback({ client, logger, selfIdRef: () => self?.id ?? null })
   const editMessageCallback = createTeamsEditMessageCallback({ client })
 
@@ -236,6 +240,7 @@ export function createTeamsAdapter(options: TeamsAdapterOptions): TeamsAdapter {
   }
 
   const handleMessage = async (event: TeamsInboundEvent): Promise<void> => {
+    const selfSnapshot = self
     inflightInbounds++
     try {
       if (isSelfEcho(event)) {
@@ -249,10 +254,10 @@ export function createTeamsAdapter(options: TeamsAdapterOptions): TeamsAdapter {
         verdict =
           channel === null
             ? ({ kind: 'drop', reason: 'unknown_channel' } as const)
-            : classifyChannelInbound(event, options.configRef(), self, channel, aliases)
+            : classifyChannelInbound(event, options.configRef(), selfSnapshot, channel, aliases)
       } else {
         const chat = await resolveChat(event.chatId)
-        verdict = classifyChatInbound(event, options.configRef(), self, chat, aliases)
+        verdict = classifyChatInbound(event, options.configRef(), selfSnapshot, chat, aliases)
       }
       if (verdict.kind === 'drop') {
         logger.info(`[teams] dropped id=${event.id} reason=${verdict.reason}${dropHint(verdict.reason)}`)
@@ -261,7 +266,12 @@ export function createTeamsAdapter(options: TeamsAdapterOptions): TeamsAdapter {
       logger.info(
         `[teams] routed id=${event.id} ${event.conversationType}=${event.chatId} mention=${verdict.payload.isBotMention} dm=${verdict.payload.isDm}`,
       )
-      await options.router.route(verdict.payload)
+      await options.router.route({
+        ...verdict.payload,
+        accountIdentity: fallbackChannelAccountIdentity('teams', verdict.payload.workspace, selfSnapshot?.id),
+        eventKind: 'message',
+        revision: 'original',
+      })
     } catch (err) {
       logger.error(`[teams] handleInbound failed: ${describeError(err)}`)
     } finally {

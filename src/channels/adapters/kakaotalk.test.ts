@@ -17,7 +17,7 @@ import type {
   KakaoTypingResult,
 } from 'agent-messenger/kakaotalk'
 
-import { createChannelRouter, type ChannelRouter } from '@/channels/router'
+import { createChannelRouter as createRealChannelRouter, type ChannelRouter } from '@/channels/router'
 import { defaultHistoryConfig, type ChannelAdapterConfig } from '@/channels/schema'
 import type { TypingCallback } from '@/channels/types'
 
@@ -204,11 +204,20 @@ const adapterCfg = (over: Partial<ChannelAdapterConfig> = {}): ChannelAdapterCon
 })
 
 let agentDir: string
+const routers: ChannelRouter[] = []
+
+function createChannelRouter(options: Parameters<typeof createRealChannelRouter>[0]): ChannelRouter {
+  const router = createRealChannelRouter(options)
+  routers.push(router)
+  return router
+}
+
 beforeEach(async () => {
   agentDir = await mkdtemp(join(tmpdir(), 'typeclaw-kakao-adapter-'))
 })
 
 afterEach(async () => {
+  await Promise.all(routers.splice(0).map((router) => router.stop()))
   await rm(agentDir, { recursive: true, force: true })
 })
 
@@ -1014,6 +1023,7 @@ describe('createKakaotalkAdapter — author name resolution', () => {
     const routed: { authorName: string }[] = []
     router.route = async (event) => {
       routed.push({ authorName: event.authorName })
+      return { kind: 'accepted' as const, inputId: event.externalMessageId, generation: 0 }
     }
     const adapter = createKakaotalkAdapter({
       router,
@@ -1179,6 +1189,7 @@ describe('createKakaotalkAdapter — inbound attachments and emoticons', () => {
     const originalRoute = router.route
     router.route = async (event) => {
       routed.push(event)
+      return { kind: 'accepted' as const, inputId: event.externalMessageId, generation: 0 }
     }
     const adapter = createKakaotalkAdapter({
       router,

@@ -128,6 +128,7 @@ async function fixture() {
       ...KEY,
       text,
       externalMessageId: `message-${++messageId}`,
+      accountIdentity: 'review-account',
       authorId: 'human',
       authorName: 'Human',
       authorIsBot: false,

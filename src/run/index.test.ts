@@ -141,8 +141,14 @@ describe('startAgent', () => {
       return { result: undefined }
     }
 
-    const createChannelManagerFor = (): ChannelManager => ({
-      router: createChannelRouter({ agentDir: testCwd, configForAdapter: () => undefined }),
+    const createChannelManagerFor = (opts: ChannelManagerOptions): ChannelManager => ({
+      router: createChannelRouter({
+        agentDir: testCwd,
+        configForAdapter: () => undefined,
+        backgroundObligations: opts.backgroundObligations,
+        inboundJournal: opts.inboundJournal,
+        recoveryOutbox: opts.recoveryOutbox,
+      }),
       start: async () => {
         // A real sync read on the same lock — throws ELOCKED if the refresh
         // still owns the lock, which is exactly the boot race under test.
@@ -219,7 +225,13 @@ describe('startAgent', () => {
     // guard is installed but BEFORE startAgent returns, so the caller never gets
     // a stop() to call — the guard must self-dispose on the throw, not leak.
     const failingChannelManager = (opts: ChannelManagerOptions): ChannelManager => ({
-      router: createChannelRouter({ agentDir: testCwd, configForAdapter: () => undefined }),
+      router: createChannelRouter({
+        agentDir: testCwd,
+        configForAdapter: () => undefined,
+        backgroundObligations: opts.backgroundObligations,
+        inboundJournal: opts.inboundJournal,
+        recoveryOutbox: opts.recoveryOutbox,
+      }),
       start: async () => {
         void opts
         throw new Error('boot failure: channel manager start rejected')
@@ -267,8 +279,14 @@ describe('startAgent', () => {
 
   test('the resource sampler is torn down when boot fails after it starts', async () => {
     let stopped = 0
-    const failingChannelManager = (): ChannelManager => ({
-      router: createChannelRouter({ agentDir: testCwd, configForAdapter: () => undefined }),
+    const failingChannelManager = (opts: ChannelManagerOptions): ChannelManager => ({
+      router: createChannelRouter({
+        agentDir: testCwd,
+        configForAdapter: () => undefined,
+        backgroundObligations: opts.backgroundObligations,
+        inboundJournal: opts.inboundJournal,
+        recoveryOutbox: opts.recoveryOutbox,
+      }),
       start: async () => {
         throw new Error('boot failure: sampler cleanup')
       },
@@ -303,8 +321,14 @@ describe('startAgent', () => {
 
     // when a second agent B starts in the same process and fails after the
     // process globals are captured
-    const failingChannelManager = (): ChannelManager => ({
-      router: createChannelRouter({ agentDir: testCwd, configForAdapter: () => undefined }),
+    const failingChannelManager = (opts: ChannelManagerOptions): ChannelManager => ({
+      router: createChannelRouter({
+        agentDir: testCwd,
+        configForAdapter: () => undefined,
+        backgroundObligations: opts.backgroundObligations,
+        inboundJournal: opts.inboundJournal,
+        recoveryOutbox: opts.recoveryOutbox,
+      }),
       start: async () => {
         throw new Error('boot failure: second agent')
       },
@@ -602,8 +626,14 @@ describe('startAgent', () => {
       )
       reloadConfig(agentDir)
       const restarts: string[] = []
-      const createChannelManagerFor = (_opts: ChannelManagerOptions): ChannelManager => ({
-        router: createChannelRouter({ agentDir, configForAdapter: () => undefined }),
+      const createChannelManagerFor = (opts: ChannelManagerOptions): ChannelManager => ({
+        router: createChannelRouter({
+          agentDir,
+          configForAdapter: () => undefined,
+          backgroundObligations: opts.backgroundObligations,
+          inboundJournal: opts.inboundJournal,
+          recoveryOutbox: opts.recoveryOutbox,
+        }),
         start: async () => {},
         stop: async () => {},
         reload: async () => ({ started: [], stopped: [], restarted: [], restartRequired: [] }),
@@ -671,7 +701,13 @@ describe('startAgent', () => {
       const createChannelManagerFor = (opts: ChannelManagerOptions): ChannelManager => {
         channelOptions = opts
         return {
-          router: createChannelRouter({ agentDir, configForAdapter: () => undefined }),
+          router: createChannelRouter({
+            agentDir,
+            configForAdapter: () => undefined,
+            backgroundObligations: opts.backgroundObligations,
+            inboundJournal: opts.inboundJournal,
+            recoveryOutbox: opts.recoveryOutbox,
+          }),
           start: async () => {},
           stop: async () => {},
           reload: async () => ({ started: [], stopped: [], restarted: [], restartRequired: [] }),

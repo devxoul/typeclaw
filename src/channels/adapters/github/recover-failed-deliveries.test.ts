@@ -127,7 +127,7 @@ describe('recoverFailedGithubDeliveries', () => {
       fetchImpl: Object.assign(async () => Response.json({ draft: true }), { preconnect: () => {} }) as typeof fetch,
       scheduleBackgroundTask: (task) => tasks.push(task),
       logger: { info: () => {}, warn: () => {}, error: () => {} },
-      route: () => {
+      route: async () => {
         throw new Error('draft recovery must not route a conversational inbound')
       },
     }
@@ -181,7 +181,7 @@ describe('recoverFailedGithubDeliveries', () => {
       fetchImpl: Object.assign(async () => Response.json({ draft: false }), { preconnect: () => {} }) as typeof fetch,
       scheduleBackgroundTask: (task) => tasks.push(task),
       logger: { info: () => {}, warn: () => {}, error: () => {} },
-      route: () => {
+      route: async () => {
         throw new Error('draft recovery must not route a conversational inbound')
       },
     }
@@ -242,7 +242,7 @@ describe('recoverFailedGithubDeliveries', () => {
       ) as typeof fetch,
       scheduleBackgroundTask: (task) => tasks.push(task),
       logger: { info: () => {}, warn: () => {}, error: () => {} },
-      route: () => {
+      route: async () => {
         throw new Error('draft recovery must not route a conversational inbound')
       },
     }

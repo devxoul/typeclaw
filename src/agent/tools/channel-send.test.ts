@@ -14,7 +14,7 @@ function fakeRouter(
   } = {},
 ): ChannelRouter {
   return {
-    route: async () => {},
+    route: async () => ({ kind: 'observed' }),
     acceptBackgroundResponse: async () => {
       throw new Error('Unexpected background admission')
     },

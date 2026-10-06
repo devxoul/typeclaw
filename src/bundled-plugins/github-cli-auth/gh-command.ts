@@ -1470,6 +1470,11 @@ export function effectiveGhTokensForAuthenticatedUserEndpoint(
   return result
 }
 
+export function effectiveGhTokensForCommand(command: string, env: GhAuthEnv): Array<string | undefined> {
+  const tokens = tokenize(command)
+  return findGhInvocations(tokens).map((start) => effectiveGhTokenForInvocation(tokens, start, env))
+}
+
 export function usesGhApiAuthenticatedUserEndpoint(command: string): boolean {
   return effectiveGhTokensForAuthenticatedUserEndpoint(command, {}).length > 0
 }

@@ -29,7 +29,7 @@ type FakeRouterOptions = {
 function makeRouter(options: FakeRouterOptions = {}): ChannelRouter {
   const attachments = options.attachments ?? []
   return {
-    route: async () => {},
+    route: async () => ({ kind: 'observed' }),
     acceptBackgroundResponse: async () => {
       throw new Error('Unexpected background admission')
     },

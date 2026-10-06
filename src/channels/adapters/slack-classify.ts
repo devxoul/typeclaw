@@ -29,11 +29,14 @@ export type SlackInboundContext = {
   conversationType?: SlackConversationType
 }
 
+import { normalizeSlackInbound, slackInboundRevision } from './slack-inbound-revision'
+
 export function classifyInbound(
   event: SlackInboundMessageEvent,
   _config: ChannelAdapterConfig,
   context: SlackInboundContext,
 ): InboundClassification {
+  event = normalizeSlackInbound(event)
   if (context.selfUserId !== null && event.user === context.selfUserId) return { kind: 'drop', reason: 'self_author' }
   if (event.user === undefined || event.user === '') return { kind: 'drop', reason: 'no_user' }
   if (!isRouteableSlackMessageSubtype(event.subtype)) return { kind: 'drop', reason: 'slack_system_message' }
@@ -63,6 +66,9 @@ export function classifyInbound(
       text,
       ...(attachments.length > 0 ? { attachments } : {}),
       externalMessageId: event.ts,
+      accountIdentity: `slack:${context.teamId}:${context.selfUserId}`,
+      eventKind: 'message',
+      revision: slackInboundRevision(event),
       reactionRef: encodeSlackReactionRef({ channel: event.channel, ts: event.ts }),
       authorId: event.user,
       authorName: event.user,

@@ -4,7 +4,10 @@ import { describeError } from './describe-error'
 // singleton would leak resolver state across tests. One instance is created in
 // run/index.ts and threaded to both the plugin loader and the channel manager.
 
-export type GithubTokenResolveResult = { kind: 'token'; token: string } | { kind: 'unavailable'; reason: string }
+export type GithubTokenCredential = { token: string; accountIdentity?: string }
+export type GithubTokenResolveResult =
+  | ({ kind: 'token' } & GithubTokenCredential)
+  | { kind: 'unavailable'; reason: string }
 
 export type ResolveGithubTokenForRepo = (repoSlug: string) => Promise<GithubTokenResolveResult>
 
@@ -16,7 +19,10 @@ export type GithubTokenBridge = {
   // process-wide GH_TOKEN, so brokered gh paths cannot rely on its prefix.
   hasAppTokenResolver: () => boolean
   getAppSelfLogin: () => string | null
-  registerResolver: (resolver: (repoSlug: string) => Promise<string>, selfLogin?: () => string | null) => () => void
+  registerResolver: (
+    resolver: (repoSlug: string) => Promise<GithubTokenCredential>,
+    selfLogin?: () => string | null,
+  ) => () => void
 }
 
 const NO_RESOLVER_REASON =
@@ -24,7 +30,7 @@ const NO_RESOLVER_REASON =
   'Check `typeclaw logs` and `secrets.json#channels.github`.'
 
 export function createGithubTokenBridge(): GithubTokenBridge {
-  let current: ((repoSlug: string) => Promise<string>) | null = null
+  let current: ((repoSlug: string) => Promise<GithubTokenCredential>) | null = null
   let currentSelfLogin: (() => string | null) | null = null
 
   return {
@@ -32,8 +38,8 @@ export function createGithubTokenBridge(): GithubTokenBridge {
       const resolver = current
       if (resolver === null) return { kind: 'unavailable', reason: NO_RESOLVER_REASON }
       try {
-        const token = await resolver(repoSlug)
-        return { kind: 'token', token }
+        const credential = await resolver(repoSlug)
+        return { kind: 'token', ...credential }
       } catch (err) {
         return { kind: 'unavailable', reason: describeError(err) }
       }

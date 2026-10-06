@@ -136,6 +136,42 @@ describe('createSlackDedupe', () => {
     expect(dedupe.check(mentioned, true)).toBe('channel_ts')
   })
 
+  test('failed admission releases every synchronously associated retry alias', () => {
+    const dedupe = createSlackDedupe()
+    const event = { channel: 'C0', ts: 't1', client_msg_id: 'X', text: '<@UBOT> 질문' }
+    const pending = dedupe.reserve(event, true)
+    expect(dedupe.check({ ...event, ts: 't2' }, true)).toBe('client_msg_id')
+    pending.rollback()
+    expect(dedupe.check(event, true)).toBeNull()
+    expect(dedupe.check({ ...event, ts: 't2', client_msg_id: undefined }, true)).toBeNull()
+  })
+
+  test('failed promotion restores observation without retiring a successful concurrent mention', () => {
+    const event = { channel: 'C0', ts: 't1', client_msg_id: 'X', text: '질문' }
+    const edited = { ...event, text: '<@UBOT> 질문' }
+    const dedupe = createSlackDedupe()
+    dedupe.mark(event)
+    const promotion = dedupe.reserve(edited, true)
+    promotion.rollback()
+    expect(dedupe.check(event)).toBe('client_msg_id')
+    expect(dedupe.check(edited, true)).toBeNull()
+    const observation = dedupe.reserve({ ...event, ts: 't2', client_msg_id: 'Y' })
+    const mention = dedupe.reserve({ ...edited, ts: 't2', client_msg_id: 'Y' }, true)
+    mention.commit()
+    observation.rollback()
+    expect(dedupe.check({ ...edited, ts: 't3', client_msg_id: 'Y' }, true)).toBe('client_msg_id')
+  })
+
+  test('concurrent observation and promotion failures do not retain a phantom admission', () => {
+    const dedupe = createSlackDedupe()
+    const event = { channel: 'C0', ts: 't1', client_msg_id: 'X', text: '질문' }
+    const observation = dedupe.reserve(event)
+    const promotion = dedupe.reserve({ ...event, text: '<@UBOT> 질문' }, true)
+    observation.rollback()
+    promotion.rollback()
+    expect(dedupe.check(event)).toBeNull()
+  })
+
   test('default capacity matches the published constant', () => {
     expect(SLACK_DEDUPE_CAPACITY).toBe(256)
   })

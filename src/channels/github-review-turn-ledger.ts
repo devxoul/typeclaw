@@ -7,9 +7,12 @@
 // turn start, so a claim must be backed by an action in the SAME turn.
 
 import type { BackgroundObligationRef } from './background-obligations'
+import type { InboundRef } from './inbound-journal'
 
 export type ReviewResultCoverage = {
+  inboundCoverage?: InboundRef[]
   backgroundCoverage?: BackgroundObligationRef[]
+  expectedAccountIdentity?: string
 }
 
 let reviewCoverageCapture: ((sessionId: string) => Promise<ReviewResultCoverage>) | null = null
@@ -20,7 +23,13 @@ export function setReviewCoverageCapture(capture: typeof reviewCoverageCapture):
 
 export async function captureReviewResultCoverage(sessionId: string): Promise<ReviewResultCoverage> {
   const coverage = await reviewCoverageCapture?.(sessionId)
-  return { backgroundCoverage: coverage?.backgroundCoverage?.map((ref) => ({ ...ref })) ?? [] }
+  return {
+    inboundCoverage: coverage?.inboundCoverage?.map((ref) => ({ ...ref })) ?? [],
+    backgroundCoverage: coverage?.backgroundCoverage?.map((ref) => ({ ...ref })) ?? [],
+    ...(coverage?.expectedAccountIdentity !== undefined
+      ? { expectedAccountIdentity: coverage.expectedAccountIdentity }
+      : {}),
+  }
 }
 
 export type ReviewVerdict = 'APPROVE' | 'REQUEST_CHANGES'
@@ -133,6 +142,7 @@ export async function recordReview(
     workspace: args.workspace,
     prNumber: args.prNumber,
     state: args.verdict,
+    ...(args.inboundCoverage !== undefined ? { inboundCoverage: args.inboundCoverage } : {}),
     ...(args.backgroundCoverage !== undefined ? { backgroundCoverage: args.backgroundCoverage } : {}),
   })
 }

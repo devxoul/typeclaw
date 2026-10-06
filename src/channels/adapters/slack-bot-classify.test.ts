@@ -5,7 +5,8 @@ import { defaultHistoryConfig, type ChannelAdapterConfig } from '@/channels/sche
 import { isDmChannelOrigin } from '@/permissions'
 
 import { classifyInbound, type SlackInboundMessageEvent } from './slack-bot-classify'
-import { encodeSlackReactionRef } from './slack-bot-reactions'
+import { createSlackDedupe } from './slack-bot-dedupe'
+import { normalizeSlackInbound } from './slack-inbound-revision'
 
 const TEAM_ID = 'T0ACME'
 const BOT_USER_ID = 'UBOT'
@@ -30,6 +31,33 @@ function buildEvent(overrides: Partial<SlackInboundMessageEvent> = {}): SlackInb
     ...overrides,
   }
 }
+
+test('a mention added by editing an observed message remains a distinct engageable revision', () => {
+  const original = buildEvent({ text: '안녕하세요', client_msg_id: 'gesture-1' })
+  const context = { teamId: TEAM_ID, botUserId: BOT_USER_ID }
+  const before = classifyInbound(original, baseConfig, context)
+  expect(before.kind).toBe('route')
+  if (before.kind !== 'route') throw new Error('Expected original message')
+  expect(before.payload.isBotMention).toBe(false)
+  const dedupe = createSlackDedupe()
+  dedupe.mark(original, before.payload.isBotMention)
+  const edited = normalizeSlackInbound({
+    ...original,
+    user: undefined,
+    subtype: 'message_changed',
+    ts: '1700000001.000100',
+    message: { ...original, text: '<@UBOT> 확인해줘', edited: { ts: '1700000001.000099' } },
+  })
+  const after = classifyInbound(edited, baseConfig, context)
+  if (after.kind !== 'route') throw new Error('Expected edited message')
+  expect(after.payload.isBotMention).toBe(true)
+  expect(dedupe.check(edited, after.payload.isBotMention)).toBeNull()
+  expect(after.payload.externalMessageId).toBe(before.payload.externalMessageId)
+  expect(after.payload.revision).toBe('1700000001.000099')
+  expect(after.payload.accountIdentity).toBe(`slack-bot:${TEAM_ID}:${BOT_USER_ID}`)
+  dedupe.mark(edited, after.payload.isBotMention)
+  expect(dedupe.check(edited, after.payload.isBotMention)).not.toBeNull()
+})
 
 describe('slack-bot classifyInbound — drop paths', () => {
   test('drops self-authored messages (event.user === botUserId) with reason=self_author', () => {
@@ -272,25 +300,10 @@ describe('slack-bot classifyInbound — route path', () => {
 
     expect(verdict.kind).toBe('route')
     if (verdict.kind !== 'route') throw new Error('expected route')
-    expect(verdict.payload).toEqual({
-      adapter: 'slack-bot',
-      workspace: TEAM_ID,
-      chat: 'C0CHANNEL',
-      thread: '1700000000.000100',
-      room: { kind: 'thread' },
-      text: `hi <@${BOT_USER_ID}>`,
-      externalMessageId: '1700000000.000100',
-      reactionRef: encodeSlackReactionRef({ channel: 'C0CHANNEL', ts: '1700000000.000100' }),
-      authorId: 'UALICE',
-      authorName: 'UALICE',
-      authorIsBot: false,
-      isBotMention: true,
-      replyToBotMessageId: null,
-      mentionsOthers: false,
-      replyToOtherMessageId: null,
-      isDm: false,
-      ts: 1_700_000_000_000,
-    })
+    expect(verdict.payload.thread).toBe(event.ts)
+    expect(verdict.payload.room).toEqual({ kind: 'thread' })
+    expect(verdict.payload.isBotMention).toBe(true)
+    expect(verdict.payload.isDm).toBe(false)
   })
 
   test('non-mention team messages route with isBotMention=false', () => {

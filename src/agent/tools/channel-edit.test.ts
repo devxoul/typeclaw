@@ -7,7 +7,7 @@ import { createChannelEditTool } from './channel-edit'
 
 function fakeRouter(handler: (req: EditMessageRequest) => Promise<EditMessageResult>): ChannelRouter {
   return {
-    route: async () => {},
+    route: async () => ({ kind: 'observed' }),
     send: async () => ({ ok: true }),
     getConsecutiveSendCount: () => 0,
     getSendRate: () => ({ count: 0, windowMs: 5_000 }),

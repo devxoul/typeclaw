@@ -252,3 +252,58 @@ test('stop during in-flight real-router send retains remote receipt and never re
     await f.cleanup()
   }
 })
+
+test('inbound-covered notice cannot dispatch without its journal authority', async () => {
+  const f = await fixture()
+  try {
+    await f.outbox.suppress(f.notice.deliveryId, 'test-replacement', 'replacement')
+    const inbound = createRecoveryNotice({
+      ...f.notice,
+      covers: [{ store: 'inbound', id: 'request', generation: 1 }],
+      transferId: 'inbound-transfer',
+      recoveryGeneration: 'inbound-generation',
+    })
+    await f.outbox.import(inbound)
+    await f.dispatcher.wake()
+    await f.error.promise
+    await f.dispatcher.stop()
+    expect(f.sent).toEqual([])
+    expect(await f.outbox.get(inbound.deliveryId)).toMatchObject({ state: 'pending', attempts: 0 })
+  } finally {
+    await f.cleanup()
+  }
+})
+
+test('journal failure during transport preflight prevents leasing while independent inventory progresses', async () => {
+  const f = await fixture()
+  const entered = Promise.withResolvers<void>()
+  const release = Promise.withResolvers<void>()
+  const validate = f.router.validateRecovery.bind(f.router)
+  f.router.validateRecovery = async (record) => {
+    if (record.deliveryId === f.notice.deliveryId) {
+      entered.resolve()
+      await release.promise
+    }
+    return validate(record)
+  }
+  try {
+    const independent = createRecoveryNotice({
+      ...f.notice,
+      covers: [{ store: 'inventory', id: 'independent-preflight', generation: 1 }],
+      transferId: 'independent-preflight',
+      recoveryGeneration: 'independent-preflight',
+    })
+    await f.outbox.import(independent)
+    await f.dispatcher.wake()
+    await entered.promise
+    f.source.setFrozen(new Error('journal became unreadable during metadata lookup'))
+    release.resolve()
+    await f.delivered.promise
+    await f.dispatcher.stop()
+    expect(await f.outbox.get(f.notice.deliveryId)).toMatchObject({ state: 'pending', attempts: 0 })
+    expect(f.sent).toEqual([independent.deliveryId])
+  } finally {
+    release.resolve()
+    await f.cleanup()
+  }
+})
