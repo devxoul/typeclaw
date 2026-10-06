@@ -22,6 +22,7 @@ import type { KakaoAccountCredentials, KakaoConfig, PendingLoginState } from 'ag
 import { prependQuoteAnchor, type ChannelRouter } from '@/channels/router'
 import type { ChannelAdapterConfig } from '@/channels/schema'
 import type {
+  ChannelSelfIdentityResolver,
   ChannelHistoryMessage,
   FetchHistoryArgs,
   FetchHistoryResult,
@@ -361,6 +362,7 @@ export function createKakaotalkAdapter(options: KakaotalkAdapterOptions): Kakaot
     })
   let listener: KakaoTalkListener | null = null
   let selfUserId: string | null = null
+  const selfIdentityResolver: ChannelSelfIdentityResolver = () => (selfUserId === null ? null : { id: selfUserId })
   let connected = false
   let started = false
   let lastConnectedAt: number | null = null
@@ -678,6 +680,7 @@ export function createKakaotalkAdapter(options: KakaotalkAdapterOptions): Kakaot
       // but outboundCallback would still send via a dead client). Stop()
       // unregisters in the inverse order.
       options.router.registerOutbound('kakaotalk', outboundCallback)
+      options.router.registerSelfIdentity('kakaotalk', selfIdentityResolver)
       options.router.registerTyping('kakaotalk', typing.callback)
       options.router.setTypingCapability('kakaotalk', true)
       // KakaoTalk expires the indicator ~5s after the last packet, faster than
@@ -694,6 +697,7 @@ export function createKakaotalkAdapter(options: KakaotalkAdapterOptions): Kakaot
       if (!started) return
       started = false
       options.router.unregisterOutbound('kakaotalk', outboundCallback)
+      options.router.unregisterSelfIdentity('kakaotalk', selfIdentityResolver)
       options.router.unregisterTyping('kakaotalk', typing.callback)
       options.router.setTypingCapability('kakaotalk', false)
       typing.reset()

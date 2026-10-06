@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { basename, join } from 'node:path'
 
 import type { ClaimedBackgroundInventory } from './background-handoff'
-import { BackgroundHandoffInventory } from './background-handoff'
+import { BackgroundHandoffInventory, resolveBackgroundRecoveryIdentity } from './background-handoff'
 
 const directories: string[] = []
 afterEach(async () => {
@@ -51,6 +51,37 @@ async function claimOne(inventory: BackgroundHandoffInventory): Promise<ClaimedB
 }
 
 describe('durable running-child inventory', () => {
+  test('sibling identities remain per task and resolution follows surviving evidence', async () => {
+    const { writer, boot, input } = await fixture()
+    const first = await writer.add({ ...input, accountIdentity: '' })
+    await writer.add({ ...input, taskId: 'bound', accountIdentity: 'actor-A' })
+    const conflict = await writer.add({ ...input, taskId: 'conflict', accountIdentity: 'actor-B' })
+    await writer.add({ ...input, taskId: 'bound', accountIdentity: 'actor-C' })
+    await writer.remove(conflict)
+    await writer.remove(first)
+    const claim = await claimOne(boot)
+    expect(claim.record.accountIdentity).toBeUndefined()
+    expect(claim.record.tasks.map((task) => task.accountIdentity)).toEqual(['actor-A'])
+    expect(resolveBackgroundRecoveryIdentity(claim.record)).toEqual({ accountIdentity: 'actor-A' })
+  })
+
+  test('legacy group evidence only fills absent task identities and is not rewritten', async () => {
+    const { writer, boot, input, pendingDirectory } = await fixture()
+    await writer.add(input)
+    const path = await pendingPath(pendingDirectory)
+    const legacy = JSON.parse(await readFile(path, 'utf8'))
+    legacy.accountIdentity = 'legacy-actor'
+    delete legacy.tasks[0].accountIdentity
+    await writeFile(path, JSON.stringify(legacy))
+    await writer.add({ ...input, taskId: 'explicit-unbound' })
+    const claim = await claimOne(boot)
+    expect(claim.record.accountIdentity).toBe('legacy-actor')
+    expect(claim.record.tasks.map((task) => task.accountIdentity)).toEqual([undefined, 'unbound-legacy'])
+    expect(resolveBackgroundRecoveryIdentity(claim.record)).toEqual({ accountIdentity: 'legacy-actor' })
+    expect(resolveBackgroundRecoveryIdentity({ ...claim.record, tasks: [claim.record.tasks[1]!] })).toEqual({
+      accountIdentity: 'unbound-legacy',
+    })
+  })
   test('publishes complete sibling payload once and removes only terminal tasks', async () => {
     const { writer, boot, input } = await fixture()
     const first = await writer.add({
@@ -65,7 +96,9 @@ describe('durable running-child inventory', () => {
     const claim = await claimOne(boot)
     expect(claim.record.parentSessionFile).toBe('parent.jsonl')
     expect(claim.record.triggeringAuthorId).toBe('latest-author')
-    expect(claim.record.tasks).toEqual([{ taskId: 'second', subagentName: 'other', startedAt: 1 }])
+    expect(claim.record.tasks).toEqual([
+      { taskId: 'second', subagentName: 'other', startedAt: 1, accountIdentity: 'unbound-legacy' },
+    ])
     expect(await boot.claim()).toEqual([])
   })
 
@@ -119,22 +152,56 @@ describe('durable running-child inventory', () => {
     expect(newClaim.record.tasks.map((task) => task.taskId)).toEqual(['fresh'])
   })
 
-  test('skips current process work and rejects mixing prior-epoch launches', async () => {
-    const { writer, boot, input } = await fixture()
-    await writer.add(input)
+  test('prior-process evidence is durably claimed without denying fresh launch admission', async () => {
+    const { writer, boot, input, pendingDirectory } = await fixture()
+    const old = await writer.add(input)
+    const before = await readFile(await pendingPath(pendingDirectory), 'utf8')
     expect(await writer.claim()).toEqual([])
-    await expect(boot.add({ ...input, taskId: 'new' })).rejects.toThrow()
+    const fresh = await boot.add({ ...input, taskId: 'new' })
     const claim = await claimOne(boot)
-    expect(claim.record.tasks.map((task) => task.taskId)).toEqual(['first'])
+    expect(await readFile(claim.claimPath, 'utf8')).toBe(before)
+    expect(claim.record.generationId).toBe(old.generationId)
+    const pending = JSON.parse(await readFile(await pendingPath(pendingDirectory), 'utf8'))
+    expect(pending.generationId).toBe(fresh.generationId)
+    expect(pending.tasks.map((task: { taskId: string }) => task.taskId)).toEqual(['new'])
   })
 
-  test('invalid transcript fails admission and failed queue operation does not block later work', async () => {
-    const { writer, boot, input } = await fixture()
-    await expect(writer.add({ ...input, parentSessionFile: `bad${String.fromCharCode(0)}.jsonl` })).rejects.toThrow()
-    await expect(writer.add({ ...input, parentSessionFile: '.jsonl' })).rejects.toThrow()
+  test('unreadable evidence is retained byte-identically while fresh admission succeeds', async () => {
+    for (const corrupt of ['{broken', JSON.stringify({ schemaVersion: 1, tasks: [] })]) {
+      const { writer, boot, input, pendingDirectory, errors } = await fixture()
+      await writer.add(input)
+      const path = await pendingPath(pendingDirectory)
+      await writeFile(path, corrupt)
+      const fresh = await boot.add({ ...input, taskId: 'new' })
+      const claimedDirectory = join(pendingDirectory, 'claimed')
+      const files = await readdir(claimedDirectory)
+      expect(files).toHaveLength(1)
+      expect(await readFile(join(claimedDirectory, files[0]!), 'utf8')).toBe(corrupt)
+      const pending = JSON.parse(await readFile(path, 'utf8'))
+      expect(pending.generationId).toBe(fresh.generationId)
+      expect(pending.tasks.map((task: { taskId: string }) => task.taskId)).toEqual(['new'])
+      expect(errors.map(String)).toEqual([expect.stringContaining('Malformed background inventory')])
+    }
+  })
+
+  test('failed evidence archival prevents overwriting the prior source', async () => {
+    const { writer, boot, input, pendingDirectory } = await fixture()
     await writer.add(input)
-    const claim = await claimOne(boot)
-    expect(claim.record.tasks.map((task) => task.taskId)).toEqual(['first'])
+    const path = await pendingPath(pendingDirectory)
+    const before = await readFile(path, 'utf8')
+    await writeFile(join(pendingDirectory, 'claimed'), 'not a directory')
+    await expect(boot.add({ ...input, taskId: 'new' })).rejects.toThrow()
+    expect(await readFile(path, 'utf8')).toBe(before)
+  })
+
+  test('missing and invalid transcript metadata do not prevent durable launch inventory', async () => {
+    for (const parentSessionFile of [undefined, `bad${String.fromCharCode(0)}.jsonl`, '.jsonl']) {
+      const { writer, boot, input } = await fixture()
+      await writer.add({ ...input, parentSessionFile })
+      const claim = await claimOne(boot)
+      expect(claim.record.parentSessionFile).toBeUndefined()
+      expect(claim.record.tasks.map((task) => task.taskId)).toEqual(['first'])
+    }
   })
 
   test('malformed, mismatched hash, and traversal records are isolated from valid parents', async () => {
@@ -187,7 +254,7 @@ describe('durable running-child inventory', () => {
     expect(await readFile(protectedFile, 'utf8')).toBe('keep')
   })
 
-  test('independent boot processes own all siblings once and old retirement preserves new work', async () => {
+  test('successive boot processes reclaim siblings and old retirement preserves new work', async () => {
     const { directory, writer, input, pendingDirectory } = await fixture()
     await writer.add(input)
     await writer.add({ ...input, taskId: 'second' })
@@ -199,20 +266,20 @@ describe('durable running-child inventory', () => {
 const inventory = new BackgroundHandoffInventory(process.argv[2], {processEpoch: process.argv[3]});
 console.log(JSON.stringify(await inventory.claim()));`,
     )
-    const processes = Array.from({ length: 6 }, (_, index) =>
-      Bun.spawn([process.execPath, worker, directory, `boot-${index}`], { stdout: 'pipe', stderr: 'pipe' }),
-    )
-    const results = await Promise.all(
-      processes.map(async (child) => {
-        const output = await new Response(child.stdout).text()
-        const error = await new Response(child.stderr).text()
-        expect(await child.exited).toBe(0)
-        expect(error).toBe('')
-        return JSON.parse(output) as ClaimedBackgroundInventory[]
-      }),
-    )
-    const claims = results.flat()
-    expect(claims).toHaveLength(1)
+    const results: ClaimedBackgroundInventory[][] = []
+    for (let index = 0; index < 3; index++) {
+      const child = Bun.spawn([process.execPath, worker, directory, `boot-${index}`], {
+        stdout: 'pipe',
+        stderr: 'pipe',
+      })
+      const output = await new Response(child.stdout).text()
+      const error = await new Response(child.stderr).text()
+      expect(await child.exited).toBe(0)
+      expect(error).toBe('')
+      results.push(JSON.parse(output) as ClaimedBackgroundInventory[])
+    }
+    expect(results.map((claims) => claims.length)).toEqual([1, 1, 1])
+    const claims = results[2]!
     expect(claims[0]!.record.tasks.map((task) => task.taskId)).toEqual(['first', 'second'])
     const fresh = await writer.add({ ...input, taskId: 'fresh' })
     const retireWorker = join(directory, 'retire-worker.ts')
@@ -252,13 +319,16 @@ await new Response(Bun.stdin.stream()).text();`,
     try {
       expect(new TextDecoder().decode((await reader.read()).value).trimEnd()).toBe('published')
       child.kill('SIGKILL')
-      await child.exited
+      expect(await child.exited).not.toBe(0)
+      if (process.platform !== 'win32') expect(child.signalCode).toBe('SIGKILL')
+      expect(await new Response(child.stderr).text()).toBe('')
       const claim = await claimOne(boot)
       expect(claim.record.processEpoch).toBe('killed-writer')
       expect(claim.record.tasks.map((task) => task.taskId)).toEqual(['first'])
       expect(await boot.claim()).toEqual([])
     } finally {
-      child.kill()
+      child.kill('SIGKILL')
+      await child.exited
       reader.releaseLock()
     }
   })

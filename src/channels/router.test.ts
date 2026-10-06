@@ -8983,6 +8983,109 @@ describe('ChannelRouter duplicate-send guard', () => {
     expect(sys).toEqual({ ok: true })
     expect(delivered).toBe(2)
   })
+  test('recovery transport preserves a live turn send budget and duplicate lock', async () => {
+    const dir = await tempDir()
+    const { router } = makeRouter(dir)
+    const seen: OutboundMessage[] = []
+    router.registerOutbound('discord-bot', async (message) => {
+      seen.push(message)
+      return { ok: true }
+    })
+    await router.route(inbound())
+    await router.__testing!.flushDebounce(KEY)
+    await router.send({ ...KEY, text: 'live answer' })
+    const before = router.getConsecutiveSendCount(KEY)
+    await router.send(
+      { ...KEY, text: 'old interrupted work' },
+      {
+        accounting: 'recovery',
+        outputKind: 'meta',
+        deliveryId: 'old-delivery',
+        coveredIds: ['old-work'],
+        expectedAccountIdentity: 'actor',
+      },
+    )
+    expect(router.getConsecutiveSendCount(KEY)).toBe(before)
+    const duplicate = await router.send({ ...KEY, text: 'live answer' })
+    expect(duplicate.ok).toBe(false)
+    expect(seen.map((message) => message.text)).toEqual(['live answer', 'old interrupted work'])
+  })
+  test('recovery preserves held live promise, leaf, skip and reaction ownership', async () => {
+    for (const mode of ['promise', 'skip']) {
+      const dir = await tempDir()
+      const entered = Promise.withResolvers<void>()
+      const release = Promise.withResolvers<void>()
+      const { router, sessions } = makeRouter(dir, {
+        onSessionCreated: (session) => {
+          session.onPrompt = async () => {
+            entered.resolve()
+            await release.promise
+          }
+        },
+      })
+      router.registerOutbound('discord-bot', async () => ({
+        ok: true,
+        reactionRef: { adapter: 'discord-bot', value: 'status-message' },
+      }))
+      router.registerReaction('discord-bot', async () => ({
+        ok: true,
+        reactionRef: { adapter: 'discord-bot', value: 'owned-reaction' },
+      }))
+      await router.route(inbound())
+      const drain = router.__testing!.flushDebounce(KEY)
+      await entered.promise
+      try {
+        if (mode === 'promise') {
+          await router.send({ ...KEY, text: "I'll check and get back to you." })
+          await sessions[0]!.agent.afterToolCall!({
+            assistantMessage: assistantMessage(''),
+            toolCall: {
+              type: 'toolCall',
+              id: 'promise',
+              name: 'channel_reply',
+              arguments: { text: "I'll check and get back to you." },
+            },
+            args: { text: "I'll check and get back to you." },
+            result: {
+              content: [{ type: 'text', text: 'delivered' }],
+              details: { ok: true, more_work_this_turn: true },
+            },
+            isError: false,
+            context: { messages: [] },
+          })
+        } else {
+          const mappings = await loadChannelSessions(dir)
+          const parentSessionId = mappings[0]?.sessionId
+          if (parentSessionId === undefined) throw new Error('live turn did not persist its parent session')
+          router.markTurnSkipped({ parentSessionId, reason: 'intentional quiet' })
+        }
+        const before = router.__testing!.getRecoveryAccountingSnapshot(KEY)
+        expect(before).toBeDefined()
+        if (mode === 'promise') {
+          expect(before?.promisedWorkOutstandingThisLogicalTurn).toBe(true)
+          expect(before?.continuationReactions).toHaveLength(1)
+        } else {
+          expect(before?.skippedTurn).toMatchObject({ reason: 'intentional quiet' })
+        }
+        await router.send(
+          { ...KEY, text: 'historical notice' },
+          {
+            accounting: 'recovery',
+            source: 'system',
+            outputKind: 'meta',
+            deliveryId: 'historic',
+            coveredIds: ['old-child'],
+            expectedAccountIdentity: 'actor',
+          },
+        )
+        expect(router.__testing!.getRecoveryAccountingSnapshot(KEY)).toEqual(before)
+      } finally {
+        release.resolve()
+        await drain
+        await router.stop()
+      }
+    }
+  })
 })
 
 describe('ChannelRouter outbound flood guard', () => {

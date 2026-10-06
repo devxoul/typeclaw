@@ -10,6 +10,19 @@ Part of the [channel adapters](/docs/reference/channel-adapters) family.
 
 Transport: **Socket Mode** (no public URL required). Setup walkthrough: [Add a channel](/docs/guides/add-a-channel).
 
+## Crash recovery correlation
+
+Interruption notices carry opaque Slack message metadata (`typeclaw_recovery`).
+Recovery checks every history page in the exact channel or thread and accepts only
+the authenticated bot user's matching delivery ID. History read failures are not
+evidence of absence. The bot account is revalidated before each recovery send.
+Delivery remains at-least-once: deleted or unavailable metadata can lead to a
+duplicate notice after an ambiguous send. Ordinary replies are unchanged.
+Direct-message workspace coordinates use a sentinel; account identity still comes
+from the authenticated team and bot user. Background admission reads that cached
+identity without calling Slack, and an unavailable cache leaves the launch
+admissible with an unbound recovery record.
+
 ## Auth
 
 Two tokens, both stored in [`secrets.json`](/docs/reference/secrets-json):

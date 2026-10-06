@@ -1,3 +1,4 @@
+import type { RecoveryFailure, RecoveryRecord } from './continuity-types'
 import type { AdapterId } from './schema'
 
 export type ChannelKey = {
@@ -255,6 +256,32 @@ export type OutboundAttachment = {
   filename?: string
 }
 
+export type SendOptions =
+  | {
+      accounting?: 'live-turn'
+      sessionId?: string
+      turnId?: string
+      claimGeneration?: number
+      coveredIds?: readonly string[]
+    }
+  | { accounting: 'recovery'; deliveryId: string; coveredIds: readonly string[]; expectedAccountIdentity: string }
+
+export type RecoveryReconcileResult =
+  | { status: 'found'; messageId?: string; messageIds?: readonly string[] }
+  | { status: 'unknown' | 'unreconcilable' }
+
+export class RecoveryTransportError extends Error {
+  constructor(readonly failure: RecoveryFailure) {
+    super(failure.safeReason)
+  }
+}
+
+export type RecoveryAdapterCallbacks = {
+  accountIdentity: (workspace?: string) => Promise<string | undefined>
+  cachedAccountIdentity?: (workspace?: string) => string | undefined
+  reconcile: (record: RecoveryRecord) => Promise<RecoveryReconcileResult>
+}
+
 export type OutboundMessage = {
   adapter: AdapterId
   workspace: string
@@ -285,6 +312,7 @@ export type OutboundMessage = {
   // send time (KakaoTalk: payload built from a source message that may have
   // scrolled out of history) degrade to the same blockquote fallback.
   replyTo?: OutboundReplyTo
+  sendOptions?: SendOptions
 }
 
 export type OutboundReplyTo = {
@@ -332,7 +360,7 @@ export type SendErrorCode =
 // removal-instance ref returned by `ReactionResult.reactionRef` after an add.
 export type SendResult =
   | { ok: true; messageId?: string; messageIds?: readonly string[]; reactionRef?: ReactionRef }
-  | { ok: false; error: string; code?: SendErrorCode }
+  | { ok: false; error: string; code?: SendErrorCode; recoveryFailure?: RecoveryFailure }
 
 export type OutboundCallback = (msg: OutboundMessage) => Promise<SendResult>
 

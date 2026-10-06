@@ -51,6 +51,8 @@ function lifecycleRouter(): ChannelRouter {
     executeCommand: async () => ({ kind: 'unknown-command' }),
     registerOutbound: noop,
     unregisterOutbound: noop,
+    registerRecoveryAdapter: noop,
+    unregisterRecoveryAdapter: noop,
     registerReaction: noop,
     unregisterReaction: noop,
     registerRemoveReaction: noop,

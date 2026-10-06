@@ -11,9 +11,9 @@ export { restartHandoffPath } from './paths'
 export const RESTART_HANDOFF_TTL_MS = 60_000
 
 // Serialize ordinary restart-handoff reads and writes within one process.
-// This is not a cross-process lock. Background launch inventory has its own
-// per-parent serialization and contributes non-TTL input at boot; it no longer
-// augments this file from a SIGTERM sampler. Key by path so distinct agent dirs
+// This is not a cross-process lock. Background launch inventory transfers
+// non-TTL interrupted work to the runtime outbox; it neither augments this
+// greeting nor relies on a SIGTERM sampler. Key by path so distinct agent dirs
 // (tests) never contend.
 const handoffLocks = new Map<string, Promise<void>>()
 
@@ -71,9 +71,9 @@ export type RestartHandoff = {
   // whatever bare-channel rule matches on every "I'm back" turn. Optional and
   // additive: pre-field v2 handoffs and tui handoffs omit it.
   triggeringAuthorId?: string
-  // Lost-work names accepted from older handoffs or merged inventory at boot.
-  // Persisted ordinary handoffs still have the greeting's 60s TTL; inventory
-  // recovery independently uses exact-parent mapping, not elapsed age.
+  // Lost-work names accepted from older handoffs. Channel boot excludes these
+  // from model greetings: covered launch recovery belongs to the outbox.
+  // Ordinary handoffs retain the greeting's 60s TTL.
   interruptedSubagents?: string[]
 }
 

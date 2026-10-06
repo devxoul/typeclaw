@@ -26,6 +26,7 @@ import type {
   FetchHistoryResult,
   HistoryCallback,
   OutboundCallback,
+  RecoveryAdapterCallbacks,
   OutboundMessage,
   ResolvedChannelNames,
   SendResult,
@@ -230,6 +231,21 @@ export function createSlackAdapter(options: SlackAdapterOptions): SlackAdapter {
   const authorResolver = createSlackAuthorResolver({ client })
   const selfIdentityResolver: ChannelSelfIdentityResolver = () =>
     selfUserId !== null ? { id: selfUserId, username: selfName ?? selfUserId } : null
+  const recoveryCallbacks: RecoveryAdapterCallbacks = {
+    cachedAccountIdentity: (workspace) =>
+      selfUserId !== null && teamId !== '' && (workspace === undefined || workspace === '@dm' || workspace === teamId)
+        ? `slack:${teamId}:${selfUserId}`
+        : undefined,
+    accountIdentity: async (workspace) => {
+      const auth = await client.testAuth()
+      return auth.team_id &&
+        auth.user_id &&
+        (workspace === undefined || workspace === '@dm' || workspace === auth.team_id)
+        ? `slack:${auth.team_id}:${auth.user_id}`
+        : undefined
+    },
+    reconcile: async () => ({ status: 'unreconcilable' }),
+  }
   const formatChannelTag = async (chat: string): Promise<string> => {
     const names = await channelResolver({ adapter: 'slack', workspace: teamId, chat, thread: null }).catch(
       (): ResolvedChannelNames => ({}),
@@ -395,6 +411,7 @@ export function createSlackAdapter(options: SlackAdapterOptions): SlackAdapter {
       listener.on('reaction_removed', (event) => handleReaction('removed', event))
 
       options.router.registerOutbound('slack', outboundCallback)
+      options.router.registerRecoveryAdapter('slack', recoveryCallbacks)
       options.router.setTypingCapability('slack', false)
       options.router.registerChannelNameResolver('slack', channelResolver)
       options.router.registerSelfIdentity('slack', selfIdentityResolver)
@@ -409,6 +426,7 @@ export function createSlackAdapter(options: SlackAdapterOptions): SlackAdapter {
 
       const rollbackStart = (reason: string, cause: Error): never => {
         options.router.unregisterOutbound('slack', outboundCallback)
+        options.router.unregisterRecoveryAdapter('slack', recoveryCallbacks)
         options.router.setTypingCapability('slack', false)
         options.router.unregisterChannelNameResolver('slack', channelResolver)
         options.router.unregisterSelfIdentity('slack', selfIdentityResolver)
@@ -445,6 +463,7 @@ export function createSlackAdapter(options: SlackAdapterOptions): SlackAdapter {
       started = false
       accountToken = null
       options.router.unregisterOutbound('slack', outboundCallback)
+      options.router.unregisterRecoveryAdapter('slack', recoveryCallbacks)
       options.router.setTypingCapability('slack', false)
       options.router.unregisterChannelNameResolver('slack', channelResolver)
       options.router.unregisterSelfIdentity('slack', selfIdentityResolver)

@@ -36,6 +36,7 @@ import { extractMentionedUserIds } from './adapters/mention-hints'
 import { formatChannelCommandHelp } from './commands'
 import { isQualifyingWorkResult } from './completion-claim'
 import { detectContinuationWillingness } from './continuation-willingness'
+import type { RecoveryFailure, RecoveryRecord } from './continuity-types'
 import { describeError } from './describe-error'
 import {
   countEffectiveHumans,
@@ -148,6 +149,7 @@ import type {
   TypingCallback,
 } from './types'
 import { channelKeyId } from './types'
+import type { RecoveryAdapterCallbacks, RecoveryReconcileResult, SendOptions as TransportSendOptions } from './types'
 import { createWaitingReactionCoordinator, type WaitingReactionHandle } from './waiting-reactions'
 
 export const INITIAL_DEBOUNCE_MS = 600
@@ -1368,7 +1370,7 @@ export type ExecuteCommandOptions = {
 
 export type SendSource = 'tool' | 'system'
 
-export type SendOptions = {
+export type SendOptions = TransportSendOptions & {
   source?: SendSource
   // Apply tool-send accounting to the originating conversation while delivering
   // elsewhere. The outbound target remains unchanged; only per-turn cap/dedup,
@@ -1413,6 +1415,12 @@ export type ChannelRouter = {
   }) => { count: number; windowMs: number }
   registerOutbound: (adapter: ChannelKey['adapter'], cb: OutboundCallback) => void
   unregisterOutbound: (adapter: ChannelKey['adapter'], cb: OutboundCallback) => void
+  registerRecoveryAdapter: (adapter: ChannelKey['adapter'], callbacks: RecoveryAdapterCallbacks) => void
+  unregisterRecoveryAdapter: (adapter: ChannelKey['adapter'], callbacks: RecoveryAdapterCallbacks) => void
+  getRecoveryAccountIdentity: (adapter: ChannelKey['adapter'], workspace?: string) => Promise<string | undefined>
+  validateRecovery: (record: RecoveryRecord) => Promise<RecoveryFailure | undefined>
+  reconcileRecovery: (record: RecoveryRecord) => Promise<RecoveryReconcileResult>
+  setRecoveryStopHandler: (handler: (target: ChannelKey, parentSessionId: string) => Promise<void>) => void
   // Reaction support is opt-in per adapter: an adapter that never calls
   // registerReaction makes `react` resolve to `code: 'unsupported'`, and
   // auto-react-on-engage becomes a silent no-op for it. Kept separate from
@@ -1650,6 +1658,7 @@ export type ChannelRouter = {
   markRestartAbortForAllLive: () => Promise<void>
   liveCount: () => number
   __testing?: {
+    getRecoveryAccountingSnapshot: (key: ChannelKey) => Record<string, unknown> | undefined
     flushDebounce: (key: ChannelKey) => Promise<void>
     fireTypingHeartbeat: (key: ChannelKey, phase?: 'tick' | 'stop') => Promise<void>
     fireTypingInterval: (key: ChannelKey) => Promise<void>
@@ -1914,6 +1923,8 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   // teardown was meant to clear.
   let liveGeneration = 0
   const outboundCallbacks = new Map<ChannelKey['adapter'], Set<OutboundCallback>>()
+  const recoveryAdapters = new Map<ChannelKey['adapter'], RecoveryAdapterCallbacks>()
+  let recoveryStopHandler: ((target: ChannelKey, parentSessionId: string) => Promise<void>) | undefined
   const reactionCallbacks = new Map<ChannelKey['adapter'], Set<ReactionCallback>>()
   const removeReactionCallbacks = new Map<ChannelKey['adapter'], Set<RemoveReactionCallback>>()
   const prepareOwnReactionCallbacks = new Map<ChannelKey['adapter'], Set<PrepareOwnReactionCallback>>()
@@ -3782,6 +3793,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   }
 
   const stopCurrentChannelTurn = async (live: LiveSession, reason: string): Promise<boolean> => {
+    if (reason === 'user_stop') await recoveryStopHandler?.(live.key, live.sessionId)
     live.userStoppedTurnSeq = live.turnSeq
     live.lastTerminalReplyCompletion = null
     live.pendingTerminalReplyStop = null
@@ -5558,6 +5570,16 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     if (authoredText !== undefined) {
       const flood = checkOutboundFlood(authoredText)
       if (!flood.ok) return { ok: false, error: OUTBOUND_FLOOD_ERROR, code: 'outbound-flood' }
+    }
+    // Recovery is a transport-only operation. Do not even look up the live
+    // session: doing so would let a delayed notice alter a newer logical turn.
+    if (opts?.accounting === 'recovery') {
+      for (const callback of Array.from(callbacks)) {
+        const result = await callback({ ...msg, sendOptions: opts })
+        if (result.ok) return result
+        return result
+      }
+      return { ok: false, error: 'no recovery transport available', code: 'no-adapter' }
     }
 
     const accountingTarget = opts?.accountingTarget ?? {
@@ -7403,10 +7425,57 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     live.activeContinuationReactions = []
     return Promise.all(owners.map((owner) => waitingReactions.release(owner))).then(() => undefined)
   }
+  const registerRecoveryAdapter = (adapter: ChannelKey['adapter'], callbacks: RecoveryAdapterCallbacks): void => {
+    recoveryAdapters.set(adapter, callbacks)
+  }
+  const unregisterRecoveryAdapter = (adapter: ChannelKey['adapter'], callbacks: RecoveryAdapterCallbacks): void => {
+    if (recoveryAdapters.get(adapter) === callbacks) recoveryAdapters.delete(adapter)
+  }
+  const getRecoveryAccountIdentity = async (
+    adapter: ChannelKey['adapter'],
+    workspace = '',
+  ): Promise<string | undefined> => {
+    const callbacks = recoveryAdapters.get(adapter)
+    if (callbacks) return callbacks.cachedAccountIdentity?.(workspace)
+    const self = selfIdentityResolvers.get(adapter)?.(workspace)
+    return self?.id === undefined ? undefined : `${adapter}:${workspace}:${self.id}`
+  }
+  const validateRecovery = async (record: RecoveryRecord): Promise<RecoveryFailure | undefined> => {
+    const config = options.configForAdapter(record.target.adapter)
+    if (!config || !config.enabled) {
+      return { kind: 'configuration', safeReason: 'original adapter is not configured' }
+    }
+    if (
+      record.principal.kind !== 'channel' ||
+      !permissions.has({ ...record.principal, thread: record.target.thread }, CORE_PERMISSIONS.channelRespond)
+    ) {
+      return { kind: 'permission', safeReason: 'original principal cannot respond or send' }
+    }
+    const callbacks = recoveryAdapters.get(record.target.adapter)
+    const identity = await (callbacks
+      ? callbacks.accountIdentity(record.target.workspace)
+      : getRecoveryAccountIdentity(record.target.adapter, record.target.workspace))
+    if (identity === undefined) return { kind: 'unavailable', safeReason: 'adapter account is not ready' }
+    if (record.accountIdentity === 'unbound-legacy' && record.boundAccountIdentity === undefined) return undefined
+    if (identity !== (record.boundAccountIdentity ?? record.accountIdentity))
+      return { kind: 'identity', safeReason: 'original account identity changed' }
+    return undefined
+  }
+  const reconcileRecovery = async (record: RecoveryRecord): Promise<RecoveryReconcileResult> =>
+    recoveryAdapters.get(record.target.adapter)?.reconcile(record) ?? { status: 'unreconcilable' }
+  const setRecoveryStopHandler = (handler: (target: ChannelKey, parentSessionId: string) => Promise<void>): void => {
+    recoveryStopHandler = handler
+  }
 
   return {
     route,
     send,
+    registerRecoveryAdapter,
+    unregisterRecoveryAdapter,
+    getRecoveryAccountIdentity,
+    validateRecovery,
+    reconcileRecovery,
+    setRecoveryStopHandler,
     getConsecutiveSendCount,
     hasQualifyingWorkThisLogicalTurn,
     getSendRate,
@@ -7559,6 +7628,22 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       },
       typingHeartbeatIntervalFor,
       runIdleGc,
+      getRecoveryAccountingSnapshot: (key: ChannelKey) => {
+        const live = liveSessions.get(channelKeyId(key))
+        if (!live) return undefined
+        return {
+          successfulChannelSends: live.successfulChannelSends,
+          promisedWorkOutstandingThisLogicalTurn: live.promisedWorkOutstandingThisLogicalTurn,
+          lastSendLeafId: live.lastSendLeafId,
+          skippedTurn: live.skippedTurn,
+          consecutiveSends: [...live.consecutiveSends],
+          lastSentText: [...live.lastSentText],
+          policyDeniedToolSendsThisTurn: [...live.policyDeniedToolSendsThisTurn],
+          continuationReactions: [...live.activeContinuationReactions],
+          typingEpoch: live.typingEpoch,
+          continueReplyTurn: live.continueReplyTurn,
+        }
+      },
       getLiveOriginSnapshot: (key: ChannelKey) => {
         const live = liveSessions.get(channelKeyId(key))
         const origin = live?.originRef.current

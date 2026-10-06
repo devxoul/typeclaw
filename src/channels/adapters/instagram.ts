@@ -9,6 +9,7 @@ import type { InstagramChatSummary, InstagramMessageSummary } from 'agent-messen
 import type { ChannelRouter } from '@/channels/router'
 import type { ChannelAdapterConfig } from '@/channels/schema'
 import type {
+  ChannelSelfIdentityResolver,
   ChannelHistoryMessage,
   FetchHistoryArgs,
   FetchHistoryResult,
@@ -177,6 +178,7 @@ export function createInstagramAdapter(options: InstagramAdapterOptions): Instag
   const client = options.client ?? buildClient(new InstagramCredentialManager())
   let listener: InstagramListenerShape | null = null
   let selfUserId: string | null = null
+  const selfIdentityResolver: ChannelSelfIdentityResolver = () => (selfUserId === null ? null : { id: selfUserId })
   let connected = false
   let started = false
   let inflightInbounds = 0
@@ -452,6 +454,7 @@ export function createInstagramAdapter(options: InstagramAdapterOptions): Instag
       }
 
       options.router.registerOutbound('instagram', outboundCallback)
+      options.router.registerSelfIdentity('instagram', selfIdentityResolver)
       options.router.registerChannelNameResolver('instagram', channelResolver.resolve)
       options.router.registerHistory('instagram', historyCallback)
     },
@@ -460,6 +463,7 @@ export function createInstagramAdapter(options: InstagramAdapterOptions): Instag
       if (!started) return
       started = false
       options.router.unregisterOutbound('instagram', outboundCallback)
+      options.router.unregisterSelfIdentity('instagram', selfIdentityResolver)
       options.router.unregisterChannelNameResolver('instagram', channelResolver.resolve)
       options.router.unregisterHistory('instagram', historyCallback)
       listener?.stop()

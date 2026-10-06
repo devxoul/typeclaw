@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { link, mkdir, open, readFile, readdir, rename, stat, unlink } from 'node:fs/promises'
 import { basename, dirname, join, resolve } from 'node:path'
 
+import { validateRecoveryRecord, type RecoveryRecord } from './continuity-types'
 import type { ChannelKey, ReactionRef } from './types'
 import { channelKeyId } from './types'
 
@@ -10,15 +11,64 @@ export type BackgroundInventoryRecord = {
   generationId: string
   processEpoch: string
   parentSessionId: string
-  parentSessionFile: string
+  parentSessionFile?: string
   key: ChannelKey
   triggeringAuthorId?: string
+  parentChat?: string
+  accountIdentity?: string
+  recoveryTransfer?: { phase: 'notice-prepared' | 'notice-owned'; record: RecoveryRecord }
   tasks: {
     taskId: string
     subagentName: string
     startedAt: number
+    accountIdentity?: string
     triggerReactionRef?: ReactionRef
   }[]
+}
+
+export type BackgroundRecoveryIdentity = {
+  accountIdentity: string
+  accountIdentityConflict?: string[]
+}
+
+/** Resolve admitted task evidence; legacy group identity applies only to absent row fields. */
+export function resolveBackgroundRecoveryIdentity(record: BackgroundInventoryRecord): BackgroundRecoveryIdentity {
+  const identities = [
+    ...new Set(
+      record.tasks
+        .map((task) => task.accountIdentity ?? record.accountIdentity ?? 'unbound-legacy')
+        .filter((identity) => identity !== 'unbound-legacy'),
+    ),
+  ].sort()
+  if (identities.length === 1) return { accountIdentity: identities[0]! }
+  return {
+    accountIdentity: 'unbound-legacy',
+    ...(identities.length > 1 ? { accountIdentityConflict: identities } : {}),
+  }
+}
+
+function transferMatchesSource(source: BackgroundInventoryRecord, transfer: RecoveryRecord): boolean {
+  const resolved = resolveBackgroundRecoveryIdentity(source)
+  const identity = JSON.stringify([channelKeyId(source.key), source.parentSessionId, source.generationId])
+  const expectedIds = source.tasks
+    .map((task) => createHash('sha256').update(`inventory:${identity}:${task.taskId}`).digest('hex'))
+    .sort()
+  return (
+    channelKeyId(transfer.target) === channelKeyId(source.key) &&
+    transfer.sourceParentSessionId === source.parentSessionId &&
+    transfer.principal.kind === 'channel' &&
+    transfer.principal.adapter === source.key.adapter &&
+    transfer.principal.workspace === source.key.workspace &&
+    transfer.principal.chat === source.key.chat &&
+    transfer.principal.parentChat === source.parentChat &&
+    transfer.principal.lastInboundAuthorId === (source.triggeringAuthorId || undefined) &&
+    transfer.accountIdentity === resolved.accountIdentity &&
+    JSON.stringify(transfer.accountIdentityConflict) === JSON.stringify(resolved.accountIdentityConflict) &&
+    transfer.recoveryGeneration === `${source.generationId}:${source.parentSessionId}` &&
+    transfer.transferId === createHash('sha256').update(`inventory-transfer:${identity}`).digest('hex') &&
+    transfer.covers.every((coverage) => coverage.store === 'inventory' && coverage.generation === 1) &&
+    JSON.stringify(transfer.covers.map((coverage) => coverage.id).sort()) === JSON.stringify(expectedIds)
+  )
 }
 
 export type BackgroundLaunchIdentity = {
@@ -32,7 +82,7 @@ export type BackgroundLaunchIdentity = {
 export type ClaimedBackgroundInventory = { record: BackgroundInventoryRecord; claimPath: string }
 type LaunchInput = Pick<
   BackgroundInventoryRecord,
-  'parentSessionId' | 'parentSessionFile' | 'key' | 'triggeringAuthorId'
+  'parentSessionId' | 'parentSessionFile' | 'key' | 'parentChat' | 'triggeringAuthorId' | 'accountIdentity'
 > &
   BackgroundInventoryRecord['tasks'][number]
 
@@ -121,6 +171,8 @@ function validReaction(value: unknown): boolean {
   return value === undefined || (object(value) && typeof value.adapter === 'string' && typeof value.value === 'string')
 }
 
+class InvalidBackgroundInventory extends Error {}
+
 async function readRecord(path: string, hash: string): Promise<BackgroundInventoryRecord | undefined> {
   let raw: string
   try {
@@ -129,19 +181,31 @@ async function readRecord(path: string, hash: string): Promise<BackgroundInvento
     if (missing(error)) return undefined
     throw error
   }
-  const record: unknown = JSON.parse(raw)
+  let record: unknown
+  try {
+    record = JSON.parse(raw)
+  } catch (error) {
+    if (!(error instanceof SyntaxError)) throw error
+    throw new InvalidBackgroundInventory(`Malformed background inventory: ${path}`, { cause: error })
+  }
   if (
     !object(record) ||
     record.schemaVersion !== 1 ||
     !validKey(record.key) ||
     typeof record.parentSessionId !== 'string' ||
     !record.parentSessionId ||
-    !validSessionFile(record.parentSessionFile) ||
+    (record.parentSessionFile !== undefined && !validSessionFile(record.parentSessionFile)) ||
     typeof record.generationId !== 'string' ||
     !generationPattern.test(record.generationId) ||
     typeof record.processEpoch !== 'string' ||
     !record.processEpoch ||
     (record.triggeringAuthorId !== undefined && typeof record.triggeringAuthorId !== 'string') ||
+    (record.parentChat !== undefined && (typeof record.parentChat !== 'string' || !record.parentChat)) ||
+    (record.accountIdentity !== undefined && (typeof record.accountIdentity !== 'string' || !record.accountIdentity)) ||
+    (record.recoveryTransfer !== undefined &&
+      (!object(record.recoveryTransfer) ||
+        !['notice-prepared', 'notice-owned'].includes(String(record.recoveryTransfer.phase)) ||
+        !validateRecoveryRecord(record.recoveryTransfer.record))) ||
     !Array.isArray(record.tasks) ||
     record.tasks.length === 0 ||
     !record.tasks.every(
@@ -152,14 +216,20 @@ async function readRecord(path: string, hash: string): Promise<BackgroundInvento
         typeof task.subagentName === 'string' &&
         typeof task.startedAt === 'number' &&
         Number.isFinite(task.startedAt) &&
+        (task.accountIdentity === undefined ||
+          (typeof task.accountIdentity === 'string' && task.accountIdentity.length > 0)) &&
         validReaction(task.triggerReactionRef),
     ) ||
     new Set(record.tasks.map((task) => task.taskId)).size !== record.tasks.length ||
     recordHash(record.key, record.parentSessionId) !== hash
   ) {
-    throw new Error(`Malformed background inventory: ${path}`)
+    throw new InvalidBackgroundInventory(`Malformed background inventory: ${path}`)
   }
-  return record as BackgroundInventoryRecord
+  const validated = record as BackgroundInventoryRecord
+  if (validated.recoveryTransfer && !transferMatchesSource(validated, validated.recoveryTransfer.record)) {
+    throw new InvalidBackgroundInventory(`Background recovery transfer does not cover its source: ${path}`)
+  }
+  return validated
 }
 
 async function publish(path: string, record: BackgroundInventoryRecord, exclusive: boolean): Promise<boolean> {
@@ -195,6 +265,7 @@ export class BackgroundHandoffInventory {
   private readonly bootStartedAt: number
   private readonly pending = new Set<Promise<unknown>>()
   private readonly onError: (error: unknown) => void
+  private readonly ownedClaims = new Set<string>()
 
   constructor(
     agentDir: string,
@@ -231,23 +302,42 @@ export class BackgroundHandoffInventory {
     const path = join(this.directory, `${hash}.json`)
     return this.track(
       serialized(path, async () => {
-        const file = basename(snapshot.parentSessionFile)
+        const file = snapshot.parentSessionFile ? basename(snapshot.parentSessionFile) : undefined
         if (
-          !validSessionFile(file) ||
           !validKey(snapshot.key) ||
           !snapshot.parentSessionId ||
           !snapshot.taskId ||
           typeof snapshot.subagentName !== 'string' ||
           !Number.isFinite(snapshot.startedAt) ||
+          (snapshot.parentChat !== undefined && (typeof snapshot.parentChat !== 'string' || !snapshot.parentChat)) ||
           !validReaction(snapshot.triggerReactionRef)
         )
           throw new Error('Invalid background launch metadata')
         await mkdir(this.directory, { recursive: true })
         await syncDirectory(dirname(this.directory))
         await syncDirectory(dirname(dirname(this.directory)))
-        let record = await readRecord(path, hash)
-        if (record && record.processEpoch !== this.processEpoch) {
-          throw new Error('Prior-process background inventory must be claimed before launching')
+        let record: BackgroundInventoryRecord | undefined
+        let invalid = false
+        try {
+          record = await readRecord(path, hash)
+        } catch (error) {
+          if (!(error instanceof InvalidBackgroundInventory)) throw error
+          invalid = true
+          this.report(error)
+        }
+        if (invalid || (record && record.processEpoch !== this.processEpoch)) {
+          // Retain prior or unreadable evidence in the existing claim namespace.
+          // Recovery bookkeeping must not reserve a healthy parent's launch slot.
+          const claimDirectory = join(this.directory, 'claimed')
+          await mkdir(claimDirectory, { recursive: true })
+          try {
+            await rename(path, join(claimDirectory, `${hash}.${randomUUID()}.json`))
+          } catch (error) {
+            if (!missing(error)) throw error
+          }
+          await syncDirectory(claimDirectory)
+          await syncDirectory(this.directory)
+          record = undefined
         }
         if (!record) {
           record = {
@@ -255,9 +345,10 @@ export class BackgroundHandoffInventory {
             generationId: randomUUID(),
             processEpoch: this.processEpoch,
             parentSessionId: snapshot.parentSessionId,
-            parentSessionFile: file,
+            ...(validSessionFile(file) ? { parentSessionFile: file } : {}),
             key: snapshot.key,
             triggeringAuthorId: snapshot.triggeringAuthorId,
+            ...(snapshot.parentChat !== undefined ? { parentChat: snapshot.parentChat } : {}),
             tasks: [],
           }
         }
@@ -265,12 +356,14 @@ export class BackgroundHandoffInventory {
           const next = {
             ...record,
             triggeringAuthorId: snapshot.triggeringAuthorId ?? record.triggeringAuthorId,
+            ...(snapshot.parentChat !== undefined ? { parentChat: snapshot.parentChat } : {}),
             tasks: [
               ...record.tasks,
               {
                 taskId: snapshot.taskId,
                 subagentName: snapshot.subagentName,
                 startedAt: snapshot.startedAt,
+                accountIdentity: snapshot.accountIdentity || 'unbound-legacy',
                 triggerReactionRef: snapshot.triggerReactionRef,
               },
             ],
@@ -322,6 +415,29 @@ export class BackgroundHandoffInventory {
 
   async claim(): Promise<ClaimedBackgroundInventory[]> {
     const claims: ClaimedBackgroundInventory[] = []
+    // A process can die after rename, preparation, or import. Claimed bytes
+    // remain a source until durable outbox ownership permits retirement.
+    const claimDirectory = join(this.directory, 'claimed')
+    let abandoned: string[] = []
+    try {
+      abandoned = (await readdir(claimDirectory)).sort()
+    } catch (error) {
+      if (!missing(error)) this.report(error)
+    }
+    for (const file of abandoned) {
+      const match = claimedPattern.exec(file)
+      if (!match) continue
+      try {
+        const claimPath = join(claimDirectory, file)
+        const record = await readRecord(claimPath, match[1]!)
+        if (record && record.processEpoch !== this.processEpoch && !this.ownedClaims.has(claimPath)) {
+          this.ownedClaims.add(claimPath)
+          claims.push({ record, claimPath })
+        }
+      } catch (error) {
+        this.report(error)
+      }
+    }
     for (const file of await this.files()) {
       const path = join(this.directory, file)
       try {
@@ -356,12 +472,50 @@ export class BackgroundHandoffInventory {
           }
           return { record, claimPath }
         })
-        if (claim) claims.push(claim)
+        if (claim) {
+          this.ownedClaims.add(claim.claimPath)
+          claims.push(claim)
+        }
       } catch (error) {
         if (!missing(error)) this.report(error)
       }
     }
     return claims
+  }
+
+  async prepareRecovery(claim: ClaimedBackgroundInventory, record: RecoveryRecord): Promise<RecoveryRecord> {
+    return this.updateRecovery(claim, 'notice-prepared', record)
+  }
+
+  async ownRecovery(claim: ClaimedBackgroundInventory, record: RecoveryRecord): Promise<RecoveryRecord> {
+    return this.updateRecovery(claim, 'notice-owned', record)
+  }
+
+  private async updateRecovery(
+    claim: ClaimedBackgroundInventory,
+    phase: 'notice-prepared' | 'notice-owned',
+    recovery: RecoveryRecord,
+  ): Promise<RecoveryRecord> {
+    const path = resolve(claim.claimPath)
+    const match = claimedPattern.exec(basename(path))
+    if (dirname(path) !== join(this.directory, 'claimed') || !match) throw new Error('Invalid inventory claim')
+    return serialized(path, async () => {
+      const current = await readRecord(path, match[1]!)
+      if (!current || current.generationId !== claim.record.generationId)
+        throw new Error('Background inventory generation changed during transfer')
+      const existing = current.recoveryTransfer
+      if (existing && JSON.stringify(existing.record) !== JSON.stringify(recovery))
+        throw new Error('Conflicting background recovery transfer')
+      const frozen = existing?.record ?? recovery
+      if (!validateRecoveryRecord(frozen)) throw new Error('Invalid background recovery payload')
+      if (!transferMatchesSource(current, frozen))
+        throw new Error('Background recovery transfer does not cover its source')
+      if (existing?.phase === 'notice-owned') return frozen
+      const next = { ...current, recoveryTransfer: { phase, record: frozen } }
+      await publish(path, next, false)
+      claim.record = next
+      return frozen
+    })
   }
 
   retire(claim: ClaimedBackgroundInventory): Promise<void> {
@@ -374,6 +528,14 @@ export class BackgroundHandoffInventory {
     ) {
       return Promise.reject(new Error('Invalid background inventory claim path'))
     }
-    return this.track(serialized(path, () => removeFile(path)))
+    return this.track(
+      serialized(path, async () => {
+        const current = await readRecord(path, match[1]!)
+        if (!current) return
+        if (current.generationId !== claim.record.generationId)
+          throw new Error('Background inventory generation changed before retirement')
+        await removeFile(path)
+      }),
+    )
   }
 }

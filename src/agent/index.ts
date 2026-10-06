@@ -928,6 +928,9 @@ export function buildSubagentOrchestrationTools(opts: {
       parentSessionId: opts.parentSessionId,
       getOrigin: opts.getOrigin,
       ...(opts.getSessionFile !== undefined ? { getSessionFile: opts.getSessionFile } : {}),
+      ...(opts.channelRouter === undefined
+        ? {}
+        : { getAccountIdentity: opts.channelRouter.getRecoveryAccountIdentity }),
       ...(opts.permissions ? { permissions: opts.permissions } : {}),
       ...(opts.stream ? { stream: opts.stream } : {}),
       ...(opts.allowBackgroundFromSubagent !== undefined

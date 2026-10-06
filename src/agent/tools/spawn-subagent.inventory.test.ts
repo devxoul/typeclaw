@@ -3,14 +3,29 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { BackgroundHandoffInventory } from '@/channels/background-handoff'
+import type { SlackBotClient, SlackBotListener } from 'agent-messenger/slackbot'
+
+import { createSlackBotAdapter } from '@/channels/adapters/slack-bot'
+import {
+  BackgroundHandoffInventory,
+  resolveBackgroundRecoveryIdentity,
+  type BackgroundRecoveryIdentity,
+} from '@/channels/background-handoff'
+import { RecoveryDispatcher } from '@/channels/recovery-dispatcher'
+import { RecoveryOutbox } from '@/channels/recovery-outbox'
+import { createChannelRouter, type ChannelRouter } from '@/channels/router'
+import { channelsSchema, defaultHistoryConfig } from '@/channels/schema'
+import type { RecoveryAdapterCallbacks } from '@/channels/types'
+import { createPermissionService } from '@/permissions/permissions'
+import { rolesConfigSchema } from '@/permissions/schema'
+import { importBackgroundRecoveryNotices, prepareBackgroundRecoveryNotice } from '@/run/background-handoff-boot'
 import { createStream } from '@/stream'
 
 import type { AgentSession } from '../index'
 import { LiveSubagentRegistry } from '../live-subagents'
 import type { SessionOrigin } from '../session-origin'
 import type { CreateSessionForSubagent } from '../subagents'
-import { createSpawnSubagentTool } from './spawn-subagent'
+import { createSpawnSubagentTool, type CreateSpawnSubagentToolOptions } from './spawn-subagent'
 
 const dirs: string[] = []
 afterEach(async () => {
@@ -26,7 +41,14 @@ const origin: SessionOrigin = {
 }
 const key = { adapter: 'slack' as const, workspace: 'team', chat: 'room', thread: 'thread' }
 async function fixture(
-  options: { create?: CreateSessionForSubagent; registry?: LiveSubagentRegistry; timeoutMs?: number } = {},
+  options: {
+    create?: CreateSessionForSubagent
+    registry?: LiveSubagentRegistry
+    timeoutMs?: number
+    origin?: SessionOrigin
+    getAccountIdentity?: CreateSpawnSubagentToolOptions['getAccountIdentity']
+    generateTaskId?: () => string
+  } = {},
 ) {
   const dir = await mkdtemp(join(tmpdir(), 'typeclaw-source-inventory-'))
   dirs.push(dir)
@@ -69,9 +91,10 @@ async function fixture(
       }),
     agentDir: dir,
     parentSessionId: 'parent',
-    getOrigin: () => origin,
+    getOrigin: () => options.origin ?? origin,
     getSessionFile: () => join(dir, 'sessions', 'parent.jsonl'),
-    generateTaskId: () => 'task',
+    ...(options.getAccountIdentity === undefined ? {} : { getAccountIdentity: options.getAccountIdentity }),
+    generateTaskId: options.generateTaskId ?? (() => 'task'),
     stream,
   })
   const spawn = (params = { subagent_type: 'explorer', prompt: 'inspect' }, signal?: AbortSignal) =>
@@ -100,6 +123,290 @@ async function checkpoint(f: {
   await f.inventory.flush()
 }
 
+test('authenticated account is captured before launch', async () => {
+  const accepted = await fixture({ getAccountIdentity: async () => 'slack:team:actor' })
+  await accepted.spawn()
+  const claims = await accepted.recover()
+  expect(claims[0]?.record.tasks[0]?.accountIdentity).toBe('slack:team:actor')
+  expect(accepted.launches()).toBe(1)
+  await checkpoint(accepted)
+})
+
+test('native Discord thread admission recovers under its parent grant at the unchanged thread target', async () => {
+  const admittedOrigin: SessionOrigin = {
+    kind: 'channel',
+    adapter: 'discord-bot',
+    workspace: 'GUILD',
+    chat: 'THREAD',
+    thread: null,
+    parentChat: 'PARENT',
+    lastInboundAuthorId: 'ALICE',
+  }
+  const target = { adapter: 'discord-bot' as const, workspace: 'GUILD', chat: 'THREAD', thread: null }
+  const f = await fixture({
+    origin: admittedOrigin,
+    getAccountIdentity: async () => {
+      // Even an admission await must not mix a later turn's principal into this task.
+      admittedOrigin.parentChat = 'OTHER'
+      admittedOrigin.lastInboundAuthorId = 'BOB'
+      return 'discord:GUILD:BOT'
+    },
+  })
+  const outbox = new RecoveryOutbox(f.dir, { epoch: 'recovery' })
+  const permissions = createPermissionService({
+    roles: rolesConfigSchema.parse({
+      member: { match: ['discord:GUILD/PARENT author:ALICE'], permissions: ['channel.respond'] },
+    }),
+  })
+  const router = createChannelRouter({
+    agentDir: f.dir,
+    configForAdapter: () => ({
+      enabled: true,
+      engagement: { trigger: ['mention'], stickiness: 'off' },
+      history: defaultHistoryConfig(),
+    }),
+    permissions,
+    logger: { info() {}, warn() {}, error() {} },
+  })
+  router.registerRecoveryAdapter('discord-bot', {
+    accountIdentity: async () => 'discord:GUILD:BOT',
+    reconcile: async () => ({ status: 'unreconcilable' }),
+  })
+  const sent: unknown[] = []
+  const posted = Promise.withResolvers<void>()
+  router.registerOutbound('discord-bot', async (message) => {
+    sent.push({ adapter: message.adapter, workspace: message.workspace, chat: message.chat, thread: message.thread })
+    posted.resolve()
+    return { ok: true, messageId: 'recovery-post' }
+  })
+  const dispatcher = new RecoveryDispatcher(outbox, router)
+  try {
+    expect((await f.spawn()).details).toMatchObject({ ok: true, mode: 'background' })
+    // The live session can advance after admission; recovery must use durable evidence.
+    admittedOrigin.parentChat = 'OTHER'
+    admittedOrigin.lastInboundAuthorId = 'BOB'
+    const errors: unknown[] = []
+    await importBackgroundRecoveryNotices({
+      inventory: new BackgroundHandoffInventory(f.dir, { processEpoch: 'recovery' }),
+      outbox,
+      prepare: prepareBackgroundRecoveryNotice,
+      onError: (error) => errors.push(error),
+    })
+    expect(errors).toEqual([])
+    const notice = (await outbox.list())[0]!
+    if (notice.principal.kind !== 'channel') throw new Error('Expected channel recovery principal')
+    expect(notice.target).toEqual(target)
+    expect(notice.principal).toEqual({
+      kind: 'channel',
+      adapter: 'discord-bot',
+      workspace: 'GUILD',
+      chat: 'THREAD',
+      parentChat: 'PARENT',
+      lastInboundAuthorId: 'ALICE',
+    })
+    expect(await router.validateRecovery(notice)).toBeUndefined()
+    expect(
+      await router.validateRecovery({
+        ...notice,
+        principal: { ...notice.principal, parentChat: 'OTHER' },
+      }),
+    ).toMatchObject({ kind: 'permission' })
+    expect(
+      await router.validateRecovery({
+        ...notice,
+        principal: { ...notice.principal, lastInboundAuthorId: 'BOB' },
+      }),
+    ).toMatchObject({ kind: 'permission' })
+    await dispatcher.wake()
+    await posted.promise
+    await dispatcher.stop()
+    expect((await outbox.get(notice.deliveryId))?.state).toBe('delivered')
+    expect(sent).toEqual([target])
+  } finally {
+    await dispatcher.stop()
+    await checkpoint(f)
+    await router.stop()
+  }
+})
+
+for (const unavailable of [
+  async () => undefined,
+  async () => {
+    throw new Error('identity unavailable')
+  },
+]) {
+  test('unavailable identity admits launch and persists one-time first-lease binding', async () => {
+    const f = await fixture({ getAccountIdentity: unavailable })
+    expect((await f.spawn()).details).toMatchObject({ ok: true, mode: 'background' })
+    expect(f.launches()).toBe(1)
+    const outbox = new RecoveryOutbox(f.dir, { epoch: 'recovery' })
+    await importBackgroundRecoveryNotices({
+      inventory: new BackgroundHandoffInventory(f.dir, { processEpoch: 'recovery' }),
+      outbox,
+      prepare: prepareBackgroundRecoveryNotice,
+      onError: (error) => {
+        throw error
+      },
+    })
+    const notice = (await outbox.list())[0]!
+    expect(notice.accountIdentity).toBe('unbound-legacy')
+    const lease = (await outbox.lease(notice.deliveryId, notice.generation))!
+    expect(await outbox.bindAccount(notice.deliveryId, lease, 'slack:team:actor')).toBe(true)
+    expect(await outbox.bindAccount(notice.deliveryId, lease, 'slack:team:other')).toBe(false)
+    expect((await new RecoveryOutbox(f.dir).get(notice.deliveryId))?.boundAccountIdentity).toBe('slack:team:actor')
+    await checkpoint(f)
+  })
+}
+
+for (const [transition, identities, expected] of [
+  ['unbound to bound', [undefined, 'slack:team:actor'], { accountIdentity: 'slack:team:actor' }],
+  ['bound to unbound', ['slack:team:actor', undefined], { accountIdentity: 'slack:team:actor' }],
+  [
+    'bound account rotation',
+    ['slack:team:actor-B', 'slack:team:actor-A'],
+    {
+      accountIdentity: 'unbound-legacy',
+      accountIdentityConflict: ['slack:team:actor-A', 'slack:team:actor-B'],
+    },
+  ],
+] satisfies [string, (string | undefined)[], BackgroundRecoveryIdentity][]) {
+  test(`same-parent siblings launch across ${transition} and import one deterministic notice`, async () => {
+    let nextTask = 0
+    let nextIdentity = 0
+    const f = await fixture({
+      generateTaskId: () => `sibling-${++nextTask}`,
+      getAccountIdentity: async () => identities[nextIdentity++],
+    })
+    try {
+      for (const prompt of ['inspect first area', 'inspect second area']) {
+        expect((await f.spawn({ subagent_type: 'explorer', prompt })).details).toMatchObject({
+          ok: true,
+          mode: 'background',
+        })
+      }
+      expect(f.launches()).toBe(2)
+      expect(
+        f.registry
+          .list({ parentSessionId: 'parent' })
+          .filter((child) => child.status === 'running')
+          .map((child) => child.taskId)
+          .sort(),
+      ).toEqual(['sibling-1', 'sibling-2'])
+      const recoveryInventory = new BackgroundHandoffInventory(f.dir, { processEpoch: 'recovery' })
+      const claims = await recoveryInventory.claim()
+      expect(claims).toHaveLength(1)
+      const source = claims[0]!.record
+      expect(source.tasks.map((task) => ({ taskId: task.taskId, accountIdentity: task.accountIdentity }))).toEqual(
+        identities.map((accountIdentity, index) => ({
+          taskId: `sibling-${index + 1}`,
+          accountIdentity: accountIdentity ?? 'unbound-legacy',
+        })),
+      )
+      expect(resolveBackgroundRecoveryIdentity(source)).toEqual(expected)
+      expect(resolveBackgroundRecoveryIdentity({ ...source, tasks: [...source.tasks].reverse() })).toEqual(expected)
+      const outbox = new RecoveryOutbox(f.dir, { epoch: 'recovery' })
+      const errors: unknown[] = []
+      await importBackgroundRecoveryNotices({
+        inventory: new BackgroundHandoffInventory(f.dir, { processEpoch: 'recovery' }),
+        outbox,
+        prepare: prepareBackgroundRecoveryNotice,
+        onError: (error) => {
+          errors.push(error)
+        },
+      })
+      expect(errors).toEqual([])
+      const notices = await outbox.list()
+      expect(notices).toHaveLength(1)
+      const notice = notices[0]!
+      expect({
+        accountIdentity: notice.accountIdentity,
+        ...(notice.accountIdentityConflict === undefined
+          ? {}
+          : { accountIdentityConflict: notice.accountIdentityConflict }),
+      }).toEqual(expected)
+      expect(notice.covers).toHaveLength(2)
+      expect(new Set(notice.covers.map((coverage) => coverage.id)).size).toBe(2)
+      await importBackgroundRecoveryNotices({
+        inventory: recoveryInventory,
+        outbox,
+        prepare: prepareBackgroundRecoveryNotice,
+        onError: (error) => {
+          errors.push(error)
+        },
+      })
+      expect(errors).toEqual([])
+      expect(await outbox.list()).toEqual(notices)
+      if (notice.accountIdentity === 'unbound-legacy') {
+        const lease = (await outbox.lease(notice.deliveryId, notice.generation))!
+        expect(await outbox.bindAccount(notice.deliveryId, lease, 'slack:team:actor-C')).toBe(true)
+        expect(await outbox.bindAccount(notice.deliveryId, lease, 'slack:team:actor-D')).toBe(false)
+        expect((await outbox.get(notice.deliveryId))?.boundAccountIdentity).toBe('slack:team:actor-C')
+        expect((await outbox.get(notice.deliveryId))?.accountIdentityConflict).toEqual(
+          'accountIdentityConflict' in expected ? expected.accountIdentityConflict : undefined,
+        )
+      }
+    } finally {
+      await checkpoint(f)
+    }
+  })
+}
+
+test('Slack DM launches with cached real team identity and no admission HTTP requests', async () => {
+  let requests = 0
+  let callbacks: RecoveryAdapterCallbacks | undefined
+  const adapter = createSlackBotAdapter({
+    router: new Proxy(
+      {},
+      {
+        get: (_target, property) =>
+          property === 'registerRecoveryAdapter'
+            ? (_adapter: string, value: RecoveryAdapterCallbacks) => {
+                callbacks = value
+              }
+            : () => {},
+      },
+    ) as ChannelRouter,
+    configRef: () => channelsSchema.parse({ 'slack-bot': {} })['slack-bot']!,
+    token: 'token',
+    appToken: 'app-token',
+    logger: { info: () => {}, warn: () => {}, error: () => {} },
+    createClient: () =>
+      ({
+        login: async () => {},
+        testAuth: async () => {
+          requests++
+          return { team_id: 'T1', user_id: 'U_BOT' }
+        },
+      }) as unknown as SlackBotClient,
+    createListener: () => ({ on: () => {}, start: async () => {}, stop: () => {} }) as unknown as SlackBotListener,
+    fetchImpl: Object.assign(
+      async () => {
+        requests++
+        throw new Error('admission must not call HTTP')
+      },
+      { preconnect: fetch.preconnect },
+    ),
+  })
+  await adapter.start()
+  try {
+    const beforeAdmission = requests
+    const f = await fixture({
+      origin: { kind: 'channel', adapter: 'slack-bot', workspace: '@dm', chat: 'D1', thread: null },
+      getAccountIdentity: async (_adapter, workspace) => callbacks?.cachedAccountIdentity?.(workspace),
+    })
+    expect((await f.spawn()).details).toMatchObject({ ok: true, mode: 'background' })
+    expect(f.launches()).toBe(1)
+    expect((await f.recover())[0]?.record).toMatchObject({
+      key: { adapter: 'slack-bot', workspace: '@dm', chat: 'D1', thread: null },
+      tasks: [{ taskId: 'task', accountIdentity: 'slack-bot:T1:U_BOT' }],
+    })
+    expect(requests).toBe(beforeAdmission)
+    await checkpoint(f)
+  } finally {
+    await adapter.stop()
+  }
+})
+
 test('direct channel launch is durable before session execution, with author but no result bodies', async () => {
   const f = await fixture()
   expect((await f.spawn()).details).toMatchObject({ ok: true, mode: 'background' })
@@ -124,31 +431,74 @@ test('factory rejection retires never-registered intent', async () => {
   expect(await f.recover()).toEqual([])
 })
 
-test('missing transcript prevents execution with visible error', async () => {
-  const f = await fixture()
-  let launches = 0
-  const tool = createSpawnSubagentTool({
-    registry: { explorer: { visibility: 'public', systemPrompt: 'Explore.' } },
-    liveRegistry: f.registry,
-    createSessionForSubagent: async () => {
-      launches++
-      throw new Error('must not execute')
-    },
-    agentDir: f.dir,
-    parentSessionId: 'parent',
-    getOrigin: () => origin,
+for (const getSessionFile of [
+  undefined,
+  () => undefined,
+  () => {
+    throw new Error('transcript unavailable')
+  },
+]) {
+  test('unavailable transcript still durably admits a child and imports one notice without reopening it', async () => {
+    const f = await fixture()
+    let launches = 0
+    const tool = createSpawnSubagentTool({
+      registry: { explorer: { visibility: 'public', systemPrompt: 'Explore.' } },
+      liveRegistry: f.registry,
+      createSessionForSubagent: async () => {
+        launches++
+        return {
+          sessionId: 'child',
+          prompt: () => f.done.promise,
+          subscribe: () => () => {},
+          abort: async () => {},
+          dispose: () => {},
+        } as unknown as AgentSession
+      },
+      agentDir: f.dir,
+      parentSessionId: 'parent',
+      getOrigin: () => origin,
+      ...(getSessionFile === undefined ? {} : { getSessionFile }),
+      generateTaskId: () => 'task',
+    })
+    try {
+      const result = await tool.execute(
+        'call',
+        { subagent_type: 'explorer', prompt: 'inspect' },
+        undefined,
+        undefined,
+        {} as never,
+      )
+      expect(result.details).toMatchObject({ ok: true, mode: 'background' })
+      expect(launches).toBe(1)
+      expect(f.registry.get('task')?.status).toBe('running')
+      const inventory = new BackgroundHandoffInventory(f.dir, { processEpoch: 'recovery' })
+      const claims = await inventory.claim()
+      expect(claims).toHaveLength(1)
+      expect(claims[0]!.record.parentSessionFile).toBeUndefined()
+      expect(claims[0]!.record.tasks).toMatchObject([{ taskId: 'task', accountIdentity: 'unbound-legacy' }])
+      const outbox = new RecoveryOutbox(f.dir, { epoch: 'recovery' })
+      const errors: unknown[] = []
+      await importBackgroundRecoveryNotices({
+        inventory: new BackgroundHandoffInventory(f.dir, { processEpoch: 'recovery' }),
+        outbox,
+        prepare: prepareBackgroundRecoveryNotice,
+        onError: (error) => {
+          errors.push(error)
+        },
+      })
+      expect(errors).toEqual([])
+      expect(await outbox.list()).toMatchObject([
+        {
+          accountIdentity: 'unbound-legacy',
+          sourceParentSessionId: 'parent',
+        },
+      ])
+      expect(await inventory.claim()).toEqual([])
+    } finally {
+      await checkpoint(f)
+    }
   })
-  const result = await tool.execute(
-    'call',
-    { subagent_type: 'explorer', prompt: 'inspect' },
-    undefined,
-    undefined,
-    {} as never,
-  )
-  expect(result.details).toMatchObject({ ok: false })
-  expect(launches).toBe(0)
-  expect(await f.recover()).toEqual([])
-})
+}
 
 test('parent aborted across persistence await never starts execution', async () => {
   const f = await fixture()
@@ -339,7 +689,9 @@ test('SIGKILL after actual source launch preserves one parent-group claim for an
     const ready = await reader.read()
     expect(JSON.parse(new TextDecoder().decode(ready.value))).toMatchObject({ ok: true, mode: 'background' })
     child.kill('SIGKILL')
-    await child.exited
+    expect(await child.exited).not.toBe(0)
+    if (process.platform !== 'win32') expect(child.signalCode).toBe('SIGKILL')
+    expect(await new Response(child.stderr).text()).toBe('')
     const recoveryScript = join(f.dir, 'recover.ts')
     await Bun.write(
       recoveryScript,
@@ -359,7 +711,7 @@ test('SIGKILL after actual source launch preserves one parent-group claim for an
     expect(await repeat.exited).toBe(0)
   } finally {
     reader.releaseLock()
-    child.kill()
+    child.kill('SIGKILL')
     await child.exited
   }
 })

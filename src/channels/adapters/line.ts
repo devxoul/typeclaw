@@ -15,6 +15,7 @@ import {
 import type { ChannelRouter } from '@/channels/router'
 import type { ChannelAdapterConfig } from '@/channels/schema'
 import type {
+  ChannelSelfIdentityResolver,
   ChannelHistoryMessage,
   FetchHistoryArgs,
   FetchHistoryResult,
@@ -186,6 +187,7 @@ export function createLineAdapter(options: LineAdapterOptions): LineAdapter {
   const client = options.client ?? buildClient(credManager)
   let listener: LineListener | null = null
   let selfUserId: string | null = null
+  const selfIdentityResolver: ChannelSelfIdentityResolver = () => (selfUserId === null ? null : { id: selfUserId })
   let connected = false
   let started = false
   let inflightInbounds = 0
@@ -393,6 +395,7 @@ export function createLineAdapter(options: LineAdapterOptions): LineAdapter {
       // failure cannot leave the router pointing at callbacks for a
       // half-initialized adapter. stop() unregisters in inverse order.
       options.router.registerOutbound('line', outboundCallback)
+      options.router.registerSelfIdentity('line', selfIdentityResolver)
       options.router.registerChannelNameResolver('line', channelResolver.resolve)
       options.router.registerHistory('line', historyCallback)
     },
@@ -405,6 +408,7 @@ export function createLineAdapter(options: LineAdapterOptions): LineAdapter {
         refreshTimer = null
       }
       options.router.unregisterOutbound('line', outboundCallback)
+      options.router.unregisterSelfIdentity('line', selfIdentityResolver)
       options.router.unregisterChannelNameResolver('line', channelResolver.resolve)
       options.router.unregisterHistory('line', historyCallback)
       if (inflightInbounds > 0) {

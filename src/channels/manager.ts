@@ -58,6 +58,7 @@ const consoleLogger: ChannelManagerLogger = {
 export type ChannelManagerOptions = {
   agentDir: string
   channelsConfigRef: () => ChannelsConfig
+  onRecoveryReady?: () => void
   // Plain-text names the agent answers to in channel engagement (the
   // `alias` field in `typeclaw.json`), forwarded to the router as
   // `configuredAliases`. Read live on every inbound so an `applied`-class
@@ -521,6 +522,7 @@ export function createChannelManager(options: ChannelManagerOptions): ChannelMan
         recoveryRestartAttempts: 0,
         recoveryRestartQueued: false,
       })
+      options.onRecoveryReady?.()
       return { status: 'started' }
     } catch (err) {
       await cleanupPartialStart(adapter)
@@ -1026,6 +1028,7 @@ export function createChannelManager(options: ChannelManagerOptions): ChannelMan
         }
       }
 
+      options.onRecoveryReady?.()
       return { started, stopped, restarted, restartRequired, ...(credentialApply ? { credentialApply } : {}) }
     },
   }
