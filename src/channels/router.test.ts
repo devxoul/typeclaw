@@ -19534,6 +19534,50 @@ describe('ChannelRouter background-child await suppression', () => {
     expect(reactions[0]).toMatchObject({ emoji: 'eyes', reactionRef })
   })
 
+  test('new inbounds while the child runs carry the deferred request instead of posting a restart notice', async () => {
+    const dir = await tempDir()
+    const logs: string[] = []
+    const nowRef = { value: CHILD_STARTED_AT }
+    const { router, sessions } = makeRouter(dir, {
+      logs,
+      nowRef,
+      newestRunningChildSubagentStartedAt: runningChild,
+    })
+    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+
+    // given: the first request is deferred to a running background child
+    const first = await router.route(inbound({ externalMessageId: 'm1', isBotMention: true, text: 'PR 좀 리뷰해줘' }))
+    sessions[0]!.onPrompt = async () => {
+      strandOnUnansweredToolUse(sessions[0]!, 'background-child')
+    }
+    await router.__testing!.flushDebounce(KEY)
+    expect(logs.some((m) => m.includes('empty_turn_suppressed cause=awaiting_background_child'))).toBe(true)
+
+    // when: a later message gets a status reply, then another arrives, all before the child finishes
+    nowRef.value += 1000
+    await router.route(
+      inbound({ externalMessageId: 'm2', authorId: 'peer', authorName: 'peer', isBotMention: true, text: 'FYI' }),
+    )
+    sessions[0]!.onPrompt = async () => {
+      await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: STATUS })
+      const reply = continueReplyAck(STATUS)
+      await sessions[0]!.agent.afterToolCall!({ ...reply, result: { ...reply.result, details: { ok: true } } })
+    }
+    await router.__testing!.flushDebounce(KEY)
+    nowRef.value += 1000
+    await router.route(
+      inbound({ externalMessageId: 'm3', authorId: 'peer', authorName: 'peer', isBotMention: true, text: 'ping' }),
+    )
+    await router.__testing!.flushDebounce(KEY)
+
+    // then: the deferred request is still owed by the live session, not declared lost
+    if (first.kind !== 'accepted') throw new Error('expected durable admission')
+    expect(await new RecoveryOutbox(dir).list()).toEqual([])
+    expect((await router.captureInboundResultCoverage!('ses_fake_1')).map((ref) => ref.inputId)).toContain(
+      first.inputId,
+    )
+  })
+
   test('a more_work_this_turn ack is not re-nudged into a second status post while the child runs', async () => {
     const dir = await tempDir()
     const logs: string[] = []

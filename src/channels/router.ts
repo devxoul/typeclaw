@@ -1077,6 +1077,11 @@ type LiveSession = {
   // `startedAt` against, to tell "this turn spawned it" from "it was already
   // running when unrelated work arrived".
   logicalTurnStartedAt: number
+  // `logicalTurnStartedAt` of the turn that deferred the open `inboundCoverage`
+  // to a background child, kept while fresh batches carry that coverage forward.
+  // Each carrying batch advances `logicalTurnStartedAt`, so without this a later
+  // batch would stop seeing the original child and declare the coverage lost.
+  coverageDeferredSince: number | null
   // Snapshot of `successfulChannelSends` taken at turn start (same
   // moment `turnSeq` increments). Lets `markTurnSkipped` detect "a
   // channel send already landed in this turn" and reject the skip,
@@ -2963,6 +2968,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         successfulChannelSends: 0,
         turnSeq: 0,
         logicalTurnStartedAt: now(),
+        coverageDeferredSince: null,
         successfulSendsAtTurnStart: 0,
         inFlightToolSends: new Map(),
         policyDeniedToolSendsThisTurn: new Map(),
@@ -4449,10 +4455,17 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
             .slice(0, batchCount)
             .flatMap((input) => (input.inputId ? [input.inputId] : []))
           const inboundRefs = await inboundJournal.resolve(inputIds)
+          if (live.inboundCoverage.length === 0) live.coverageDeferredSince = null
           if (fresh && live.inboundCoverage.length > 0) {
-            if (batchCount > 0) {
+            // Coverage left open by a turn deferred to a still-running background child
+            // is owed, not lost: carry it forward like a wakeup instead of posting a
+            // restart notice.
+            const deferredSince = live.coverageDeferredSince ?? live.logicalTurnStartedAt
+            if (batchCount > 0 && !isAwaitingBackgroundChild(live, 'fresh-inbound-coverage', deferredSince)) {
               await transferLostCoverageInLane(live.key, live.inboundCoverage, live.backgroundCoverage, live.sessionId)
+              live.coverageDeferredSince = null
             } else {
+              if (batchCount > 0) live.coverageDeferredSince = deferredSince
               const previous = await inboundJournal.resolve(live.inboundCoverage)
               const movedInputs = await inboundJournal.move(previous, {
                 fromTurnId: live.backgroundTurnId,
