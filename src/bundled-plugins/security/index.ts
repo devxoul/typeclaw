@@ -1,6 +1,9 @@
-import { definePlugin, type PluginLogger } from '@/plugin'
+import { getConfig } from '@/config'
+import { definePlugin, type PluginContext, type PluginLogger, type ToolBeforeEvent } from '@/plugin'
 import { resolveHiddenPaths } from '@/sandbox'
 
+import { analyzeGitCommand, createSessionTmpGitResolvers } from '../github-cli-auth/git-command'
+import { recordGrantedPush, resolveGrantedPush } from '../github-cli-auth/granted-push'
 import { HIGH_TIER_PER_GUARD_PERMISSIONS, SECURITY_PERMISSIONS, SEVERITY_PERMISSION } from './permissions'
 import type { SecurityPermission, SecuritySeverity } from './permissions'
 import { GUARD_CRON_PROMOTION_SEVERITY, checkCronPromotionGuard } from './policies/cron-promotion'
@@ -9,6 +12,7 @@ import {
   GUARD_GIT_REMOTE_TAINTED_SEVERITY,
   checkGitExfilGuard,
   checkGitRemoteTaintedGuard,
+  isPushOnlyGitExfilMatch,
   recordGitRemoteTaintIfAny,
 } from './policies/git-exfil'
 import { GUARD_OUTBOUND_SECRET_SEVERITY, checkOutboundSecretGuard } from './policies/outbound-secret-scan'
@@ -84,6 +88,47 @@ function withPermissionHint(
   return {
     block: true,
     reason: `${result.reason} Or run as a role carrying \`${permission}\` (${perGuardHint}) or the tier permission \`${tierPerm}\`; see the \`typeclaw-permissions\` skill.`,
+  }
+}
+
+type PushGrantOutcome = { kind: 'allow' } | { kind: 'deny'; reason: string } | { kind: 'not-configured' }
+
+// Only consulted for a command whose sole gitExfil finding is `git push`. The
+// destination is decided from the broker's resolved remote identity, never
+// from the command string or working-directory path; on allow, the resolved
+// destination is handed to github-cli-auth, which refuses to fund any other.
+async function evaluatePushGrant(
+  event: ToolBeforeEvent,
+  ctx: Pick<PluginContext, 'agentDir' | 'github'>,
+): Promise<PushGrantOutcome> {
+  const command = event.args.command
+  if (typeof command !== 'string' || !isPushOnlyGitExfilMatch(command)) return { kind: 'not-configured' }
+  const github = getConfig().channels?.github
+  if (github === undefined || github.repos.length === 0) return { kind: 'not-configured' }
+  if (!ctx.github.hasAppTokenResolver()) {
+    return {
+      kind: 'deny',
+      reason: 'pushing to channels.github.repos without the bypass requires GitHub App auth for the github channel',
+    }
+  }
+  const resolvers = createSessionTmpGitResolvers(ctx.agentDir, event.sessionId)
+  const decision = await analyzeGitCommand(command, { cwd: ctx.agentDir, resolvers })
+  const verdict = await resolveGrantedPush(decision, { repos: github.repos }, resolvers)
+  if (verdict.kind === 'deny') return verdict
+  recordGrantedPush(event.callId, verdict.push)
+  return { kind: 'allow' }
+}
+
+function withPushGrantHint(result: SecurityBlock, outcome: PushGrantOutcome): SecurityBlock {
+  if (outcome.kind === 'deny') {
+    return {
+      block: true,
+      reason: `${result.reason} Pushing to a configured channels.github.repos repo did not apply: ${outcome.reason}.`,
+    }
+  }
+  return {
+    block: true,
+    reason: `${result.reason} Branch pushes are allowed without the bypass to repos listed in channels.github.repos when the github channel uses App auth.`,
   }
 }
 
@@ -213,7 +258,10 @@ export default definePlugin({
                 SECURITY_PERMISSIONS.bypassGitExfil,
                 GUARD_GIT_EXFIL_SEVERITY,
               )
-          if (gitExfilResult) return gitExfilResult
+          if (gitExfilResult) {
+            const pushGrant = await evaluatePushGrant(event, ctx)
+            if (pushGrant.kind !== 'allow') return withPushGrantHint(gitExfilResult, pushGrant)
+          }
 
           const secretExfilReadResult = canBypass(
             GUARD_SECRET_EXFIL_READ_SEVERITY,

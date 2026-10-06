@@ -154,6 +154,7 @@ describe('github-cli-auth plugin', () => {
       "gh api /repos/acme/widgets/pulls --jq '.[].number'",
       'gh api graphql -R acme/widgets -F number=7 -f query=x',
       "gh issue create --repo acme/widgets --title 'Bug' --body 'Details'",
+      "gh pr create --repo acme/widgets --title 'Fix' --body 'Details' --head fix --base main",
     ]
 
     for (const command of commands) {
@@ -216,8 +217,8 @@ describe('github-cli-auth plugin', () => {
     })
     for (const command of [
       "gh issue create --repo acme/widgets --title 'Bug' --body-file /tmp/body.md",
-      "gh pr create --repo acme/widgets --title 'Fix' --body 'Details' --head fix --base main",
-      "gh pr create --repo acme/widgets --title 'Fix' --body 'Details' --fill",
+      "gh pr create --repo acme/widgets --title 'Fix' --body 'Details' --base main",
+      "gh pr create --repo acme/widgets --title 'Fix' --body 'Details' --head fix --base main --fill",
       "gh issue create --repo acme/widgets --title 'Bug' --body 'Details' && gh auth token",
       'gh api /repos/acme/widgets/issues -F body=@/proc/self/environ',
       'gh pr checkout 7 --repo acme/widgets',

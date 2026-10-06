@@ -345,6 +345,7 @@ const SAFE_GH_OPERATIONS: Readonly<Record<string, ReadonlySet<string>>> = {
     'ready',
     'merge',
     'edit',
+    'create',
   ]),
   issue: new Set(['view', 'list', 'status', 'comment', 'close', 'reopen', 'create']),
   label: new Set(['list', 'create', 'edit', 'delete', 'clone']),
@@ -483,7 +484,7 @@ function isCredentialSafeGhArgs(args: readonly string[]): boolean {
     if (endpoint === null || endpoint.includes('://')) return false
   }
   if (!SAFE_GH_OPERATIONS[command]?.has(operation)) return false
-  if (command === 'issue' && operation === 'create' && !isSafeCreateArgs(args)) {
+  if ((command === 'issue' || command === 'pr') && operation === 'create' && !isSafeCreateArgs(command, args)) {
     return false
   }
   if (command === 'pr' && operation === 'edit' && !isSafePrEditArgs(args)) {
@@ -509,7 +510,7 @@ function isCredentialSafeGhArgs(args: readonly string[]): boolean {
   return true
 }
 
-function isSafeCreateArgs(args: readonly string[]): boolean {
+function isSafeCreateArgs(command: 'issue' | 'pr', args: readonly string[]): boolean {
   if (extractRepoFlag(args) === null) return false
   const title = findFlagValue(args, ['--title'])
   const body = findFlagValue(args, ['--body', '-b'])
@@ -527,7 +528,33 @@ function isSafeCreateArgs(args: readonly string[]): boolean {
     '--fill-verbose',
   ])
   if (args.some((arg) => forbidden.has(arg.includes('=') ? arg.slice(0, arg.indexOf('=')) : arg))) return false
+  if (command === 'pr' && !hasExplicitPrRefs(args)) return false
   return true
+}
+
+// Without `--head`, `gh pr create` interrogates the checkout and offers to push
+// or fork, running git with the minted token in its environment. An explicit
+// head (plus `--repo`, required above) keeps gh to read-only remote/config
+// lookups that tolerate running outside any checkout. gh's flag parser keeps
+// the LAST value of a repeated flag, so a later `--head=` or `-H ''` would
+// silently empty the head this check saw first: repeats are refused outright.
+const PR_CREATE_REF_FLAGS: readonly (readonly string[])[] = [
+  ['--head', '-H'],
+  ['--base', '-B'],
+  ['--repo', '-R'],
+  ['--title', '-t'],
+  ['--body', '-b'],
+]
+
+function hasExplicitPrRefs(args: readonly string[]): boolean {
+  for (const names of PR_CREATE_REF_FLAGS) {
+    const occurrences = args.filter((arg) => names.some((name) => arg === name || arg.startsWith(`${name}=`)))
+    if (occurrences.length > 1) return false
+  }
+  const head = findFlagValue(args, ['--head', '-H'])
+  const base = findFlagValue(args, ['--base', '-B'])
+  if (head === null || head.trim() === '' || base === null || base.trim() === '') return false
+  return !head.startsWith('@') && !base.startsWith('@')
 }
 
 // `gh pr edit` with no field flag drops into an interactive survey and spawns
