@@ -1,5 +1,12 @@
 import { validateConfig } from '@/config'
-import { type Controller, resolveController, type StartResult } from '@/container'
+import {
+  type Controller,
+  defaultDockerExec,
+  formatOversubscriptionWarning,
+  readFleetMemoryOversubscription,
+  resolveController,
+  type StartResult,
+} from '@/container'
 
 import { discoverAgents, type AgentEntry } from './discover'
 
@@ -23,16 +30,19 @@ export type ComposeStartOptions = {
 
 export type ComposeStartDeps = {
   start?: Controller['start']
+  checkMemory?: () => Promise<string[] | null>
 }
 
 export type ComposeStartResult = {
   agents: AgentEntry[]
   results: AgentResult<StartSuccess>[]
+  // Fleet-wide, reported once — see readFleetMemoryOversubscription.
+  memoryWarning: string[] | null
 }
 
 export async function composeStart(
   { rootCwd, preferredHostPort, forceBuild = false, cliEntry, onProgress }: ComposeStartOptions,
-  { start = (options) => resolveController().start(options) }: ComposeStartDeps = {},
+  { start = (options) => resolveController().start(options), checkMemory = checkFleetMemory }: ComposeStartDeps = {},
 ): Promise<ComposeStartResult> {
   const agents = discoverAgents(rootCwd)
   const results = await Promise.all(
@@ -43,7 +53,13 @@ export async function composeStart(
       return result
     }),
   )
-  return { agents, results }
+  const memoryWarning = results.some((r) => r.ok) ? await checkMemory() : null
+  return { agents, results, memoryWarning }
+}
+
+export async function checkFleetMemory(): Promise<string[] | null> {
+  const warning = await readFleetMemoryOversubscription(defaultDockerExec)
+  return warning === null ? null : formatOversubscriptionWarning(warning)
 }
 
 async function runOne(
@@ -64,6 +80,7 @@ async function runOne(
       forceBuild,
       cliEntry,
       streamOutput: false,
+      skipMemoryOversubscriptionCheck: true,
       onWarning: (warning) => warnings.push(warning),
     })
     if (!data.ok) return { name, ok: false, reason: data.reason, warnings }
