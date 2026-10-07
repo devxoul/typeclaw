@@ -10,7 +10,7 @@ import { isWindows } from '@/shared'
 
 import { isDaemonReachable } from './client'
 import { startDaemon, type Daemon } from './daemon'
-import { ensureDirs, lockfilePath, pidfilePath, socketPath } from './paths'
+import { ensureDirs, lockfilePath, logfilePath, pidfilePath, socketPath } from './paths'
 import { ensureDaemon } from './spawn'
 
 let home: string
@@ -115,13 +115,7 @@ describe('ensureDaemon', () => {
     // simulated by a harmless long-lived process recorded in the pidfile
     if (isWindows()) return
     await expectDaemonEndpointGone()
-    const child = Bun.spawn({
-      cmd: [process.execPath, '-e', 'setTimeout(() => {}, 60_000)'],
-      stdin: 'ignore',
-      stdout: 'ignore',
-      stderr: 'ignore',
-    })
-    child.unref()
+    const child = await spawnFakeHostd()
     try {
       await mkdir(dirname(pidfilePath()), { recursive: true })
       await writeFile(pidfilePath(), `${child.pid}\n`)
@@ -137,6 +131,126 @@ describe('ensureDaemon', () => {
       expect(readFileSync(pidfilePath(), 'utf8').trim()).toBe(String(child.pid))
     } finally {
       child.kill('SIGKILL')
+    }
+  })
+
+  test('replaces a wedged daemon that stayed unreachable past the boot window', async () => {
+    // given: a host daemon process spawned long ago that never answers its
+    // socket — e.g. stuck in Bun's crash handler after a segfault
+    if (isWindows()) return
+    await expectDaemonEndpointGone()
+    const child = await spawnFakeHostd()
+    try {
+      await writeAgedPidfile(child.pid)
+
+      // when: ensureDaemon runs against it
+      const result = await ensureDaemon({ cliEntry: '/nonexistent/cli.ts', spawnTimeoutMs: 150 })
+
+      // then: the wedged process is terminated and a fresh spawn is attempted
+      // (which fails on the dummy cliEntry) instead of adopting it forever
+      expect(await exitedWithin(child, 5_000)).toBe(true)
+      expect(result.ok).toBe(false)
+      if (result.ok) return
+      expect(result.reason).toContain('exited before becoming reachable')
+      expect(readFileSync(logfilePath(), 'utf8')).toContain(`replaced unresponsive host daemon pid ${child.pid}`)
+    } finally {
+      child.kill('SIGKILL')
+    }
+  })
+
+  test('escalates to SIGKILL when a wedged daemon ignores SIGTERM', async () => {
+    // given: a wedged daemon whose SIGTERM handler never lets it exit, like a
+    // process spinning inside Bun's crash handler
+    if (isWindows()) return
+    await expectDaemonEndpointGone()
+    const child = await spawnFakeHostd({ ignoreSigterm: true })
+    try {
+      await writeAgedPidfile(child.pid)
+
+      // when: ensureDaemon replaces it
+      const result = await ensureDaemon({ cliEntry: '/nonexistent/cli.ts', spawnTimeoutMs: 150 })
+
+      // then: SIGTERM is not enough, so it is SIGKILLed and the replacement
+      // spawn is still attempted
+      expect(await exitedWithin(child, 10_000)).toBe(true)
+      expect(child.signalCode).toBe('SIGKILL')
+      expect(result.ok).toBe(false)
+      if (result.ok) return
+      expect(result.reason).toContain('exited before becoming reachable')
+    } finally {
+      child.kill('SIGKILL')
+    }
+  })
+
+  for (const [label, cmd] of [
+    [
+      'a bun process that only mentions _hostd',
+      [process.execPath, '-e', 'setInterval(() => "_hostd", 1_000)', '_hostd'],
+    ],
+    ['a shell loop grepping for _hostd', ['sh', '-c', 'while :; do grep -q _hostd /dev/null; sleep 1; done']],
+    [
+      'a monitor carrying the full launch signature as arguments',
+      ['sh', '-c', 'while :; do sleep 1; done', 'watch', '/usr/local/bin/bun', '/repo/src/cli/index.ts', '_hostd'],
+    ],
+    [
+      'a bun process carrying the full launch signature as arguments',
+      [
+        process.execPath,
+        '-e',
+        'setInterval(() => {}, 1_000)',
+        '/usr/local/bin/bun',
+        '/repo/src/cli/index.ts',
+        '_hostd',
+      ],
+    ],
+  ] as const) {
+    test(`never signals an aged pidfile pid reused by ${label}`, async () => {
+      // given: an aged pidfile whose pid the OS recycled to an unrelated
+      // process whose command text happens to contain `_hostd`
+      if (isWindows()) return
+      await expectDaemonEndpointGone()
+      const unrelated = Bun.spawn({ cmd: [...cmd], stdin: 'ignore', stdout: 'ignore', stderr: 'ignore' })
+      unrelated.unref()
+      try {
+        await writeAgedPidfile(unrelated.pid)
+
+        // when: ensureDaemon runs
+        const result = await ensureDaemon({ cliEntry: '/nonexistent/cli.ts', spawnTimeoutMs: 150 })
+
+        // then: the unrelated process is left alone and treated as before
+        expect(result.ok).toBe(false)
+        if (result.ok) return
+        expect(result.reason).toContain('did not become reachable yet')
+        expect(unrelated.exitCode).toBeNull()
+        expect(unrelated.signalCode).toBeNull()
+      } finally {
+        unrelated.kill('SIGKILL')
+      }
+    })
+  }
+
+  test('reaps a drifted daemon that acknowledged shutdown but never exited', async () => {
+    // given: a reachable daemon on an old version whose process will unlink its
+    // socket on shutdown but linger — modelled by the in-process daemon serving
+    // the socket plus a host daemon process recorded in the pidfile
+    if (isWindows()) return
+    daemon = await startDaemon({ version: 'old', gcIntervalMs: 1_000_000 })
+    const lingering = await spawnFakeHostd()
+    try {
+      await writeFile(pidfilePath(), `${lingering.pid}\n`)
+
+      // when: ensureDaemon detects drift and requests shutdown
+      await ensureDaemon({ cliEntry: '/nonexistent/cli.ts', expectedVersion: 'new', spawnTimeoutMs: 100 })
+      daemon = null
+
+      // then: the process that did not exit is reaped, so it can't keep holding
+      // the HTTP control port or run renewals next to the fresh daemon
+      expect(await exitedWithin(lingering, 5_000)).toBe(true)
+      expect(readFileSync(logfilePath(), 'utf8')).toContain(
+        `reaped host daemon pid ${lingering.pid} that acknowledged shutdown but did not exit`,
+      )
+    } finally {
+      lingering.kill('SIGKILL')
     }
   })
 
@@ -283,6 +397,46 @@ function deferred(): { promise: Promise<void>; resolve: () => void } {
     resolve = done
   })
   return { promise, resolve }
+}
+
+// A long-lived process launched with the real daemon signature
+// (`bun <...>/src/cli/index.ts _hostd`) that never binds the socket. Resolves
+// once the script is running, so any SIGTERM handler is already installed.
+async function spawnFakeHostd({ ignoreSigterm = false } = {}): Promise<ReturnType<typeof Bun.spawn>> {
+  const entry = join(home, 'fake-typeclaw', 'src', 'cli', 'index.ts')
+  await mkdir(dirname(entry), { recursive: true })
+  await writeFile(
+    entry,
+    `${ignoreSigterm ? "process.on('SIGTERM', () => {})\n" : ''}setInterval(() => {}, 1_000)\nconsole.log('ready')\n`,
+  )
+  const child = Bun.spawn({
+    cmd: [process.execPath, entry, '_hostd'],
+    stdin: 'ignore',
+    stdout: 'pipe',
+    stderr: 'ignore',
+  })
+  child.unref()
+  const reader = child.stdout.getReader()
+  let seen = ''
+  while (!seen.includes('ready')) {
+    const { value, done } = await reader.read()
+    if (done) throw new Error('fake host daemon exited before becoming ready')
+    seen += new TextDecoder().decode(value)
+  }
+  reader.releaseLock()
+  return child
+}
+
+async function writeAgedPidfile(pid: number): Promise<void> {
+  await ensureDirs()
+  await writeFile(pidfilePath(), `${pid}\n`)
+  const aged = new Date(Date.now() - 60_000)
+  await utimes(pidfilePath(), aged, aged)
+}
+
+async function exitedWithin(child: ReturnType<typeof Bun.spawn>, ms: number): Promise<boolean> {
+  const timeout = new Promise<false>((resolve) => setTimeout(() => resolve(false), ms))
+  return Promise.race([child.exited.then(() => true as const), timeout])
 }
 
 // Spawns a trivial process, waits for it to exit, and returns its now-dead pid —
