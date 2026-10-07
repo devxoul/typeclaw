@@ -75,7 +75,7 @@ import {
   validateGithubReviewRound,
 } from './github-review-verdict-coordinator'
 import { renderPrVerdictStandDownReminder } from './github-verdict-activity'
-import { InboundJournal, type InboundRef } from './inbound-journal'
+import { InboundJournal, type InboundRecord, type InboundRef } from './inbound-journal'
 import {
   MEMBERSHIP_COLD_FETCH_TIMEOUT_MS,
   type MembershipCount,
@@ -842,6 +842,7 @@ type PendingReloadCoverage = {
   ownerSessionId: string
   logicalTurnStartedAt: number
   coverageDeferredSince: number | null
+  coverageDeferredParentSessionId: string | null
   turnAccountIdentity?: string
   // Author context a completion-only wake needs for author-scoped role
   // resolution, exactly as the reloaded session would have restored it.
@@ -1053,6 +1054,10 @@ type LiveSession = {
   inboundCoverage: string[]
   turnAccountIdentity?: string
   backgroundTurnId: string
+  // Session holding the claims under `backgroundTurnId`: the creating session, a
+  // reload source restored at adoption, or this session once a consume acquires a
+  // turn. A successor may run under another ID than the one its adopted rows name.
+  backgroundTurnOwnerSessionId: string
   backgroundStopVersion: number
   // True only for the reminder-only iteration that consumed a willingness
   // nudge. `willingnessNudges` persists across the logical turn, so it remains
@@ -1106,11 +1111,17 @@ type LiveSession = {
   // `startedAt` against, to tell "this turn spawned it" from "it was already
   // running when unrelated work arrived".
   logicalTurnStartedAt: number
-  // `logicalTurnStartedAt` of the turn that deferred the open `inboundCoverage`
-  // to a background child, kept while fresh batches carry that coverage forward.
-  // Each carrying batch advances `logicalTurnStartedAt`, so without this a later
-  // batch would stop seeing the original child and declare the coverage lost.
+  // `logicalTurnStartedAt` of the turn that deferred open coverage (inbound requests,
+  // consumed child results, or both) to a background child, kept while fresh batches
+  // carry that coverage forward. Each carrying batch advances `logicalTurnStartedAt`,
+  // so without this a later batch would stop seeing the original child and declare
+  // the coverage lost.
   coverageDeferredSince: number | null
+  // Session that spawned the child that coverage was deferred to, kept with
+  // `coverageDeferredSince` while it is carried; null means the claim owner. A carry
+  // moves the claims to the carrying session, which after a reload can have another
+  // session ID than that child's parent.
+  coverageDeferredParentSessionId: string | null
   // Snapshot of `successfulChannelSends` taken at turn start (same
   // moment `turnSeq` increments). Lets `markTurnSkipped` detect "a
   // channel send already landed in this turn" and reject the skip,
@@ -2334,10 +2345,13 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     live: LiveSession,
     label: string,
     startedAt = live.logicalTurnStartedAt,
+    // Deferred coverage can wait on another session's child; a reload successor
+    // under a new session ID owns none of them in the registry.
+    parentSessionId = live.sessionId,
   ): boolean => {
-    const childStartedAt = newestRunningChildSubagentStartedAt(live.sessionId)
+    const childStartedAt = newestRunningChildSubagentStartedAt(parentSessionId)
     if (childStartedAt === null || childStartedAt < startedAt) return false
-    return isPinnedByRunningChild(live.sessionId, live.keyId, label)
+    return isPinnedByRunningChild(parentSessionId, live.keyId, label)
   }
 
   const shouldRolloverLive = (live: LiveSession, idleMs: number): boolean => {
@@ -2530,10 +2544,18 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     inboundJournal.assertAvailable()
     await transferMismatchedAccountCoverageInLane(live)
     const hasCoverage = live.inboundCoverage.length > 0 || live.backgroundCoverage.length > 0
+    // Children of the session the coverage was deferred from and of its current claim owner.
+    const deferredParents = [
+      ...new Set([
+        live.coverageDeferredParentSessionId ?? live.backgroundTurnOwnerSessionId,
+        live.backgroundTurnOwnerSessionId,
+      ]),
+    ]
+    const deferredSince = live.coverageDeferredSince ?? live.logicalTurnStartedAt
     const deferredToBackground =
       hasCoverage &&
       (live.pendingSystemReminders.some((reminder) => reminder.backgroundObligationId !== undefined) ||
-        isAwaitingBackgroundChild(live, 'reload-handoff', live.coverageDeferredSince ?? live.logicalTurnStartedAt))
+        deferredParents.some((parent) => isAwaitingBackgroundChild(live, 'reload-handoff', deferredSince, parent)))
     if (hasCoverage && !deferredToBackground) {
       await transferLostCoverageInLane(live.key, live.inboundCoverage, live.backgroundCoverage, live.sessionId)
       live.inboundCoverage = []
@@ -2547,9 +2569,10 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           inboundIds: [...live.inboundCoverage],
           backgroundIds: [...live.backgroundCoverage],
           turnId: live.backgroundTurnId,
-          ownerSessionId: live.sessionId,
+          ownerSessionId: live.backgroundTurnOwnerSessionId,
           logicalTurnStartedAt: live.logicalTurnStartedAt,
           coverageDeferredSince: live.coverageDeferredSince,
+          coverageDeferredParentSessionId: live.coverageDeferredParentSessionId,
           ...(live.turnAccountIdentity !== undefined ? { turnAccountIdentity: live.turnAccountIdentity } : {}),
           lastTurnAuthorId: live.lastTurnAuthorId,
           lastTurnAuthorIds: [...live.lastTurnAuthorIds],
@@ -2720,14 +2743,16 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     if (adoptCoverage) {
       // Identity caches only. The journal claims stay with the source turn until
       // this session's in-lane consume revalidates and moves them, which happens
-      // before any prompt; restoring the source turn keeps that move and any
-      // retry lineage valid. A coverage-only handoff never prompts by itself: the
+      // before any prompt; restoring the source turn and owner keeps that move and
+      // any retry lineage valid. A coverage-only handoff never prompts by itself: the
       // child's completion (or the next real input) is what wakes this session.
       live.inboundCoverage = [...coverage.inboundIds]
       live.backgroundCoverage = [...coverage.backgroundIds]
       live.backgroundTurnId = coverage.turnId
+      live.backgroundTurnOwnerSessionId = coverage.ownerSessionId
       live.logicalTurnStartedAt = coverage.logicalTurnStartedAt
       live.coverageDeferredSince = coverage.coverageDeferredSince
+      live.coverageDeferredParentSessionId = coverage.coverageDeferredParentSessionId
       if (coverage.turnAccountIdentity !== undefined) live.turnAccountIdentity = coverage.turnAccountIdentity
       if (live.lastTurnAuthorId === null && coverage.lastTurnAuthorId !== null) {
         live.lastTurnAuthorId = coverage.lastTurnAuthorId
@@ -3039,6 +3064,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         inboundCoverage: [],
         backgroundStopVersion: 0,
         backgroundTurnId: randomUUID(),
+        backgroundTurnOwnerSessionId: created.sessionId,
         willingnessReminderIteration: false,
         contextBuffer: [],
         currentTurnAttachments: [],
@@ -3087,6 +3113,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         turnSeq: 0,
         logicalTurnStartedAt: now(),
         coverageDeferredSince: null,
+        coverageDeferredParentSessionId: null,
         successfulSendsAtTurnStart: 0,
         inFlightToolSends: new Map(),
         policyDeniedToolSendsThisTurn: new Map(),
@@ -4722,58 +4749,86 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
             .slice(0, batchCount)
             .flatMap((input) => (input.inputId ? [input.inputId] : []))
           const inboundRefs = await inboundJournal.resolve(inputIds)
-          if (live.inboundCoverage.length === 0) live.coverageDeferredSince = null
-          if (fresh && live.inboundCoverage.length > 0) {
+          let carriedBackground: BackgroundObligationRef[] = []
+          if (live.inboundCoverage.length === 0 && live.backgroundCoverage.length === 0) {
+            live.coverageDeferredSince = null
+            live.coverageDeferredParentSessionId = null
+          }
+          if (fresh && (live.inboundCoverage.length > 0 || live.backgroundCoverage.length > 0)) {
             // Coverage left open by a turn deferred to background work is owed, not
             // lost: carry it forward like a wakeup instead of posting a restart
-            // notice. Cached IDs are hints (a reload successor adopts them), so only
-            // rows the deferring turn still owns in the journal are carried or moved.
-            const deferred = live.inboundCoverage.flatMap((id) => {
-              const row = inboundJournal.get(id)
-              return row?.phase === 'turn-owned' &&
+            // notice. That covers deferred inputs and child results the deferring
+            // turn already consumed, together or alone. Cached IDs are hints (a reload
+            // successor adopts them), so only rows the recorded source turn and owner
+            // still hold at their current generation, target and account are carried.
+            const sourceOwner = live.backgroundTurnOwnerSessionId
+            const sourceAccount = live.turnAccountIdentity ?? currentAccountIdentityFor(live.key)
+            const cached: Array<InboundRecord | BackgroundObligation | undefined> = live.inboundCoverage.map((id) =>
+              inboundJournal.get(id),
+            )
+            for (const id of new Set(live.backgroundCoverage)) cached.push(await backgroundObligations.get(id))
+            const held = cached.filter(
+              (row): row is InboundRecord | BackgroundObligation =>
+                row?.phase === 'turn-owned' &&
                 !row.transfer &&
                 row.claim?.turnId === live.backgroundTurnId &&
-                row.claim.epoch === inboundJournal.epoch
-                ? [row]
-                : []
-            })
+                row.claim.ownerSessionId === sourceOwner &&
+                row.claim.epoch === inboundJournal.epoch &&
+                row.claim.generation === row.generation &&
+                channelKeyId(row.target) === live.keyId &&
+                row.accountIdentity === sourceAccount,
+            )
+            const deferred = held.flatMap((row) => ('inputId' in row ? [row] : []))
+            const deferredBackground = held.flatMap((row) => ('obligationId' in row ? [row] : []))
             live.inboundCoverage = deferred.map((row) => row.inputId)
+            live.backgroundCoverage = deferredBackground.map((row) => row.obligationId)
             const deferredSince = live.coverageDeferredSince ?? live.logicalTurnStartedAt
+            // The deferred work is a child of the session the coverage was deferred from
+            // or of the session now holding its claims; the two differ once a successor
+            // under another session ID has carried it.
+            const deferredParent = live.coverageDeferredParentSessionId ?? sourceOwner
+            const parents = [...new Set([deferredParent, sourceOwner])]
             // A child of the deferring turn that already finished no longer shows as
             // running, yet its durable result-ready wake in this same batch still
             // carries the debt into the coalesced turn. Only an exact match counts:
-            // spawned by the deferring owner, during the deferred interval, under the
-            // deferred inputs' account. Generic wake text or an unrelated child never does.
-            const owners = new Set(
-              deferred.flatMap((row) => (row.claim?.ownerSessionId ? [row.claim.ownerSessionId] : [])),
-            )
-            const accounts = new Set(deferred.map((row) => row.accountIdentity))
-            const completionCarrier = readyRows.some(
-              (row) =>
-                owners.has(row.parentSessionId) &&
-                accounts.size === 1 &&
-                accounts.has(row.accountIdentity) &&
-                row.acceptedAt >= deferredSince,
-            )
-            if (deferred.length === 0) {
+            // spawned by one of those sessions, during the deferred interval, under the
+            // source account. Generic wake text or an unrelated child never does.
+            const awaitingDeferredWork =
+              readyRows.some(
+                (row) =>
+                  parents.includes(row.parentSessionId) &&
+                  row.accountIdentity === sourceAccount &&
+                  row.acceptedAt >= deferredSince,
+              ) ||
+              parents.some((parent) =>
+                isAwaitingBackgroundChild(live, 'fresh-deferred-coverage', deferredSince, parent),
+              )
+            if (held.length === 0) {
               live.coverageDeferredSince = null
-            } else if (
-              batchCount > 0 &&
-              !completionCarrier &&
-              !isAwaitingBackgroundChild(live, 'fresh-inbound-coverage', deferredSince)
-            ) {
-              await transferLostCoverageInLane(live.key, live.inboundCoverage, live.backgroundCoverage, live.sessionId)
+              live.coverageDeferredParentSessionId = null
+            } else if (batchCount > 0 && !awaitingDeferredWork) {
+              await transferLostCoverageInLane(live.key, live.inboundCoverage, live.backgroundCoverage, sourceOwner)
               live.coverageDeferredSince = null
+              live.coverageDeferredParentSessionId = null
             } else {
+              // A wake-only batch still carries deferred inputs, but a consumed child
+              // result moves only on evidence that its deferred work is pending; an
+              // abandoned one stays with its source turn for durable recovery.
+              const background = awaitingDeferredWork
+                ? deferredBackground.map((row) => ({ obligationId: row.obligationId, generation: row.generation }))
+                : []
               if (batchCount > 0) live.coverageDeferredSince = deferredSince
-              const previous = await inboundJournal.resolve(live.inboundCoverage)
-              const movedInputs = await inboundJournal.move(previous, {
-                fromTurnId: live.backgroundTurnId,
-                turnId,
-                ownerSessionId: live.sessionId,
-                target: live.key,
-              })
-              inboundRefs.push(...movedInputs.inboundRefs)
+              live.coverageDeferredParentSessionId = deferredParent
+              if (deferred.length > 0 || background.length > 0) {
+                // One journal decision moves both kinds out of the source turn.
+                const moved = await inboundJournal.move(
+                  inboundJournal.resolve(live.inboundCoverage),
+                  { fromTurnId: live.backgroundTurnId, turnId, ownerSessionId: live.sessionId, target: live.key },
+                  background,
+                )
+                inboundRefs.push(...moved.inboundRefs)
+                carriedBackground = moved.backgroundRefs
+              }
             }
           }
           const owner = { turnId, ownerSessionId: live.sessionId, target: live.key }
@@ -4816,7 +4871,10 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           }
           live.inboundCoverage = [...carriedInboundIds, ...claimedCoverage.inboundRefs.map((ref) => ref.inputId)]
           live.backgroundTurnId = turnId
-          if (fresh) live.backgroundCoverage = []
+          if (fresh || carried) live.backgroundTurnOwnerSessionId = live.sessionId
+          // Moved results and newly claimed completions are disjoint: one was
+          // turn-owned, the other unclaimed and result-ready when the lane read it.
+          if (fresh) live.backgroundCoverage = carriedBackground.map((ref) => ref.obligationId)
           else
             live.backgroundCoverage = (await resolveBackgroundCoverage(live, live.backgroundCoverage, true)).map(
               (ref) => ref.obligationId,
@@ -8279,8 +8337,10 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           current.phase === 'closed' ||
           current.transfer ||
           liveSessions.has(keyId) ||
-          !pending ||
-          pending.coverage?.ownerSessionId !== args.parentSessionId
+          !pending?.coverage ||
+          ![pending.coverage.coverageDeferredParentSessionId, pending.coverage.ownerSessionId].includes(
+            args.parentSessionId,
+          )
         )
           return false
         if (pending.reminders.some((reminder) => reminder.backgroundObligationId === current.obligationId)) return true

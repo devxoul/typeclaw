@@ -479,6 +479,8 @@ async function debtFixture(
     held?: { text: string; entered: PromiseWithResolvers<void>; release: PromiseWithResolvers<void> }
     // Lets a test script a successor's model behavior before the router prompts it.
     onSessionCreated?: (session: ParentSession) => void
+    // Rehydrations come back under this session ID instead of the requested one.
+    successorSessionId?: string
   } = { now: 1000, account: 'account-a', messages: 0, closed: false }
   const router = createChannelRouter({
     agentDir: dir,
@@ -510,7 +512,10 @@ async function debtFixture(
       return {
         // The controlled boundary implements the session surface the router touches.
         session: session as unknown as AgentSession,
-        sessionId: existingSessionId ?? `parent-${sessions.length}`,
+        sessionId:
+          existingSessionId === undefined
+            ? `parent-${sessions.length}`
+            : (state.successorSessionId ?? existingSessionId),
         dispose: async () => {},
       }
     },
@@ -572,7 +577,7 @@ async function debtFixture(
   // Opens the conversation; the session is `parent-1`.
   await route('open the conversation')
   await flush()
-  return {
+  const debt = {
     dir,
     key,
     store,
@@ -689,6 +694,28 @@ async function debtFixture(
         await journal.close()
       }
       await rm(dir, { recursive: true, force: true })
+    },
+  }
+  return {
+    ...debt,
+    // The deferring turn consumes child-a's completion, starts child-b and waits on it. With a
+    // request, that request first defers to child-a; without one, child-a carries no inbound debt.
+    consumeThenDefer: async (request?: string, during?: () => Promise<void>) => {
+      const parent = sessions[0]!
+      let messageId: string | undefined
+      if (request === undefined) {
+        await debt.accept('child-a')
+      } else {
+        debt.deferToChild(parent, 'child-a')
+        messageId = await route(request)
+        await flush()
+        running.delete('parent-1')
+      }
+      state.now += 10
+      debt.deferToChild(parent, 'child-b', during)
+      await debt.complete('child-a')
+      await flush()
+      return messageId
     },
   }
 }
@@ -952,34 +979,250 @@ for (const carrier of ['another parent', 'an earlier turn'] as const) {
 }
 
 for (const reload of ['idle', 'mid-drain'] as const) {
-  test(`a ${reload} reload hands a child-deferred request to a fresh successor that answers once on completion`, async () => {
+  test(`a ${reload} reload hands a request and its consumed result to a successor that closes both`, async () => {
+    const f = await debtFixture()
+    try {
+      const request = (await f.consumeThenDefer(
+        'Please research the incident.',
+        reload === 'mid-drain' ? () => f.router.tearDownAllLive() : undefined,
+      ))!
+      // Idle: the successor comes back under a new session ID, is reloaded again and takes a
+      // follow-up while the original parent's child still runs, so no check may use its own ID.
+      if (reload === 'idle') {
+        f.state.successorSessionId = 'parent-2'
+        await f.router.tearDownAllLive()
+        await f.router.tearDownAllLive()
+      }
+
+      expect(await f.outbox.list()).toEqual([])
+      expect(f.creations).toEqual(reload === 'idle' ? [undefined, 'parent-1', 'parent-2'] : [undefined, 'parent-1'])
+      const successor = f.sessions.at(-1)!
+      expect(successor.prompts).toEqual([])
+      expect(f.inputRow(request)?.phase).toBe('turn-owned')
+      expect((await f.childRow('child-a'))?.phase).toBe('turn-owned')
+      const inputs = [request]
+      if (reload === 'idle') {
+        // The follow-up turn takes over the deferred coverage and keeps waiting on the child.
+        inputs.push(await f.route('Any progress?'))
+        await f.flush()
+        expect(successor.prompts).toHaveLength(1)
+        expect(await f.outbox.list()).toEqual([])
+      }
+
+      successor.onPrompt = async () =>
+        f.reply(successor, 'The incident was a DNS misconfiguration.', reload === 'idle' ? 'parent-2' : 'parent-1')
+      f.running.delete('parent-1')
+      await f.complete('child-b')
+      await f.flush()
+
+      const prompts = reload === 'idle' ? 2 : 1
+      expect(successor.prompts).toHaveLength(prompts)
+      expect(successor.prompts.at(-1)).toContain('child-b')
+      expect(f.sessions[0]!.prompts).toHaveLength(3)
+      expect(f.sent).toEqual(['The incident was a DNS misconfiguration.'])
+      for (const input of inputs) {
+        expect(f.inputRow(input)).toMatchObject({ phase: 'closed', outcome: { kind: 'delivered' } })
+      }
+      for (const task of ['child-a', 'child-b']) {
+        expect(await f.childRow(task)).toMatchObject({ phase: 'closed', outcome: { kind: 'delivered' } })
+      }
+      // Late duplicate completions find closed rows: no wake, no prompt, nothing owed after reboot.
+      expect((await f.complete('child-a')).kind).toBe('no-live-session')
+      expect((await f.complete('child-b')).kind).toBe('no-live-session')
+      await f.flush()
+      expect(successor.prompts).toHaveLength(prompts)
+      expect(await f.outbox.list()).toEqual([])
+      expect(await f.reboot()).toBe(0)
+    } finally {
+      await f.cleanup()
+    }
+  })
+}
+
+test("the original parent's completion waits on the handoff of a successor that took over its work", async () => {
+  const f = await debtFixture({ failCreationAttempts: [3] })
+  try {
+    const request = (await f.consumeThenDefer('Please research the incident.'))!
+    f.state.successorSessionId = 'parent-2'
+    await f.router.tearDownAllLive()
+    // parent-2's follow-up turn takes over the request and the consumed result; child-b stays parent-1's.
+    const followUp = await f.route('Any progress?')
+    await f.flush()
+    expect(f.sessions[1]!.prompts).toHaveLength(1)
+    // parent-2's own reload cannot recreate a session, so the coverage waits in the handoff.
+    await f.router.tearDownAllLive()
+    expect(f.router.liveCount()).toBe(0)
+    expect(await f.outbox.list()).toEqual([])
+    f.running.delete('parent-1')
+    expect((await f.complete('child-b')).kind).toBe('delivered')
+
+    f.state.onSessionCreated = (successor) => {
+      successor.onPrompt = async () => f.reply(successor, 'The incident was a DNS misconfiguration.', 'parent-2')
+    }
+    await f.router.tearDownAllLive()
+    await f.flush()
+
+    expect(f.creations).toEqual([undefined, 'parent-1', 'parent-2', 'parent-2'])
+    const successor = f.sessions.at(-1)!
+    expect(successor.prompts).toHaveLength(1)
+    expect(successor.prompts[0]).toContain('child-b')
+    expect(f.sent).toEqual(['The incident was a DNS misconfiguration.'])
+    for (const input of [request, followUp]) {
+      expect(f.inputRow(input)).toMatchObject({ phase: 'closed', outcome: { kind: 'delivered' } })
+    }
+    for (const task of ['child-a', 'child-b']) {
+      expect(await f.childRow(task)).toMatchObject({ phase: 'closed', outcome: { kind: 'delivered' } })
+    }
+    expect(await f.outbox.list()).toEqual([])
+    expect(await f.reboot()).toBe(0)
+  } finally {
+    await f.cleanup()
+  }
+})
+
+test('a coalesced follow-up and the next completion carry the consumed result of the deferring turn', async () => {
+  const f = await debtFixture()
+  try {
+    const request = (await f.consumeThenDefer('Please investigate the outage.'))!
+    const parent = f.sessions[0]!
+    parent.onPrompt = async () => f.reply(parent, 'The certificate expired; the database is healthy.')
+    f.running.delete('parent-1')
+    const followUp = await f.route('Is the database healthy too?')
+    await f.complete('child-b')
+    await f.flush()
+
+    expect(parent.prompts).toHaveLength(4)
+    expect(parent.prompts[3]).toContain('Is the database healthy too?')
+    expect(parent.prompts[3]).toContain('child-b')
+    expect(f.sent).toEqual(['The certificate expired; the database is healthy.'])
+    for (const input of [request, followUp]) {
+      expect(f.inputRow(input)).toMatchObject({ phase: 'closed', outcome: { kind: 'delivered' } })
+    }
+    for (const task of ['child-a', 'child-b']) {
+      expect(await f.childRow(task)).toMatchObject({ phase: 'closed', outcome: { kind: 'delivered' } })
+    }
+    expect(await f.outbox.list()).toEqual([])
+    expect(await f.reboot()).toBe(0)
+  } finally {
+    await f.cleanup()
+  }
+})
+
+test('a completion-only turn that consumed a result and waited on another child closes both', async () => {
+  const f = await debtFixture()
+  try {
+    await f.consumeThenDefer()
+    expect((await f.childRow('child-a'))?.phase).toBe('turn-owned')
+    const inputs = f.journal.list()
+    const parent = f.sessions[0]!
+    parent.onPrompt = async () => f.reply(parent, 'Both checks finished: all green.')
+    f.running.delete('parent-1')
+    await f.complete('child-b')
+    await f.flush()
+
+    expect(parent.prompts).toHaveLength(3)
+    expect(f.sent).toEqual(['Both checks finished: all green.'])
+    for (const task of ['child-a', 'child-b']) {
+      expect(await f.childRow(task)).toMatchObject({ phase: 'closed', outcome: { kind: 'delivered' } })
+    }
+    // No synthetic inbound row carried the result.
+    expect(f.journal.list()).toEqual(inputs)
+    expect(await f.outbox.list()).toEqual([])
+    expect(await f.reboot()).toBe(0)
+  } finally {
+    await f.cleanup()
+  }
+})
+
+for (const stale of ['claimed by another owner', 'already closed'] as const) {
+  test(`a consumed result ${stale} stays untouched while the request and the next child deliver`, async () => {
+    const f = await debtFixture()
+    try {
+      const request = (await f.consumeThenDefer('Please investigate the outage.'))!
+      const consumed = (await f.childRow('child-a'))!
+      const refs = [{ obligationId: consumed.obligationId, generation: consumed.generation }]
+      if (stale === 'claimed by another owner') {
+        await f.store.move(refs, {
+          fromTurnId: consumed.claim!.turnId,
+          turnId: 'foreign-turn',
+          ownerSessionId: 'parent-9',
+          target: f.key,
+        })
+      } else {
+        await f.journal.settle([], { kind: 'delivered', decisionId: 'answered-elsewhere' }, refs, f.key)
+      }
+      const before = await f.childRow('child-a')
+      const parent = f.sessions[0]!
+      parent.onPrompt = async () => f.reply(parent, 'The certificate expired.')
+      f.running.delete('parent-1')
+      await f.complete('child-b')
+      await f.flush()
+
+      expect(f.sent).toEqual(['The certificate expired.'])
+      expect(f.inputRow(request)).toMatchObject({ phase: 'closed', outcome: { kind: 'delivered' } })
+      expect(await f.childRow('child-b')).toMatchObject({ phase: 'closed', outcome: { kind: 'delivered' } })
+      expect(await f.childRow('child-a')).toEqual(before)
+    } finally {
+      await f.cleanup()
+    }
+  })
+}
+
+test('a consumed result re-owned by another session under the same turn is not carried forward', async () => {
+  const f = await debtFixture()
+  try {
+    await f.consumeThenDefer()
+    const consumed = (await f.childRow('child-a'))!
+    await f.store.move([{ obligationId: consumed.obligationId, generation: consumed.generation }], {
+      fromTurnId: consumed.claim!.turnId,
+      turnId: consumed.claim!.turnId,
+      ownerSessionId: 'parent-9',
+      target: f.key,
+    })
+    const before = await f.childRow('child-a')
+    const parent = f.sessions[0]!
+    parent.onPrompt = async () => f.reply(parent, 'The second check finished.')
+    f.running.delete('parent-1')
+    await f.complete('child-b')
+    await f.flush()
+
+    expect(f.sent).toEqual(['The second check finished.'])
+    expect(await f.childRow('child-b')).toMatchObject({ phase: 'closed', outcome: { kind: 'delivered' } })
+    expect(await f.childRow('child-a')).toEqual(before)
+  } finally {
+    await f.cleanup()
+  }
+})
+
+for (const next of ['an unrelated wake', 'a new request'] as const) {
+  test(`${next} does not acquire a consumed result its turn abandoned`, async () => {
     const f = await debtFixture()
     try {
       const parent = f.sessions[0]!
-      f.deferToChild(parent, 'research', reload === 'mid-drain' ? () => f.router.tearDownAllLive() : undefined)
-      const request = await f.route('Please research the incident.')
+      await f.accept('child-a')
+      // The wake consumes the result and ends silent without starting more work.
+      await f.complete('child-a')
       await f.flush()
-      if (reload === 'idle') await f.router.tearDownAllLive()
+      const abandoned = await f.childRow('child-a')
+      expect(abandoned?.phase).toBe('turn-owned')
 
-      expect(await f.outbox.list()).toEqual([])
-      // A fresh session rehydrates the same conversation, with no prompt of its own.
-      expect(f.creations).toEqual([undefined, 'parent-1'])
-      const successor = f.sessions[1]!
-      expect(successor.prompts).toEqual([])
-      expect(f.inputRow(request)?.phase).toBe('turn-owned')
-
-      successor.onPrompt = async () => f.reply(successor, 'The incident was a DNS misconfiguration.')
-      f.running.delete('parent-1')
-      await f.complete('research')
+      parent.onPrompt = async () => f.reply(parent, 'Here is the answer.')
+      // A completion with no durable obligation is a generic wake.
+      if (next === 'an unrelated wake') await f.complete('untracked-task')
+      else await f.route('What time is it?')
       await f.flush()
 
-      expect(successor.prompts).toHaveLength(1)
-      expect(successor.prompts[0]).toContain('research')
-      expect(parent.prompts).toHaveLength(2)
-      expect(f.sent).toEqual(['The incident was a DNS misconfiguration.'])
-      expect(f.inputRow(request)).toMatchObject({ phase: 'closed', outcome: { kind: 'delivered' } })
-      expect(await f.childRow('research')).toMatchObject({ phase: 'closed', outcome: { kind: 'delivered' } })
-      expect(await f.outbox.list()).toEqual([])
+      expect(f.sent).toEqual(['Here is the answer.'])
+      if (next === 'an unrelated wake') {
+        expect(await f.childRow('child-a')).toEqual(abandoned)
+        expect(await f.outbox.list()).toEqual([])
+      } else {
+        // A human batch with no deferred work pending transfers it, as for abandoned requests.
+        expect((await f.childRow('child-a'))?.phase).toBe('notice-owned')
+        const notices = await f.outbox.list()
+        expect(notices).toHaveLength(1)
+        expect(notices[0]!.covers.map((cover) => cover.id)).toEqual([abandoned!.obligationId])
+      }
     } finally {
       await f.cleanup()
     }

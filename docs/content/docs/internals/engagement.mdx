@@ -161,9 +161,11 @@ per-revision identity.
 
 Queues cache IDs rather than generation snapshots. The target lane resolves
 current ownership and commits a turn claim before splicing, todo updates,
-prompting or tool dispatch. Retries retain their claim; rollover and reload move
-ownership rather than copying or deleting an obligation. A confirmed terminal
-reply or review covers only its captured IDs. A substantive `channel_send` to
+prompting or tool dispatch. Retries retain their claim; a reload handoff or a
+deferred-work carry moves ownership rather than copying or deleting an
+obligation. Idle eviction and stale-session rollover do not; see the recovery
+boundary below. A confirmed terminal reply or review covers only its captured
+IDs. A substantive `channel_send` to
 the turn's exact origin coordinate (adapter, workspace, chat and thread; a root
 post does not match a thread origin) also settles the invoking session's
 captured inbound and fetched background coverage once the send lands and the
@@ -182,11 +184,24 @@ also consumes an eligible durable completion of that deferred work, the
 previous coverage moves into the coalesced turn even if the registry no longer
 reports the child running. An eligible completion is a real result-ready,
 unclaimed and untransferred obligation for the exact target. Its parent must be
-the deferred claim owner, its account must match, and it must have been
-accepted no earlier than the start of the deferred interval. Generic wakes and
-stale, closed, transferred, wrong-parent, wrong-account or earlier-turn
-completions are not carriers; a genuinely abandoned earlier turn still
-transfers to the notice outbox.
+the session the coverage was deferred from or its current claim owner, its
+account must match, and it must have been accepted no earlier than the start of
+the deferred interval. Generic wakes and stale, closed, transferred,
+wrong-parent, wrong-account or earlier-turn completions are not carriers; a
+genuinely abandoned earlier turn still transfers to the notice outbox.
+
+Deferred coverage is the turn's open requests, the child results it already
+consumed, or both. A completion-only turn that consumed one child's result and
+then waited on another child defers that result the same way, with no inbound
+row. Before the carrying turn's first prompt, one journal decision moves the
+requests and consumed results out of the source turn together, and the moved
+results stay in the new turn's coverage beside newly claimed completions, so its
+final reply closes all of them. A cached ID is only a locator: a row moves only
+while its current claim still names the recorded source turn and owner at the
+row's current generation, target and account. Without a running child of those
+sessions or an eligible completion, a fresh input transfers a consumed result to
+the notice outbox like an abandoned request, and a wake-only drain leaves it with
+its source turn for durable recovery instead of acquiring it.
 
 Different authors may share a turn without losing their immutable permission
 principals. Interruption notices partition coverage by exact channel key,
@@ -245,7 +260,10 @@ prompt. A completion that arrives before the successor is installed is held on
 the handoff only if it fits the existing per-key item, per-key byte and global
 byte limits. Otherwise the error is logged, the handoff stays as it was, and
 the result remains owed for durable recovery. The successor's target lane
-revalidates and moves durable ownership before its first real prompt. Coverage
+revalidates and moves durable ownership before its first real prompt. Restored
+IDs grant no ownership by themselves: the successor checks them against the
+recorded source turn and owner and that deferral's child, which may belong to a
+session ID other than its own. Coverage
 whose account no longer matches transfers under its original account before
 retention, so no successor inherits it. `/stop` (text or native slash) with no
 live session withdraws a pending handoff that holds owed or queued work
@@ -308,9 +326,9 @@ durability.
 
 The registry remains the authority for execution, and the transcript remains the authority for content. Canonical child completion marks an existing obligation result-ready; it does not settle the response. An absent parent, a queued completion, reminder consumption, assistant `stop`, `NO_REPLY` or provider failure leaves the response owed. **Queued is not delivered.**
 
-Before splicing completion reminders into a prompt, the router durably claims their exact obligation IDs and generations. A successful final-result fetch attaches that task's coverage; polling a running task does not. Retries retain coverage and session rollover moves ownership rather than recreating the obligation. Only a router settlement decision closes consumed or fetched coverage: a confirmed terminal reply, recognized formal review, substantive non-terminal `channel_send` to the exact origin coordinate, explicit skip or `/stop`. Progress, `more_work_this_turn`, continuation willingness, off-target sends and sends from other sessions cannot settle siblings or other turns. The durable decision precedes cache clearing or parent abort.
+Before splicing completion reminders into a prompt, the router durably claims their exact obligation IDs and generations. A successful final-result fetch attaches that task's coverage; polling a running task does not. Retries retain coverage, and a reload handoff or deferred-work carry moves ownership rather than recreating the obligation. Only a router settlement decision closes consumed or fetched coverage: a confirmed terminal reply, recognized formal review, substantive non-terminal `channel_send` to the exact origin coordinate, explicit skip or `/stop`. Progress, `more_work_this_turn`, continuation willingness, off-target sends and sends from other sessions cannot settle siblings or other turns. The durable decision precedes cache clearing or parent abort.
 
-Live queues and turn coverage retain obligation IDs, not generation snapshots. Claim, fetch, settlement, stop withdrawal and rollover resolve current ownership inside the same per-target lane after earlier decisions finish. A fetch retires its queued wake; a closed or already-owned wake is reconciled without replaying the result or blocking unrelated human input. `/stop` waits for an in-flight claim before selecting its coverage. If genuine storage failure prevents withdrawal, it reports the failure and still aborts the parent; the unresolved obligation remains eligible for conservative recovery.
+Live queues and turn coverage retain obligation IDs, not generation snapshots. Claim, fetch, settlement, stop withdrawal and reload retention resolve current ownership inside the same per-target lane after earlier decisions finish. A fetch retires its queued wake; a closed or already-owned wake is reconciled without replaying the result or blocking unrelated human input. `/stop` waits for an in-flight claim before selecting its coverage. If genuine storage failure prevents withdrawal, it reports the failure and still aborts the parent; the unresolved obligation remains eligible for conservative recovery.
 
 On boot, unresolved obligations from an earlier epoch transfer to `channels/recovery-outbox/<deliveryId>.json`. An obligation that shares a notice partition with older-epoch inbound requests joins that partition's single mixed notice; the remaining obligations use the existing background-only transfer. The source freezes coverage, target, principal, delivery ID and notice payload before import; outbox import is durable before source ownership changes. A delivered interruption notice ends exactly the obligations it covers. Repeated boots repair the same transfer rather than replaying the child or asking the model to recover it. The old launch-inventory format is read only for migration, respecting already-transferred and delivered receipts before retiring legacy files. Ordinary #291 restart greetings and TUI handoff remain separate.
 
@@ -344,6 +362,7 @@ The locale, template version and text are frozen at transfer preparation. This s
 
 - **Inbound and background guarantee:** unless explicitly cancelled or intentionally suppressed, a durably accepted channel request interrupted by process death eventually receives an answer or interruption notice once the runtime and authorized destination are available again. This starts at the durable admission boundary, not at upstream delivery or the first transcript entry.
 - Healthy terminal replies, reviews and substantive origin `channel_send` deliveries close their exact result coverage without an extra interruption notice. A remote reply, review or send that landed before a settlement-write failure remains ambiguous: the obligation stays owed, and a later notice may accompany that answer. This never authorizes repeating the reply, review, send or logical turn. Notices contain no request content, names, transcript or provider errors, and interrupted work is never automatically replayed.
+- **Known limitation:** idle eviction and stale-session rollover tear a session down without moving or transferring its open coverage. Its requests and consumed results stay owned by the dead turn until the next boot transfers them, so that notice can be late and can arrive after a later reply already answered the request.
 - Delivery is **at least once**, not exactly once. Death after a remote POST succeeds but before the local receipt is synced is ambiguous. Supported adapters reconcile the stable correlation marker against paginated history from their own authenticated actor at the exact target; a read failure or first-page miss is not proof of absence. Unknown or unsupported reconciliation eventually retries, accepting a possible duplicate notice. No ambiguous remote success authorizes replay of a reply, review or logical turn.
 - Inventories written before this version, and new admissions whose cached identity was unavailable, use an unbound marker. The first authorized attempt durably binds the authenticated actor serving the original exact adapter/workspace under its lease before sending. Slack direct-message coordinates use a workspace sentinel, while account identity still uses the authenticated team/user. A later identity change blocks delivery. An unbound record cannot prove that the posting identity stayed unchanged between death and reboot.
 - One active runtime per agent directory is supported. Local leases fence callbacks and reboots, not simultaneous runtimes or already-issued remote requests. JSON publication syncs the file and containing directory on POSIX; Windows development cannot provide the same directory-sync power-loss guarantee. Unresolved records and terminal receipts are retained.
