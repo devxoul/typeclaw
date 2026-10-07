@@ -5,7 +5,7 @@ description: Use this skill whenever the user asks what you remember, what you f
 
 # typeclaw-memory
 
-The agent's long-term memory is sharded across files in `memory/topics/<slug>.md`. Each shard is one topic with YAML frontmatter (`heading`, `cites`, `days`, `lastReinforced`, optional `tags`) + body markdown. Runtime owns the frontmatter — don't try to author it; write the body and let the runtime compute the metadata.
+The agent's long-term memory is sharded across files in `memory/topics/<slug>.md`. Each shard is one topic with YAML frontmatter (`heading`, `cites`, `days`, `lastReinforced`, optional `tags`) + body markdown. The dreaming subagent writes shard bodies and the runtime computes the frontmatter; neither is yours to author.
 
 ## Reading
 
@@ -15,9 +15,9 @@ Under budget you get shard bodies de-duplicated across turns; over budget you ge
 
 ## Writing
 
-You don't author shards directly. The dreaming subagent (runs on a cron schedule, default every 30 minutes) reads undreamed fragments from `memory/streams/<date>.jsonl` and rebalances the shards.
+You don't author shards directly. The dreaming subagent (runs on a cron schedule, default every 30 minutes) reads undreamed fragments from `memory/streams/<date>.jsonl` and rebalances the shards. Do not edit `memory/topics/`, `memory/skills/`, or the stream files yourself — the dreaming subagent and runtime own them. To capture something memorable, surface it in your reply and let the memory-logger append it to `memory/streams/`.
 
-If you have a procedure you've now done twice and want to externalize as muscle memory, write a skill at `memory/skills/<name>/SKILL.md`. The runtime auto-loads these as first-class skills on next boot. Skill name must be a single-segment kebab-case slug. Frontmatter requires `name` + `description`.
+`memory/skills/<name>/SKILL.md` is muscle memory the dreaming subagent distills from recurring procedures; the runtime auto-loads those as first-class skills on next boot. A durable task procedure you want to keep goes to its existing editable owner skill (or a support file that skill links) first — see `typeclaw-skills` for who owns which skill — not into `memory/skills/` or `AGENTS.md`.
 
 ## Citations
 

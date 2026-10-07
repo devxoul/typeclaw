@@ -1,9 +1,20 @@
 #!/usr/bin/env bun
 
+// Debug dump of the TypeClaw-composed system-prompt preamble for each standard
+// session origin, with placeholder inputs. Every origin — including the
+// default subagent — goes through the real `composeSystemPrompt`, so the
+// sections and their order are exactly what `createResourceLoader` produces.
+//
+// This is the preamble only. pi appends project context (AGENTS.md), the skill
+// catalog, and the cwd when it assembles the final system message; capture a
+// real session's `session.systemPrompt` for that. Sessions created with an
+// explicit `systemPromptOverride` do not use this composer and are not dumped.
+
 import { parseArgs } from 'node:util'
 
-import { composeSystemPrompt, deriveSystemPromptMode, renderTurnTimeAnchor, type SystemPromptMode } from '@/agent'
-import type { SessionOrigin, SessionRoleContext } from '@/agent/session-origin'
+import { composeSystemPrompt, deriveSystemPromptMode, renderTurnTimeAnchor } from '@/agent'
+import { renderInteractiveSessionContext, type SessionOrigin, type SessionRoleContext } from '@/agent/session-origin'
+import { buildSystemPolicy, DEFAULT_SUBAGENT_ROSTER, renderRuntimeBlock } from '@/agent/system-prompt'
 import { renderRetrievedMemorySection, type RetrievedMemoryItem } from '@/bundled-plugins/memory/load-memory'
 import { composeTurnPrompt } from '@/channels/router'
 
@@ -178,10 +189,10 @@ export type DumpResult = {
   totalTokens: number
 }
 
-// Heuristic: ~4 chars per token. Industry rule-of-thumb (e.g. OpenAI tokenizer
-// docs); accurate to ~15% for English prose / markdown, model-agnostic across
-// Claude / GPT / Gemini families. Exposed so tests can assert the methodology.
-export const TOKENS_PER_CHAR = 0.25
+// Rough size estimate: ~4 chars per token. A model-agnostic rule of thumb for
+// English prose/markdown, NOT a tokenizer count — use a real tokenizer for any
+// measurement you report.
+const TOKENS_PER_CHAR = 0.25
 
 export function estimateTokens(text: string): number {
   return Math.round(text.length * TOKENS_PER_CHAR)
@@ -198,12 +209,6 @@ export function byteLength(text: string): number {
   return encoder.encode(text).length
 }
 
-const PLACEHOLDER_SUBAGENT_OVERRIDE = [
-  'You are typeclaw <PLACEHOLDER: subagent name>, a narrow worker subagent.',
-  '',
-  '<PLACEHOLDER: contents of the subagent-specific system prompt — owned by the plugin/bundled subagent that declared this worker. Real examples: memory-logger (~1000 tok), dreaming (~2200 tok). The prompt is opaque to the runtime; it teaches the subagent its job, its tools, and its termination contract.>',
-].join('\n')
-
 const mkSection = (name: string, body: string): SectionBreakdown => ({
   name,
   bytes: byteLength(body),
@@ -211,87 +216,32 @@ const mkSection = (name: string, body: string): SectionBreakdown => ({
   tokens: estimateTokens(body),
 })
 
+// Each section row runs from its marker to the next one, so it includes the
+// `\n\n` separator that follows it and the rows sum exactly to the totals.
 export function dumpSystemPromptWithBreakdown(
   kind: OriginKind,
   options: { gitNudge: boolean } = { gitNudge: true },
 ): DumpResult {
-  if (kind === 'subagent') return dumpSubagentOverridePrompt()
-  return dumpDefaultLoaderPrompt(kind, options)
-}
-
-// Subagent sessions in production go through `defaultCreateSessionForSubagent`
-// (and the plugin-subagent path in run/index.ts), both of which set
-// `systemPromptOverride: subagent.systemPrompt`. That routes through
-// `createOverrideResourceLoader`, which emits only:
-//   <override string> + runtime block + origin (with role)
-// No DEFAULT/SLIM base, no IDENTITY/SOUL, no git-nudge.
-//
-// Without this branch, the dumper would report a misleadingly large slim
-// breakdown for the subagent case and contradict AGENTS.md's "the section
-// order it prints is the section order an agent actually sees" contract.
-function dumpSubagentOverridePrompt(): DumpResult {
-  const fixture = buildFixture('subagent')
-  const runtimeBlock = `## Runtime\n\nTypeClaw runtime version: ${PLACEHOLDER_RUNTIME_VERSION}.`
-  const originBlock = `## Session origin\n\nYou are a \`${(fixture.origin as { subagent: string }).subagent}\` subagent spawned by parent session\n\`${(fixture.origin as { parentSessionId: string }).parentSessionId}\`. Stay narrowly within the task you were given.\nReturn cleanly when done; do not sprawl into unrelated work.\n\n## Your role in this session\n\nRole: \`${fixture.roleContext.role}\`. Permissions: ${fixture.roleContext.permissions.map((p) => `\`${p}\``).join(', ')}.\n\nThis is the role the runtime resolved at session creation. Tool calls\nand channel admission are gated by these permissions; a \`blocked:\` or\n"denied by permissions" message means the current actor lacks the\npermission the guard was looking for. See the \`typeclaw-permissions\`\nskill for what each role can do and how to grant access.`
-
-  const prompt = `${PLACEHOLDER_SUBAGENT_OVERRIDE}\n\n${runtimeBlock}\n\n${originBlock}`
-  const sections: SectionBreakdown[] = [
-    mkSection('Subagent override prompt', PLACEHOLDER_SUBAGENT_OVERRIDE),
-    mkSection('Runtime block', runtimeBlock),
-    mkSection('Session origin + role', originBlock),
-  ]
-  return {
-    prompt,
-    sections,
-    totalBytes: byteLength(prompt),
-    totalChars: prompt.length,
-    totalTokens: estimateTokens(prompt),
-  }
-}
-
-function dumpDefaultLoaderPrompt(kind: Exclude<OriginKind, 'subagent'>, options: { gitNudge: boolean }): DumpResult {
   const fixture = buildFixture(kind)
-  const mode: SystemPromptMode = deriveSystemPromptMode(fixture.origin)
-  const wantGitNudge = options.gitNudge && mode === 'full'
-  const parts = {
+  const mode = deriveSystemPromptMode(fixture.origin)
+  const gitNudge = options.gitNudge && mode === 'full' ? PLACEHOLDER_GIT_NUDGE : ''
+  const prompt = composeSystemPrompt({
     mode,
     self: PLACEHOLDER_SELF,
     runtimeVersion: PLACEHOLDER_RUNTIME_VERSION,
     origin: fixture.origin,
     roleContext: fixture.roleContext,
-    gitNudge: wantGitNudge ? PLACEHOLDER_GIT_NUDGE : '',
-  } as const
-
-  const prompt = composeSystemPrompt(parts)
-
-  const baseEnd = prompt.indexOf(`\n\n${parts.self}`)
-  const base = baseEnd > 0 ? prompt.slice(0, baseEnd) : ''
-  const baseLabel = mode === 'slim' ? 'SLIM_SYSTEM_PROMPT (base)' : 'DEFAULT_SYSTEM_PROMPT (base)'
-  const sections: SectionBreakdown[] = [
-    mkSection(baseLabel, base),
-    mkSection('Identity (IDENTITY.md + SOUL.md)', parts.self),
-    mkSection('Runtime block', `## Runtime\n\nTypeClaw runtime version: ${parts.runtimeVersion}.`),
-    mkSection('Session origin', extractSection(prompt, '## Session origin', '## Your role in this session')),
-    mkSection(
-      'Role context',
-      extractSection(
-        prompt,
-        '## Your role in this session',
-        parts.gitNudge !== '' ? '## Uncommitted changes at session start' : undefined,
-      ),
-    ),
+    gitNudge,
+  })
+  const markers: Array<readonly [string, string]> = [
+    ['Shared policy', buildSystemPolicy()],
+    ['Identity (IDENTITY.md + SOUL.md)', PLACEHOLDER_SELF],
+    ['Runtime block', renderRuntimeBlock(PLACEHOLDER_RUNTIME_VERSION)],
   ]
-  if (parts.gitNudge !== '') {
-    sections.push(mkSection('Git nudge', parts.gitNudge))
-  }
-
-  return {
-    prompt,
-    sections,
-    totalBytes: byteLength(prompt),
-    totalChars: prompt.length,
-    totalTokens: estimateTokens(prompt),
-  }
+  if (mode === 'full') markers.push(['Interactive context', renderInteractiveSessionContext(DEFAULT_SUBAGENT_ROSTER)])
+  markers.push(['Session origin', '## Session origin\n'], ['Role context', '## Your role in this session\n'])
+  if (gitNudge !== '') markers.push(['Git nudge', gitNudge])
+  return buildDumpResultFromMarkers(prompt, markers)
 }
 
 export function dumpSystemPrompt(kind: OriginKind, options: { gitNudge: boolean } = { gitNudge: true }): string {
@@ -373,7 +323,7 @@ export function dumpTurnPrompt(kind: OriginKind): string {
 
 function buildDumpResult(prompt: string, parts: ReadonlyArray<readonly [string, string]>): DumpResult {
   if (parts.map(([, body]) => body).join('') !== prompt) {
-    throw new Error('turn-prompt breakdown does not cover the rendered prompt exactly')
+    throw new Error('prompt breakdown does not cover the rendered prompt exactly')
   }
   return {
     prompt,
@@ -384,37 +334,26 @@ function buildDumpResult(prompt: string, parts: ReadonlyArray<readonly [string, 
   }
 }
 
+// Locates each marker after the previous one, so a marker string that also
+// occurs earlier (inside policy prose, say) cannot be mistaken for its section.
 function buildDumpResultFromMarkers(prompt: string, markers: ReadonlyArray<readonly [string, string]>): DumpResult {
-  const starts = markers.map(([name, marker], index) => {
-    const start = prompt.indexOf(marker, index === 0 ? 0 : 1)
-    if (start < 0) throw new Error(`turn-prompt section marker not found: ${name}`)
-    return { name, start }
-  })
-  if (starts[0]?.start !== 0 || starts.some((part, index) => index > 0 && part.start <= starts[index - 1]!.start)) {
-    throw new Error('turn-prompt section markers are not in rendered order')
+  const starts: Array<{ name: string; start: number }> = []
+  for (const [name, marker] of markers) {
+    const previous = starts.at(-1)
+    const start = prompt.indexOf(marker, previous === undefined ? 0 : previous.start + 1)
+    if (start < 0) throw new Error(`prompt section marker not found in rendered order: ${name}`)
+    starts.push({ name, start })
   }
+  if (starts[0]?.start !== 0) throw new Error('the first prompt section marker does not start the prompt')
   return buildDumpResult(
     prompt,
     starts.map((part, index) => [part.name, prompt.slice(part.start, starts[index + 1]?.start)] as const),
   )
 }
 
-// Slice between two unique headers in the rendered prompt. Both anchors are
-// guaranteed unique by `composeSystemPrompt`'s contract (each section's
-// header appears exactly once). Used by the breakdown so we attribute each
-// section's chars precisely instead of guessing from input fixtures.
-function extractSection(prompt: string, startHeader: string, endHeader: string | undefined): string {
-  const start = prompt.lastIndexOf(`\n\n${startHeader}`)
-  if (start < 0) return ''
-  const afterStart = start + 2
-  if (endHeader === undefined) return prompt.slice(afterStart)
-  const end = prompt.indexOf(`\n\n${endHeader}`, afterStart)
-  return end < 0 ? prompt.slice(afterStart) : prompt.slice(afterStart, end)
-}
-
 function header(kind: OriginKind, result: DumpResult, label: 'SYSTEM PROMPT' | 'USER TURN'): string {
   const bar = '═'.repeat(78)
-  const summary = `~${result.totalTokens} tok / ${result.totalChars} chars / ${result.totalBytes} bytes (tok est. chars/4)`
+  const summary = `${result.totalChars} chars / ${result.totalBytes} bytes / ~${result.totalTokens} tok (chars/4 estimate, not a tokenizer count)`
   return `\n${bar}\n  ${label} — origin: ${kind} — ${summary}\n${bar}\n`
 }
 
@@ -430,7 +369,7 @@ function renderBreakdownTable(result: DumpResult): string {
   const sep = `  ${'─'.repeat(nameW)}  ${'─'.repeat(tokW)}  ${'─'.repeat(charW)}  ${'─'.repeat(byteW)}`
 
   const lines = [
-    row('Section', 'Tokens', 'Chars', 'Bytes'),
+    row('Section', '~Tok', 'Chars', 'Bytes'),
     sep,
     ...result.sections.map((s) => row(s.name, `~${s.tokens}`, String(s.chars), String(s.bytes))),
     sep,
@@ -456,11 +395,13 @@ function main(): void {
       [
         'Usage: bun run debug:prompt [--turn] [--origin <kind>] [--no-git-nudge]',
         '',
-        'Dump the rendered system prompt, or the per-turn user message with --turn,',
-        'for one or all session-origin kinds,',
-        'using placeholder values for every dynamic field. Each dump is prefixed',
-        'with a per-section breakdown showing approximate tokens (chars/4),',
-        'character count, and UTF-8 byte length.',
+        'Dump the TypeClaw-composed system-prompt preamble, or the per-turn user',
+        'message with --turn, for one or all session-origin kinds, using',
+        'placeholder values for every dynamic field. pi appends project context,',
+        'the skill catalog, and the cwd to the preamble at session creation.',
+        'Each dump is prefixed with a per-section breakdown of character count,',
+        'UTF-8 byte length, and a rough chars/4 token estimate (not a tokenizer',
+        'count); rows include their trailing separator and sum to the totals.',
         '',
         'Options:',
         '  -o, --origin <kind>   tui | cron | channel | subagent | all (default: all)',

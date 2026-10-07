@@ -1,13 +1,26 @@
 ---
 name: typeclaw-troubleshooting
-description: Use this skill when you are stuck in a fix-it loop — you've made roughly three attempts at the same failure and you're still cycling shell commands (kill the process, re-run, `sleep`, `capture-pane`, inspect, retry) without converging. Triggers include a hung or runaway process that won't die, a `C-c` that didn't stop the program, `<defunct>`/zombie processes piling up in `ps`, an interactive program that blocks `bash` waiting for input, a script that "ran" but produced no output and no file, repeated "not found"/timeout/same-error-again loops, and any moment you catch yourself thinking "let me wait a bit more and check again" for the third time. Read it before you spawn `operator` to take over the debugging — it covers the operator hand-off prompt, the tmux session pattern, killing stuck/zombie processes properly, and the edge-triggered capture-pane polling loop that the inline retry-and-sleep approach gets wrong.
+description: Use this skill when you are stuck in a fix-it loop — you've made roughly three attempts at the same failure and you're still cycling shell commands (kill the process, re-run, `sleep`, `capture-pane`, inspect, retry) without converging. Triggers include a hung or runaway process that won't die, a `C-c` that didn't stop the program, `<defunct>`/zombie processes piling up in `ps`, an interactive program that blocks `bash` waiting for input, a script that "ran" but produced no output and no file, repeated "not found"/timeout/same-error-again loops, and any moment you catch yourself thinking "let me wait a bit more and check again" for the third time. Also read it before you start a minutes-long or input-waiting program in your own session (dev server, REPL, watcher, `docker compose up`, interactive installer) — foreground `bash` blocks until exit, and this skill has the detached tmux start/observe/drive/stop pattern. Read it before you spawn `operator` to take over the debugging — it covers the operator hand-off prompt, the tmux session pattern, killing stuck/zombie processes properly, and the edge-triggered capture-pane polling loop that the inline retry-and-sleep approach gets wrong.
 ---
 
 # typeclaw-troubleshooting
 
 When a problem fights back, the failure mode is not "I can't fix it" — it's "I'm burning my own context and freezing the conversation while I fix it." A debugging loop is inherently noisy: every retry dumps stale shell output, zombie-process listings, and pane captures into your context, and each blocking `bash` call (especially `sleep N` followed by a capture) leaves the user staring at a frozen-looking conversation. The fix is to move the loop out of your session and into `operator`, which has bash-with-side-effects and runs in its own context window.
 
-This skill is the runbook for that hand-off. Read it once you've hit the trigger (~3 attempts on the same failure without convergence), **before** you spawn `operator`.
+This skill is the runbook for that hand-off. Read it once you've hit the trigger (~3 attempts on the same failure without convergence), **before** you spawn `operator`. It also owns the plain long-running-command pattern below, which applies before any loop starts.
+
+## Long-running and interactive commands
+
+Foreground `bash` blocks until the command exits. Run minutes-long or input-waiting programs (dev servers, REPLs, watchers, `docker compose up`, installers) detached in `tmux`:
+
+```sh
+tmux new-session -d -s <name> "<cmd>"      # start
+tmux capture-pane -t <name> -p             # observe
+tmux send-keys -t <name> "<input>" Enter   # drive
+tmux kill-session -t <name>                # stop
+```
+
+Use tmux only for work that belongs in your session. In an interactive session that can spawn subagents, delegate self-contained long work (builds, tests, installs, batches) to `operator` instead, so the conversation stays responsive. If the command starts failing in a loop, the rest of this skill applies.
 
 ## The trigger, concretely
 

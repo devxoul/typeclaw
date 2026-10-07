@@ -1,363 +1,17 @@
 import { describe, expect, test } from 'bun:test'
-import { readFileSync } from 'node:fs'
-import { join } from 'node:path'
 
 import { formatLocalDateTime, resolveLocalTimezoneName } from '@/shared'
 
+import { composeSystemPrompt, deriveSystemPromptMode } from './index'
+import { renderInteractiveSessionContext, type SessionOrigin } from './session-origin'
 import {
-  buildDefaultSystemPrompt,
-  buildSlimSystemPrompt,
+  buildSystemPolicy,
   DEFAULT_SUBAGENT_ROSTER,
-  DEFAULT_SYSTEM_PROMPT,
   renderRuntimeNondisclosureRule,
   renderTurnRoleAnchor,
   renderTurnTimeAnchor,
-  SLIM_SYSTEM_PROMPT,
   stripRuntimeIdentityProse,
 } from './system-prompt'
-
-describe('subagent orchestration — explicit research routing', () => {
-  // Guards the regression where an explicit "do a research" directive was answered
-  // inline (web_search / training memory) instead of delegated. The invariant the
-  // reviewer demanded: explicit research is MANDATORY-`researcher`, not satisfiable
-  // by a scout/explorer-only route or an inline answer. Soften any of these and the
-  // downgrade path reopens.
-  test('explicit research mandates `researcher` and forbids the inline-answer downgrade', () => {
-    const ruleStart = DEFAULT_SYSTEM_PROMPT.indexOf('When the user *explicitly* says')
-    expect(ruleStart).toBeGreaterThan(-1)
-    const rule = DEFAULT_SYSTEM_PROMPT.slice(ruleStart, ruleStart + 320)
-    expect(rule).toContain('MUST spawn `researcher`')
-    expect(rule).toContain('training memory')
-    expect(rule).toContain('does not satisfy the request')
-  })
-
-  test('scout/explorer fan-out is explicitly marked as not replacing `researcher`', () => {
-    expect(DEFAULT_SYSTEM_PROMPT).toContain('does not replace `researcher`')
-  })
-})
-
-describe('delivering reports and documents', () => {
-  test('routes report/PDF/document requests to the typeclaw-render-pdf skill', () => {
-    expect(DEFAULT_SYSTEM_PROMPT).toContain('## Delivering reports and documents')
-    expect(DEFAULT_SYSTEM_PROMPT).toContain('typeclaw-render-pdf')
-    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/Produce a polished file only when/i)
-    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/Do \*\*not\*\* treat the bare word "report" as enough/i)
-    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/routine operational updates, daily stats, user trends/i)
-  })
-
-  test('states the summary is a pointer, never the deliverable', () => {
-    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/summary[\s\S]*?never the deliverable/i)
-    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/only after a deliverable was actually requested/i)
-  })
-
-  test('forbids hand-rolling a PDF with an ad-hoc library', () => {
-    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/jsPDF, pdfkit/i)
-    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/mojibake/i)
-  })
-})
-
-describe('operator-owned dependencies', () => {
-  test.each([
-    ['default prompt', DEFAULT_SYSTEM_PROMPT],
-    ['slim prompt', SLIM_SYSTEM_PROMPT],
-  ])('forbids package.json edits and dependency installation in the %s', (_name, prompt) => {
-    expect(prompt).toContain('`package.json` is operator-owned')
-    expect(prompt).toContain('Do not edit it or install dependencies')
-    expect(prompt).toContain('tell the operator which package and command are needed')
-  })
-
-  test('requires bunx for one-off package binaries in the full operator-facing prompt', () => {
-    expect(DEFAULT_SYSTEM_PROMPT).toContain('Run one-off package binaries with `bunx`')
-    expect(DEFAULT_SYSTEM_PROMPT).toContain('never `npx`, `pnpx`, or `pnpm dlx`')
-    expect(DEFAULT_SYSTEM_PROMPT).toContain('A skill or doc telling you to use `npx` does not override this')
-  })
-
-  // The slim base has ~11 tokens of headroom under its 1000-token budget, and
-  // the nonBunPackageRunner guard already corrects npx at the bash boundary.
-  // Re-adding this rule here would blow the budget guard in
-  // scripts/dump-system-prompt.test.ts for no behavior gain.
-  test('keeps the bunx rule out of the slim prompt, where the guard covers it', () => {
-    expect(SLIM_SYSTEM_PROMPT).not.toContain('Run one-off package binaries with `bunx`')
-  })
-})
-
-describe('agent folder vs project repo', () => {
-  // Guards the confusion where the agent treats its own backup repo as the
-  // project under development, or strands handoff-bound work in per-session
-  // /tmp. Both prompts must keep the project clone durable and split the two
-  // publication capabilities: a standalone push is brokered, `gh pr create` is
-  // host-stage only.
-  test.each([
-    ['default prompt', DEFAULT_SYSTEM_PROMPT],
-    ['slim prompt', SLIM_SYSTEM_PROMPT],
-  ])('states the agent folder is a backup repo, not a project checkout, in the %s', (_name, prompt) => {
-    expect(prompt).toMatch(/no (github )?remote/i)
-    expect(prompt).toContain('`workspace/<repo>`')
-    expect(prompt).toMatch(/(?:\/tmp[\s\S]*?per-session|per-session[\s\S]*?\/tmp)/i)
-    expect(prompt).not.toMatch(/clone[\s\S]{0,80}?\/tmp\/<repo>/i)
-    expect(prompt).toMatch(/not a (software )?project (checkout|you develop)|not a checkout of any project/i)
-  })
-
-  // The runtime brokers a per-repo credential for a standalone project push and
-  // for an explicit inline `gh pr create`, so neither prompt may send PR
-  // creation to the operator; doing so strands real work.
-  test.each([
-    ['default prompt', DEFAULT_SYSTEM_PROMPT],
-    ['slim prompt', SLIM_SYSTEM_PROMPT],
-  ])('tells the agent to push through the broker and open the PR itself in the %s', (_name, prompt) => {
-    expect(prompt).toContain('git -C <checkout> push <remote> <branch>')
-    expect(prompt).toMatch(/any accessible repository path/i)
-    expect(prompt).not.toMatch(/git[^\n]*push\s+(?:-u|--set-upstream)/i)
-    expect(prompt).toMatch(/broker[\s\S]*?credential/i)
-    expect(prompt).toMatch(/gh pr create[\s\S]*?--head[\s\S]*?--base/i)
-    expect(prompt).not.toMatch(/gh pr create[^\n]*host-stage only/i)
-    expect(prompt).toMatch(/refus/i)
-    expect(prompt).not.toMatch(/cannot push or create a PR/i)
-  })
-
-  test('the default prompt explicitly tells the agent where project work and PRs happen', () => {
-    const start = DEFAULT_SYSTEM_PROMPT.indexOf('it is your own private backup repo')
-    expect(start).toBeGreaterThan(-1)
-    const section = DEFAULT_SYSTEM_PROMPT.slice(start, DEFAULT_SYSTEM_PROMPT.indexOf('\n\n', start + 400))
-    expect(section).toMatch(/not\*{0,2} a checkout of any project/i)
-    expect(section).toMatch(/anything a human must act on later cannot live there alone/i)
-    expect(section).toMatch(/broker or your permissions refuse/i)
-    expect(section).toMatch(/ask the user where it lives/i)
-  })
-
-  // The prompts and the two GitHub skills are mirrored guidance; the skills are
-  // what the agent actually loads for PR work, so a fix applied only to the
-  // prompts leaves the operative instruction contradicting itself.
-  test.each([
-    ['channel-github skill', 'typeclaw-channel-github'],
-    ['github-contributing skill', 'typeclaw-github-contributing'],
-  ])('mirrors the brokered push and in-session PR creation guidance in the %s', (_name, slug) => {
-    const skill = readFileSync(join(import.meta.dir, '..', 'skills', slug, 'SKILL.md'), 'utf8')
-    expect(skill).toMatch(/push <remote> <branch>/)
-    expect(skill).toMatch(/any accessible repository path/i)
-    expect(skill).toMatch(/GitHub App[\s\S]*PAT[\s\S]*trusted GitHub CLI store/i)
-    expect(skill).toMatch(/gh auth login --hostname github\.com/)
-    expect(skill).not.toMatch(/push -u origin <branch>/)
-    expect(skill).toMatch(/broker[\s\S]*?credential/i)
-    expect(skill).toMatch(/gh pr create --repo[^\n]*--head[^\n]*--base/i)
-    expect(skill).not.toMatch(/gh pr create[^\n]*host-stage only/i)
-    expect(skill).toMatch(/channels\.github\.repos/)
-    expect(skill).toMatch(/refuse/i)
-    expect(skill).not.toMatch(/cannot (push or create|create or push) a PR/i)
-    expect(skill).not.toMatch(/cannot run `gh pr checkout` or authenticated `git push`/i)
-  })
-})
-
-describe('understanding the request — intent-recognition steer', () => {
-  // Fixes TASK RECOGNITION, upstream of the "choose a reasonable default"
-  // ambiguity rule (which only fires AFTER the task is recognized) and the
-  // "finish the job" rule (which only helps ONCE the job is known). The failure
-  // mode: the agent executes the literal SURFACE form of a message instead of
-  // the practical task behind it — answering "yes I can" to a polite imperative,
-  // or a bare status answer when the user obviously wants the fix next.
-  test('the default prompt tells the agent to infer the practical task behind the wording, not the literal speech act', () => {
-    expect(DEFAULT_SYSTEM_PROMPT).toContain('## Understanding the request')
-    const start = DEFAULT_SYSTEM_PROMPT.indexOf('## Understanding the request')
-    const section = DEFAULT_SYSTEM_PROMPT.slice(start, start + 1000)
-    expect(section).toMatch(
-      /practical task|what the user (actually )?(needs|wants)|real(?: underlying)? (need|intent)/i,
-    )
-    expect(section).toMatch(/literal|surface|wording/i)
-  })
-
-  // The polite-imperative trap, stated language-agnostically: "can you X?" /
-  // "could you X" / "X would be nice" are requests to DO X, not yes/no
-  // questions — and this holds across languages (this is a multilingual chat
-  // agent). Soften this and the "yes I can" regression reopens.
-  test('the default prompt calls out the polite-imperative trap language-agnostically', () => {
-    const start = DEFAULT_SYSTEM_PROMPT.indexOf('## Understanding the request')
-    const section = DEFAULT_SYSTEM_PROMPT.slice(start, start + 1200)
-    expect(section).toMatch(/can you|could you|would be (nice|good|great)|capability|polite/i)
-    // Language-agnostic framing — must not be scoped to English phrasing only.
-    expect(section).toMatch(/any language|across languages|regardless of (the )?language|whatever the language/i)
-  })
-
-  // Anti-over-clarification guardrail: intent inference must REDUCE questions,
-  // not add them. A chat agent that interrogates "what did you really mean?" on
-  // every turn is a UX regression. The carve-out: act on the safe conventional
-  // reading; ask only when interpretations materially diverge. This is the
-  // CANONICAL home for the clarifying-question rule — `## How to behave` no
-  // longer duplicates it (the dedupe guard below pins that).
-  test('the default prompt frames intent inference as reducing questions, not adding a clarification ritual', () => {
-    const start = DEFAULT_SYSTEM_PROMPT.indexOf('## Understanding the request')
-    const section = DEFAULT_SYSTEM_PROMPT.slice(start, start + 1200)
-    expect(section).toMatch(
-      /fewer\b[\s*]*(clarifying )?questions|not.*more questions|reduce.*question|don't (over-?ask|interrogate)|without.*(asking|clarif)/i,
-    )
-    expect(section).toMatch(/reasonable|conventional|safe|likely/i)
-    expect(section).toMatch(/materially change scope|scope, permissions, cost/i)
-  })
-
-  // The action-bias steer ("start in the same turn, don't answer with only a
-  // plan") was merged INTO this section from the former standalone
-  // `## Execution bias` header. Guards both that the steer survived the merge
-  // and that it stays salient as the section's opening line (not buried).
-  test('the action-bias steer is folded into the section and is no longer a separate `## Execution bias` header', () => {
-    expect(DEFAULT_SYSTEM_PROMPT).not.toContain('## Execution bias')
-    const start = DEFAULT_SYSTEM_PROMPT.indexOf('## Understanding the request')
-    const opening = DEFAULT_SYSTEM_PROMPT.slice(start, start + 220)
-    expect(opening).toMatch(/start work in the same turn|same turn/i)
-    expect(opening).toMatch(/only a plan|not narration/i)
-  })
-
-  // Dedupe guard: the clarifying-question / reasonable-default rule lives ONLY
-  // in `## Understanding the request` now. `## How to behave` must not carry a
-  // second copy (the redundancy this consolidation removed).
-  test('the clarifying-question rule is not duplicated in `## How to behave`', () => {
-    const behaveStart = DEFAULT_SYSTEM_PROMPT.indexOf('## How to behave')
-    expect(behaveStart).toBeGreaterThan(-1)
-    const behave = DEFAULT_SYSTEM_PROMPT.slice(behaveStart, behaveStart + 700)
-    expect(behave).not.toMatch(/clarifying question/i)
-    expect(behave).not.toMatch(/choose a reasonable default/i)
-  })
-
-  // Scope guard: the helpful next step lives WITHIN the apparent request — the
-  // steer must not license inventing a larger project off a small ask.
-  test('the default prompt bounds the inferred next step to the apparent request (no scope inflation)', () => {
-    const start = DEFAULT_SYSTEM_PROMPT.indexOf('## Understanding the request')
-    const section = DEFAULT_SYSTEM_PROMPT.slice(start, start + 1400)
-    expect(section).toMatch(
-      /don't (invent|expand|inflate)|not a (larger|bigger) project|within (the )?(apparent|requested) (scope|request)|stay within scope/i,
-    )
-  })
-
-  // Delegation-on-recognition steer (PR #993): recognizing the task includes
-  // recognizing WHO should do it. Heavy/side-effectful execution work belongs
-  // to a subagent (`operator`) so the main conversation stays fast on the
-  // lighter default model, rather than the orchestrator grinding through it
-  // inline. The section names operator and points at the delegation mechanics
-  // rather than restating Mode B/C.
-  test('the default prompt encourages routing heavy execution work to a subagent once the task is recognized', () => {
-    const start = DEFAULT_SYSTEM_PROMPT.indexOf('## Understanding the request')
-    const section = DEFAULT_SYSTEM_PROMPT.slice(start, start + 1600)
-    expect(section).toMatch(/delegat|hand (it )?off|spawn|subagent/i)
-    expect(section).toContain('operator')
-    expect(section).toMatch(
-      /responsive|stay (fast|light)|conversation (fast|responsive|light)|keep.*(fast|responsive)/i,
-    )
-  })
-
-  // Cache-suffix contract: like the other steering blocks, this lives in the
-  // least-volatile base prefix, ahead of the per-agent identity block, so it
-  // never invalidates cached bytes when IDENTITY.md / SOUL.md change. It leads
-  // the execution-discipline run: recognize the task BEFORE finishing it.
-  test('the understanding-the-request steer sits in the base prefix, ahead of finishing-the-job and the identity block', () => {
-    const intentIdx = DEFAULT_SYSTEM_PROMPT.indexOf('## Understanding the request')
-    expect(intentIdx).toBeGreaterThan(-1)
-    expect(intentIdx).toBeLessThan(DEFAULT_SYSTEM_PROMPT.indexOf('## Finishing the job'))
-    expect(intentIdx).toBeLessThan(DEFAULT_SYSTEM_PROMPT.indexOf('You are not pi, not Claude, not ChatGPT.'))
-  })
-})
-
-describe('finishing the job — completion + anti-fabrication steer', () => {
-  // Ported from hermes-agent's TASK_COMPLETION_GUIDANCE: deliverable is a
-  // working artifact backed by real tool output, and the agent must never
-  // substitute fabricated output for a result it could not actually produce.
-  test('the default prompt tells the agent the deliverable is a real artifact, not a description of one', () => {
-    expect(DEFAULT_SYSTEM_PROMPT).toContain('## Finishing the job')
-    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/working artifact backed by real tool output/i)
-    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/do not stop after writing a stub/i)
-  })
-
-  test('the default prompt forbids fabricating output when the real path is blocked', () => {
-    const start = DEFAULT_SYSTEM_PROMPT.indexOf('## Finishing the job')
-    expect(start).toBeGreaterThan(-1)
-    const section = DEFAULT_SYSTEM_PROMPT.slice(start, start + 900)
-    expect(section).toMatch(/never substitute .*fabricated output|never fabricate/i)
-    expect(section).toMatch(/report(ing)? .*blocker|say so directly/i)
-  })
-
-  test.each([
-    ['default prompt', DEFAULT_SYSTEM_PROMPT],
-    ['slim prompt', SLIM_SYSTEM_PROMPT],
-  ])(
-    'the %s keeps the anti-fabrication invariant (cron/subagent are where fabrication is most dangerous)',
-    (_name, prompt) => {
-      expect(prompt).toMatch(/never fabricate|fabricated output/i)
-    },
-  )
-
-  // Regression: an agent reported "fixed it, build and lint passed" for a
-  // restart-required plugin change that never loaded into the running
-  // container, then invented a cause for the resulting tool failure. A green
-  // build proves the artifact is well-formed, never that it took effect.
-  test('the default prompt separates a green build from a change that actually took effect', () => {
-    const start = DEFAULT_SYSTEM_PROMPT.indexOf('## Finishing the job')
-    const section = DEFAULT_SYSTEM_PROMPT.slice(start, DEFAULT_SYSTEM_PROMPT.indexOf('## Parallel'))
-    expect(section).toMatch(/not done because it compiled/i)
-    expect(section).toMatch(/restart-required/i)
-    expect(section).toMatch(/verify the reported symptom is gone in the running system/i)
-    expect(section).toMatch(/name what is still unverified/i)
-  })
-
-  test('the default prompt forbids claiming actions the agent did not or cannot perform', () => {
-    const start = DEFAULT_SYSTEM_PROMPT.indexOf('## Finishing the job')
-    const section = DEFAULT_SYSTEM_PROMPT.slice(start, DEFAULT_SYSTEM_PROMPT.indexOf('## Parallel'))
-    expect(section).toMatch(/never say you performed an action you did not perform/i)
-    expect(section).toMatch(/cannot perform from where you run/i)
-  })
-
-  test('the default prompt makes an unverified cause a fabrication, not an explanation', () => {
-    const start = DEFAULT_SYSTEM_PROMPT.indexOf('## Finishing the job')
-    const section = DEFAULT_SYSTEM_PROMPT.slice(start, DEFAULT_SYSTEM_PROMPT.indexOf('## Parallel'))
-    expect(section).toMatch(/separate what a tool returned from why you think it happened/i)
-    expect(section).toMatch(/label any account of the cause as the inference it is/i)
-  })
-
-  // The incident spanned BOTH modes: a full-mode channel session made the
-  // false claim, and slim-mode cron runs repeated an invented cause every 30
-  // minutes. Adding the rule to only one mode silently regresses the other.
-  test.each([
-    ['default prompt', DEFAULT_SYSTEM_PROMPT],
-    ['slim prompt', SLIM_SYSTEM_PROMPT],
-  ])('the %s requires verifying the fix landed in the live system before reporting it', (_n, p) => {
-    expect(p).toMatch(/restart-required/i)
-    expect(p).toMatch(/unverified/i)
-    expect(p).toMatch(/never (say you performed|claim) an action you did not perform/i)
-    expect(p).toMatch(/verify the (reported )?symptom is gone in the (running|live) system/i)
-    expect(p).toMatch(/label (any account of the cause as the inference it is|a suspected cause as inference)/i)
-  })
-
-  // Cache-suffix contract: steering blocks must live in the least-volatile
-  // base prefix, AHEAD of the per-agent identity block, so they never
-  // invalidate cached bytes when IDENTITY.md / SOUL.md change.
-  test('the finishing-the-job steer sits inside the base prompt (no per-agent placeholders)', () => {
-    expect(DEFAULT_SYSTEM_PROMPT.indexOf('## Finishing the job')).toBeLessThan(
-      DEFAULT_SYSTEM_PROMPT.indexOf('You are not pi, not Claude, not ChatGPT.'),
-    )
-  })
-})
-
-describe('parallel tool calls steer', () => {
-  // Ported from hermes-agent's PARALLEL_TOOL_CALL_GUIDANCE (universal, all
-  // models). typeclaw's runtime base prompt never told the model to batch
-  // independent reads/searches; only the orchestration section mentioned
-  // parallel subagent fan-out. This makes the batching steer explicit for the
-  // model's own direct tool calls.
-  test('the default prompt tells the agent to batch independent tool calls into one turn', () => {
-    expect(DEFAULT_SYSTEM_PROMPT).toContain('## Parallel tool calls')
-    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/independent (reads|tool calls|calls)/i)
-    expect(DEFAULT_SYSTEM_PROMPT).toMatch(/single (response|turn)|same (response|turn)/i)
-  })
-
-  test('the parallel steer carves out the dependency exception (serialize only when a later call depends on an earlier result)', () => {
-    const start = DEFAULT_SYSTEM_PROMPT.indexOf('## Parallel tool calls')
-    expect(start).toBeGreaterThan(-1)
-    const section = DEFAULT_SYSTEM_PROMPT.slice(start, start + 700)
-    expect(section).toMatch(/depend|serialize/i)
-  })
-
-  test('the parallel steer sits inside the cacheable base prefix, ahead of the identity block', () => {
-    expect(DEFAULT_SYSTEM_PROMPT.indexOf('## Parallel tool calls')).toBeLessThan(
-      DEFAULT_SYSTEM_PROMPT.indexOf('You are not pi, not Claude, not ChatGPT.'),
-    )
-  })
-})
 
 describe('renderTurnTimeAnchor', () => {
   test('wraps the ISO timestamp, IANA zone, and weekday in a single <current-time> tag', () => {
@@ -420,18 +74,9 @@ describe('renderTurnTimeAnchor', () => {
 })
 
 describe('renderTurnRoleAnchor', () => {
-  test('wraps a non-owner role in an authoritative <your-role> tag with override instruction', () => {
-    expect(renderTurnRoleAnchor('guest')).toBe(
-      '<your-role authority="current-speaker">guest</your-role> (authoritative for this message; overrides any role implied by the system prompt)',
-    )
+  test('wraps a non-owner role in a current-speaker <your-role> tag', () => {
     expect(renderTurnRoleAnchor('member')).toContain('<your-role authority="current-speaker">member</your-role>')
     expect(renderTurnRoleAnchor('trusted')).toContain('<your-role authority="current-speaker">trusted</your-role>')
-  })
-
-  test('marks the per-turn role as authoritative so it overrides the cached system-prompt role block', () => {
-    const anchor = renderTurnRoleAnchor('guest')!
-    expect(anchor).toContain('authoritative')
-    expect(anchor).toContain('overrides')
   })
 
   test('omits the tag for owner (the unconstrained default — absent means no special handling)', () => {
@@ -449,56 +94,955 @@ describe('renderTurnRoleAnchor', () => {
   })
 })
 
-describe('branding opt-out', () => {
-  test('branding on (default) is byte-identical to the exported constants', () => {
-    expect(buildDefaultSystemPrompt(DEFAULT_SUBAGENT_ROSTER)).toBe(DEFAULT_SYSTEM_PROMPT)
-    expect(buildDefaultSystemPrompt(DEFAULT_SUBAGENT_ROSTER, true)).toBe(DEFAULT_SYSTEM_PROMPT)
-    expect(buildSlimSystemPrompt()).toBe(SLIM_SYSTEM_PROMPT)
-    expect(buildSlimSystemPrompt(true)).toBe(SLIM_SYSTEM_PROMPT)
+describe('buildSystemPolicy branding', () => {
+  test('branding off removes every "TypeClaw" clue', () => {
+    expect(buildSystemPolicy(true)).toContain('TypeClaw')
+    expect(buildSystemPolicy(false)).not.toContain('TypeClaw')
   })
 
-  test('branding off strips every "TypeClaw" clue from the full prompt', () => {
-    const off = buildDefaultSystemPrompt(DEFAULT_SUBAGENT_ROSTER, false)
-    expect(off).not.toContain('TypeClaw')
-    expect(off).toContain('You are a general-purpose AI agent.')
-    expect(off).not.toContain('running inside TypeClaw')
+  // Input-variation property, not semantic coverage: catches a rule dropped
+  // only when branding is off. A rule removed from both outputs passes here;
+  // the instruction-preservation guards below cover the obligations they name.
+  test('branding off keeps every branding-on policy line that does not name TypeClaw', () => {
+    const brandedOffLines = new Set(buildSystemPolicy(false).split('\n'))
+    const nonBrandLines = buildSystemPolicy(true)
+      .split('\n')
+      .filter((line) => line.trim() !== '' && !line.includes('TypeClaw'))
+
+    expect(nonBrandLines.filter((line) => !brandedOffLines.has(line))).toEqual([])
+  })
+})
+
+// Instruction-preservation guards. Each obligation binds a stable operand (a
+// path, a runner, a role) to a small set of recognized English relations —
+// prohibition and its scope, mandatory modality, precedence, exceptions — and
+// is checked against the RETURNED text of `buildSystemPolicy`,
+// `renderInteractiveSessionContext`, and `composeSystemPrompt`. Expectations
+// live here, never derived from those builders, so an obligation deleted or
+// weakened in both brandings fails even though the parity and composition
+// tests still pass.
+//
+// Bounds: the matcher recognizes a few authored forms, not arbitrary
+// paraphrase; it proves the instruction is still stated, not semantic
+// equivalence and not that a model obeys it. A legitimate rewording outside
+// these forms needs a reviewed matcher update, not a looser pattern. Prose is
+// case-folded, but inline code spans are matched byte-for-byte: `.ENV` or
+// `--Base` names a different target than `.env` or `--base`. The policy is
+// English written TO the model, so AGENTS.md's multi-language rule for
+// matching user text does not apply.
+
+type Span = { start: number; end: number }
+type Scope = Span & { text: string; conditional: boolean }
+type Unit = { scope: string; text: string }
+type Item = { verb: string; object: string }
+type Obligation = readonly [name: string, holds: (prompt: string) => boolean]
+
+const PROHIBITION = /\b(?:never|neither|do not|must not|must never|may not)\b/
+// A ban followed by one of these ("never commit X unless asked", "… when the
+// user agrees", "… without review") is conditional, not a ban.
+const EXCEPTION_WORDS = 'unless|except|only|if|when|whenever|while|until|before|after|without|other than'
+const EXCEPTION = new RegExp(String.raw`^\s(?:${EXCEPTION_WORDS})\b`)
+const CONDITIONAL = new RegExp(String.raw`\b(?:${EXCEPTION_WORDS})\b`)
+const CONDITION = /\b(?:if|when|whenever|unless|only)\b/
+const CONTRAST = /,\s*not\s+|\binstead of\s+|\brather than\s+/
+const MANUAL = /\b(?:manually|by hand|yourself)\b/
+const LEADING_VERB = /^(?:(?:manually|ever|directly|yourself)\s+)*([a-z]+)\b\s*([\s\S]*)$/
+const VERBS: Record<string, true> = {
+  add: true,
+  change: true,
+  commit: true,
+  edit: true,
+  fabricate: true,
+  fake: true,
+  hide: true,
+  ignore: true,
+  install: true,
+  invent: true,
+  modify: true,
+  push: true,
+  run: true,
+  silence: true,
+  stage: true,
+  substitute: true,
+  suppress: true,
+  swallow: true,
+  use: true,
+  write: true,
+}
+
+// Where a prohibition stops governing: a contrast, exception, or new clause.
+// ", and <verb>" starts a new positive instruction ("never X, and report Y"),
+// while ", and <operand>" still lists objects ("never commit A, B, and C").
+const SCOPE_BREAK = new RegExp(
+  String.raw`\s(?:but|instead|rather than|so|because|then|${EXCEPTION_WORDS})\b|\s—\s|,\s+and\s+(?=(?:${Object.keys(VERBS).join('|')})\b)`,
+)
+const DIRECTIVE_LEAD = /(?:^|[,—]\s*|\b(?:and|then|instead|but|so|always|must|shall|have to|need to|required to)\s+)$/
+const PERMISSIVE_LEAD = /\b(?:may|might|can|could|should|optionally)\s+(?:\w+\s+)?$/
+const DOC_SOURCE = String.raw`\b(?:skills?|docs?|documentation|readmes?)\b`
+const RUNNERS: ReadonlyArray<readonly [string, RegExp]> = [
+  ['npx', /(?<![\w-])npx\b/],
+  ['pnpx', /(?<![\w-])pnpx\b/],
+  ['pnpm dlx', /\bpnpm dlx\b/],
+]
+
+function spans(text: string, pattern: RegExp): Span[] {
+  const re = new RegExp(pattern.source, 'g')
+  const out: Span[] = []
+  for (let match = re.exec(text); match !== null; match = re.exec(text)) {
+    out.push({ start: match.index, end: re.lastIndex })
+    if (re.lastIndex === match.index) re.lastIndex += 1
+  }
+  return out
+}
+
+function within(index: number, ranges: readonly Span[]): boolean {
+  return ranges.some((range) => index >= range.start && index < range.end)
+}
+
+// One paragraph or one list item. Prose drops Markdown emphasis, is
+// lowercased, and has negative contractions expanded; inline code spans keep
+// their exact bytes minus the backticks. A list item's scope is the "…:" line
+// that introduces its list, so "never stage X" under an agent-folder lead-in
+// is an agent-folder rule.
+function units(prompt: string): Unit[] {
+  const normalized = prompt
+    .split(/(`[^`\n]+`)/)
+    .map((part, index) =>
+      index % 2 === 1
+        ? part.slice(1, -1)
+        : part
+            .replace(/[`*]/g, '')
+            .replace(/[\u2018\u2019]/g, "'")
+            .toLowerCase()
+            .replace(/\bcan't\b/g, 'cannot')
+            .replace(/\bwon't\b/g, 'will not')
+            .replace(/\b(do|does|did|must|should|may|is|are)n't\b/g, '$1 not')
+            .replace(/[ \t]+/g, ' '),
+    )
+    .join('')
+  const out: Unit[] = []
+  let leadIn = ''
+  for (const block of normalized.split(/\n\s*\n/)) {
+    let intro = ''
+    const items: string[] = []
+    for (const line of block.split('\n').map((raw) => raw.trim())) {
+      if (line === '') continue
+      if (/^[-•] /.test(line)) items.push(line.slice(2))
+      else if (items.length > 0) items.push(`${items.pop()} ${line}`)
+      else intro = intro === '' ? line : `${intro} ${line}`
+    }
+    if (intro !== '') out.push({ scope: '', text: intro })
+    const scope = intro !== '' ? intro : leadIn
+    for (const item of items) out.push({ scope, text: item })
+    leadIn = items.length === 0 && intro.endsWith(':') ? intro : ''
+  }
+  return out
+}
+
+function clauses(text: string): string[] {
+  return text
+    .split(/(?<=[.!?])\s+|;\s*|:\s+/)
+    .map((clause) => clause.trim())
+    .filter((clause) => clause !== '')
+}
+
+function anyClause(prompt: string, accept: (clause: string, unit: Unit) => boolean): boolean {
+  return units(prompt).some((unit) => clauses(unit.text).some((clause) => accept(clause, unit)))
+}
+
+function mentions(text: string, operand: string): boolean {
+  const escaped = operand.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&')
+  return new RegExp(String.raw`(?<![\w./-])${escaped}(?![\w<-]|\.\w)`).test(text)
+}
+
+// What a prohibition marker governs: up to the next marker, contrast, or
+// exception. An exception ("unless asked") or a condition ahead of the marker
+// ("if asked, never …") makes it conditional.
+function prohibitionScopes(clause: string): Scope[] {
+  const markers = spans(clause, PROHIBITION)
+  return markers.map((marker, index) => {
+    const limit = markers[index + 1]?.start ?? clause.length
+    const rest = clause.slice(marker.end, limit)
+    const stop = rest.search(SCOPE_BREAK)
+    const end = stop === -1 ? limit : marker.end + stop
+    const exception = stop !== -1 && EXCEPTION.test(rest.slice(stop))
+    return {
+      start: marker.end,
+      end,
+      text: clause.slice(marker.end, end),
+      conditional: exception || CONDITION.test(clause.slice(0, marker.start)),
+    }
+  })
+}
+
+function exclusionScopes(clause: string): Scope[] {
+  const contrasts = spans(clause, CONTRAST).map(({ end }): Scope => {
+    const stop = clause.slice(end).search(SCOPE_BREAK)
+    const scopeEnd = stop === -1 ? clause.length : end + stop
+    return { start: end, end: scopeEnd, text: clause.slice(end, scopeEnd), conditional: false }
+  })
+  return [...prohibitionScopes(clause), ...contrasts]
+}
+
+// Coordinated verb phrases under one prohibition. A bare verb shares the next
+// phrase's object, so "stage or commit X" forbids both for X, while
+// "stage X or commit Y" forbids staging X only. A non-verb piece that carries
+// its own predicate ("…, and Y is fine to commit") ends the list.
+function negatedItems(scope: string): Item[] {
+  const out: Item[] = []
+  for (const piece of scope.split(/\s*,\s*(?:or|and|nor)\s+|\s*,\s*|\s+(?:or|and|nor)\s+/)) {
+    const match = LEADING_VERB.exec(piece.trim())
+    const verb = match?.[1]
+    const last = out.at(-1)
+    if (verb !== undefined && VERBS[verb] === true) out.push({ verb, object: match?.[2] ?? '' })
+    else if (/\b(?:is|are|stays?|remains?|may|can)\b/.test(piece)) break
+    else if (last !== undefined) last.object = `${last.object} ${piece}`
+  }
+  for (let index = out.length - 2; index >= 0; index -= 1) {
+    const item = out[index]
+    const next = out[index + 1]
+    if (item !== undefined && next !== undefined && item.object.trim() === '') item.object = next.object
+  }
+  return out
+}
+
+function forbids(clause: string, accept: (item: Item, scope: Scope) => boolean): boolean {
+  return prohibitionScopes(clause).some(
+    (scope) => !scope.conditional && negatedItems(scope.text).some((item) => accept(item, scope)),
+  )
+}
+
+// A positive instruction: imperative or mandatory ("must", "always"), outside
+// every prohibition scope. "You may …", "you should …", or a negated lead
+// ("you are not required to …", "there is no need to …") is not one, and
+// neither is one offered with an alternative or an exception ("… or answer
+// inline", "… unless …").
+function directs(clause: string, action: RegExp): Span | undefined {
+  const prohibited = prohibitionScopes(clause)
+  return spans(clause, action).find(({ start, end }) => {
+    const before = clause.slice(0, start)
+    return (
+      !within(start, prohibited) &&
+      DIRECTIVE_LEAD.test(before) &&
+      !PERMISSIVE_LEAD.test(before) &&
+      !/\b(?:not|no|never|nor)\s+(?:\w+\s+){0,2}$/.test(before) &&
+      !/^\s*,?\s*(?:or|unless|except)\b/.test(clause.slice(end))
+    )
+  })
+}
+
+// A list item's own text or its unconditional lead-in, or a paragraph's own
+// clause, must name the agent folder, and not as the place the rule does NOT
+// apply ("outside your agent folder"). A nearby mention in the same
+// paragraph ("… or push your agent folder as the project. In a project
+// checkout, never …") does not scope a different clause.
+function forbidsInAgentFolder(prompt: string, verb: string, operand: string, manualOnly: boolean): boolean {
+  return anyClause(prompt, (clause, unit) => {
+    if (CONDITIONAL.test(unit.scope)) return false
+    const scope = unit.scope === '' ? clause : `${unit.scope} ${unit.text}`
+    const inAgentFolder = spans(scope, /\bagent[- ]folder\b/).some(
+      ({ start }) =>
+        !/\b(?:outside|not|other than|except|besides|instead of)\b[^,.;:]*$/.test(
+          scope.slice(Math.max(0, start - 40), start),
+        ),
+    )
+    return (
+      inAgentFolder &&
+      forbids(
+        clause,
+        (item, prohibition) =>
+          MANUAL.test(prohibition.text) === manualOnly && item.verb === verb && mentions(item.object, operand),
+      )
+    )
+  })
+}
+
+// The agent-folder root write ban. `forbids` treats every excepted ban as
+// conditional, so this reads the ban's own tail instead of loosening that: the
+// only exceptions are being asked and a task-named path, in either order, with
+// nothing after them. Only "you" may precede the ban (no condition, other
+// actor, or weaker modal), and its object is that root itself, not new files,
+// another root, or only manual or direct writes.
+const ROOT_ASKED = String.raw`(?:you are\s+|you're\s+)?(?:explicitly\s+)?(?:asked|requested)(?:\s+to)?`
+const ROOT_NAMED = String.raw`(?:the|your)\s+task\s+(?:names|specifies|gives)\s+(?:that|the|this)\s+path`
+const ROOT_EXCEPTION = new RegExp(
+  String.raw`^\sunless\s+(?:${ROOT_ASKED}\s+or\s+(?:unless\s+)?${ROOT_NAMED}|${ROOT_NAMED}\s+or\s+(?:unless\s+)?${ROOT_ASKED})\s*[.!]?$`,
+)
+const AGENT_ROOT =
+  /^(?:(?:files|anything)\s+)?(?:at|to|in|into)\s+(?:the|your)\s+(?:agent[- ]folder\s+root|root\s+of\s+(?:the|your)\s+agent[- ]folder)\s*[.!]?$/
+// The root and progress rules split only at sentences and semicolons, so an
+// inline label ("when asked: …") stays on its rule and fails the anchored lead.
+const RULE_CLAUSE = /(?<=[.!?])\s+|;\s*/
+// Another clause of the rule's own item that points back at the rule and makes
+// it optional or narrower ("this is optional", "this applies only to new
+// files") undoes it.
+const RULE_BACKREF = /\b(?:this|that|it|these|the (?:rule|ban|update|exceptions?))\b/
+const RULE_RELAXED = /\b(?:optional|advisory|only|outside|not (?:required|mandatory|binding)|(?:does|do) not apply)\b/
+
+function statesRootWriteBan(clause: string): boolean {
+  const markers = spans(clause, PROHIBITION)
+  return prohibitionScopes(clause).some((scope, index) => {
+    const marker = markers[index]
+    const tail = clause.slice(scope.end, markers[index + 1]?.start ?? clause.length)
+    return (
+      marker !== undefined &&
+      /^(?:you\s+)?$/.test(clause.slice(0, marker.start)) &&
+      !/\b(?:manually|directly|by hand|yourself)\b/.test(scope.text) &&
+      ROOT_EXCEPTION.test(tail) &&
+      negatedItems(scope.text).some((item) => item.verb === 'write' && AGENT_ROOT.test(item.object))
+    )
+  })
+}
+
+function rootWriteBanUnits(prompt: string): Unit[] {
+  return units(prompt).filter((unit) => {
+    const ruleClauses = unit.text.split(RULE_CLAUSE)
+    return (
+      !CONDITIONAL.test(unit.scope) &&
+      ruleClauses.some(statesRootWriteBan) &&
+      !ruleClauses.some(
+        (clause) => !statesRootWriteBan(clause) && RULE_BACKREF.test(clause) && RULE_RELAXED.test(clause),
+      )
+    )
+  })
+}
+
+// An affirmative grant, anywhere in the prompt, to write at the agent-folder
+// root or to edit `.gitignore` or existing, other, or root-level files without
+// a request. An edit or exemption word counts unless a prohibition, contrast,
+// or negation governs it. A negated requirement or limit ("no permission
+// needed", "need not ask") grants what follows it, and a new subject and modal
+// (", and you may …") ends the prohibition before it.
+const ROOT_TARGETS =
+  /\b(?:existing|other|all|any)\s+(?:root[- ]level\s+|root\s+)?files?\b|\broot(?:[- ]level)?\s+files?\b|\bfiles?\s+(?:at|in)\s+(?:the|your)\s+(?:agent[- ]folder\s+)?root\b|\bagent[- ]folder\s+root\b|\broot\s+of\s+(?:the|your)\s+agent[- ]folder\b/
+const EDIT_GRANT =
+  /(?<![\w-])(?:edit\w*|writ\w*|modif\w*|updat\w*|overwrit\w*|rewrit\w*|chang\w*|touch\w*|exempt\w*|except(?:ed|ions?)|allowed|permitted|fine|free|ok|okay)\b/
+const REQUEST_GATE =
+  /\s(?:only\s+)?(?:when|if)\s+(?:you are\s+|you're\s+)?(?:explicitly\s+)?(?:asked|requested)(?:\s+to)?\s*[.!]?$/
+const NEGATED = /\b(?:not|no|never|nor|cannot)\s+(?:\w+\s+){0,2}$/
+const WAIVED =
+  /\b(?:need not|(?:do|does) not need|no (?:need|permission|requirements?|limits?)|not (?:required|limited|restricted))\b/
+const NEW_PREDICATE =
+  /,\s*(?:(?:and|or|but|nor)\s+)?(?:you|it|they|this|that)\s+(?:may|can|might|could|should|is|are)\b/
+
+// "… only when asked" closing a clause, with nothing before it coordinated,
+// negated, or conditional, restates the ban's own exception.
+function requestGated(clause: string): boolean {
+  const gate = REQUEST_GATE.exec(clause)
+  const before = clause.slice(0, gate?.index ?? 0)
+  return gate !== null && !/[,;]|\b(?:and|or|but|nor|not|no|never)\b/.test(before) && !CONDITIONAL.test(before)
+}
+
+function affirms(clause: string, term: RegExp): boolean {
+  const waived = clause.search(WAIVED)
+  const excluded = exclusionScopes(clause).map((scope) => {
+    const predicate = scope.text.search(NEW_PREDICATE)
+    return predicate === -1 ? scope : { start: scope.start, end: scope.start + predicate }
+  })
+  return spans(clause, term).some(
+    ({ start }) =>
+      (waived !== -1 && start > waived) || (!within(start, excluded) && !NEGATED.test(clause.slice(0, start))),
+  )
+}
+
+function grantsUnaskedRootFileEdit(prompt: string): boolean {
+  return anyClause(
+    prompt,
+    (clause) =>
+      (mentions(clause, '.gitignore') || ROOT_TARGETS.test(clause)) &&
+      !requestGated(clause) &&
+      affirms(clause, EDIT_GRANT),
+  )
+}
+
+// The ban's two specific exceptions, each its own clause in the ban's item and
+// given to the agent ("as specific exceptions, …", "you must …"): edit
+// `IDENTITY.md` when responsibilities, role, or scope change, and edit
+// `SOUL.md` rarely, for durable voice or persona changes. A dropped or negated
+// condition, another actor, or any other unrequested directed edit in that
+// item (a third file, a second object) breaks them. Code spans keep the file
+// names case-exact.
+const IDENTITY_EXCEPTION = String.raw`\s+IDENTITY\.md\s+when\s+(?:your\s+)?(?:responsibilities|role|scope)\s+changes?\s*[.!]?$`
+const SOUL_EXCEPTION = String.raw`\s+SOUL\.md\s+rarely\s+for\s+durable\s+(?:voice|persona)(?:\s+or\s+(?:voice|persona))?\s+changes\s*[.!]?$`
+const IDENTITY_EDITS = [IDENTITY_EXCEPTION, SOUL_EXCEPTION].map(
+  (condition) => new RegExp(String.raw`\b(?:edit|update)(?=${condition})`),
+)
+const OTHER_ROOT_EDIT = new RegExp(
+  String.raw`\b(?:edit|update|write|modify|change|overwrite|rewrite|create)\b(?!${IDENTITY_EXCEPTION}|${SOUL_EXCEPTION})`,
+)
+const EXCEPTION_LEAD =
+  /^(?:as\s+(?:an?\s+)?(?:specific\s+)?exceptions?\s*,\s*)?(?:(?:you\s+)?(?:must|always|shall)\s+)?$/
+
+function exceptsIdentityEdits(prompt: string): boolean {
+  return rootWriteBanUnits(prompt).some((unit) => {
+    const ruleClauses = unit.text.split(RULE_CLAUSE)
+    return (
+      IDENTITY_EDITS.every((edit) =>
+        ruleClauses.some((clause) =>
+          spans(clause, edit).some(({ start }) => EXCEPTION_LEAD.test(clause.slice(0, start))),
+        ),
+      ) && !ruleClauses.some((clause) => !requestGated(clause) && directs(clause, OTHER_ROOT_EDIT) !== undefined)
+    )
+  })
+}
+
+function inPackageJsonRule(prompt: string, accept: (clause: string) => boolean): boolean {
+  return anyClause(prompt, (clause, unit) => mentions(unit.text, 'package.json') && accept(clause))
+}
+
+function requiresBunxIn(clause: string): boolean {
+  const verb = directs(clause, /\b(?:run|use|invoke|execute)\b/)
+  if (verb === undefined) return false
+  const excluded = exclusionScopes(clause)
+  return spans(clause, /\bbunx\b/).some(({ start }) => start > verb.start && !within(start, excluded))
+}
+
+function inBunxRule(prompt: string, accept: (clause: string) => boolean): boolean {
+  return anyClause(prompt, (clause, unit) => /\bbunx\b/.test(unit.text) && accept(clause))
+}
+
+function excludesRunner(prompt: string, runner: RegExp): boolean {
+  return inBunxRule(prompt, (clause) => {
+    const excluded = exclusionScopes(clause).filter((scope) => !scope.conditional)
+    return spans(clause, runner).some(({ start }) => within(start, excluded))
+  })
+}
+
+// "A skill/doc … does not override this rule", "this rule takes precedence
+// over any skill/doc", or "even if a skill/doc says otherwise, use bunx".
+// Checked per conjunct, and that conjunct must name a skill: in "a skill …
+// overrides this rule, but a doc does not override it", no skill is outranked.
+// Only "ever"/"simply" may sit between the negation and "override"; "does not
+// always override" is not a denial.
+function bunxRuleOutranksSkillsAndDocs(prompt: string): boolean {
+  const negation = '(?:not|never|no|cannot|neither|nor)'
+  const denied = new RegExp(
+    String.raw`${DOC_SOURCE}.*?\b(?:does not|do not|cannot|will not|never|must not|may not)\s+(?:ever\s+|simply\s+)?(?:override|supersede|outrank|take precedence over|win over)\b`,
+  )
+  const asserted = new RegExp(
+    String.raw`\b(?:this rule|the bunx rule|bunx)\b(?:(?!\b${negation}\b).)*?\b(?:overrides|supersedes|outranks|takes precedence over|wins over)\b(?:(?!\b${negation}\b).)*?${DOC_SOURCE}`,
+  )
+  return inBunxRule(
+    prompt,
+    (clause) =>
+      !/\b(?:unless|except)\b/.test(clause) &&
+      clause
+        .split(/,\s+(?:and|but)\s+/)
+        .some(
+          (conjunct) =>
+            /\bskills?\b/.test(conjunct) &&
+            (denied.test(conjunct) ||
+              asserted.test(conjunct) ||
+              (/\b(?:even if|even when|even though|regardless of)\b/.test(conjunct) && requiresBunxIn(conjunct))),
+        ),
+  )
+}
+
+function mandatesResearcher(prompt: string): boolean {
+  return anyClause(prompt, (clause) => {
+    const trigger = /\b(?:when|if|whenever)\b([^,]*)/.exec(clause)?.[1]
+    if (trigger === undefined || /\b(?:not|never|without)\b/.test(trigger)) return false
+    const triggered = [/\buser\b/, /\bexplicit(?:ly)?\b/, /\bresearch\b/, /\binvestigat/].every((term) =>
+      term.test(trigger),
+    )
+    const action =
+      /\b(?:spawn|delegate to|use|call|run|hand (?:it|this|the request) to|route (?:it|this|the request) to)\s+(?:a\s+|the\s+)?researcher\b/
+    return triggered && directs(clause, action) !== undefined
+  })
+}
+
+// The operand's own conjunct must deny it substitutes: in "A does not satisfy
+// X, and B can replace Y", B is not denied. Only "ever"/"simply" may sit
+// between the negation and the verb; "does not always satisfy" is not a denial.
+function deniedAsSubstitute(prompt: string, operand: RegExp, displaced?: RegExp): boolean {
+  const denial =
+    /\b(?:does not|do not|cannot|will not|never|is not|are not)\s+(?:ever\s+|simply\s+)?(?:satisfy|replace|substitute for|count as|suffice|enough)\b/
+  return anyClause(prompt, (clause) =>
+    spans(clause, operand).some(({ start }) => {
+      const rest = clause.slice(start)
+      const conjunctEnd = rest.search(/,\s+(?:and|but)\s+/)
+      const conjunct = conjunctEnd === -1 ? rest : rest.slice(0, conjunctEnd)
+      const match = denial.exec(conjunct)
+      return match !== null && (displaced === undefined || displaced.test(conjunct.slice(match.index)))
+    }),
+  )
+}
+
+// One mandatory short progress update for multi-step work, whole in one
+// clause: the multi-step trigger, the agent as actor (imperative or "you
+// must"), give or provide, exactly one short or brief progress update, and its
+// contrast with narration, with nothing after it. Another clause in that item
+// that allows narration or more updates (also as a waived limit or a joined
+// ", and you may …"), or that points back and makes the rule optional, undoes
+// it, and a todo or no-narration rule cannot supply a missing part.
+const MULTI_STEP = /^(?:for|in|during)\s+(?:all\s+|any\s+)?multi-step\s+(?:work|tasks?|requests?)\s*,\s*/
+const PROGRESS_LEAD = /^(?:you\s+)?(?:must\s+|always\s+|shall\s+|need to\s+|have to\s+)?$/
+const ONE_SHORT_UPDATE = /^\s+(?:exactly one|only one|a single|one)\s+(?:short|brief)\s+progress update\b/
+const NOT_NARRATION = /^(?:,\s*not|,?\s*(?:rather than|instead of))\s+(?:a\s+)?narration\s*[.!]?$/
+const MORE_UPDATES = /\bnarrat\w*|\bupdates?\b|\bprogress\b/
+
+function statesOneShortUpdate(clause: string): boolean {
+  const verb = directs(clause, /\b(?:give|provide)\b/)
+  if (verb === undefined || !MULTI_STEP.test(clause)) return false
+  const update = clause.slice(verb.end)
+  return (
+    PROGRESS_LEAD.test(clause.slice(0, verb.start).replace(MULTI_STEP, '')) &&
+    ONE_SHORT_UPDATE.test(update) &&
+    NOT_NARRATION.test(update.replace(ONE_SHORT_UPDATE, ''))
+  )
+}
+
+function requiresOneShortProgressUpdate(prompt: string): boolean {
+  return units(prompt).some((unit) => {
+    const ruleClauses = unit.text.split(RULE_CLAUSE)
+    return (
+      !CONDITIONAL.test(unit.scope) &&
+      ruleClauses.some(statesOneShortUpdate) &&
+      !ruleClauses.some(
+        (clause) =>
+          !statesOneShortUpdate(clause) &&
+          (affirms(clause, MORE_UPDATES) || (RULE_BACKREF.test(clause) && RULE_RELAXED.test(clause))),
+      )
+    )
+  })
+}
+
+const PR_FIELDS = ['--repo', '--head', '--base', '--title', '--body']
+
+const SHARED_OBLIGATIONS: readonly Obligation[] = [
+  ...['secrets.json', '.env', 'workspace/'].flatMap((operand) =>
+    ['stage', 'commit'].map(
+      (verb): Obligation => [
+        `agent folder: never ${verb} ${operand}`,
+        (prompt) => forbidsInAgentFolder(prompt, verb, operand, false),
+      ],
+    ),
+  ),
+  ...['sessions/', 'memory/'].flatMap((operand) =>
+    ['stage', 'commit'].map(
+      (verb): Obligation => [
+        `agent folder: never manually ${verb} runtime-owned ${operand}`,
+        (prompt) => forbidsInAgentFolder(prompt, verb, operand, true),
+      ],
+    ),
+  ),
+  [
+    'agent folder: never write at its root unless asked or the task names the path',
+    (prompt) => rootWriteBanUnits(prompt).length > 0,
+  ],
+  ['agent folder root: IDENTITY.md and SOUL.md edits are its specific exceptions', exceptsIdentityEdits],
+  [
+    'agent folder root: no unasked edit of .gitignore or other existing files',
+    (prompt) => !grantsUnaskedRootFileEdit(prompt),
+  ],
+  [
+    'package.json is operator-owned',
+    (prompt) =>
+      inPackageJsonRule(
+        prompt,
+        (clause) =>
+          mentions(clause, 'package.json') &&
+          spans(
+            clause,
+            /\b(?:operator[- ]owned|owned by the operator|belongs to the operator|the operator owns)\b/,
+          ).some(({ start }) => !/\b(?:not|never|no longer)\s+(?:\w+\s+)?$/.test(clause.slice(0, start))),
+      ),
+  ],
+  [
+    'package.json must not be edited',
+    (prompt) =>
+      inPackageJsonRule(prompt, (clause) =>
+        forbids(
+          clause,
+          (item) =>
+            ['edit', 'modify', 'change', 'write'].includes(item.verb) &&
+            (mentions(item.object, 'package.json') || /^\s*(?:it|this file|the file)\b/.test(item.object)),
+        ),
+      ),
+  ],
+  [
+    'dependencies must not be installed',
+    (prompt) =>
+      inPackageJsonRule(prompt, (clause) =>
+        forbids(
+          clause,
+          (item) => ['install', 'add'].includes(item.verb) && /\b(?:dependenc(?:y|ies)|packages?)\b/.test(item.object),
+        ),
+      ),
+  ],
+  [
+    'package needs are escalated to the operator',
+    (prompt) =>
+      inPackageJsonRule(
+        prompt,
+        (clause) =>
+          !CONDITIONAL.test(clause) &&
+          directs(clause, /\b(?:tell|ask|notify|inform|escalate to|report to)\s+(?:the\s+)?operator\b/) !== undefined,
+      ),
+  ],
+  ['one-off package binaries run with bunx', (prompt) => inBunxRule(prompt, requiresBunxIn)],
+  ...RUNNERS.map(([name, runner]): Obligation => [`${name} is excluded`, (prompt) => excludesRunner(prompt, runner)]),
+  ['a conflicting skill or doc does not override the bunx rule', bunxRuleOutranksSkillsAndDocs],
+  [
+    'fabricated output is forbidden',
+    (prompt) =>
+      anyClause(prompt, (clause) =>
+        forbids(clause, (item) => {
+          const phrase = `${item.verb} ${item.object}`
+          return (
+            /\b(?:fabricat\w*|made-up|invent\w*|fake\w*)\b/.test(phrase) && /\b(?:output|results?|data)\b/.test(phrase)
+          )
+        }),
+      ),
+  ],
+  [
+    'suppressing errors is forbidden',
+    (prompt) =>
+      anyClause(prompt, (clause) =>
+        forbids(
+          clause,
+          (item) =>
+            ['suppress', 'hide', 'swallow', 'silence', 'ignore'].includes(item.verb) &&
+            /\b(?:errors?|failures?|exceptions?|warnings?)\b/.test(item.object),
+        ),
+      ),
+  ],
+  [
+    'failures are reported',
+    (prompt) =>
+      anyClause(
+        prompt,
+        (clause) =>
+          !CONDITIONAL.test(clause) &&
+          directs(clause, /\b(?:report|surface|disclose)\s+(?:\w+\s+){0,3}?(?:failures?|errors?)\b/) !== undefined,
+      ),
+  ],
+  [
+    // The agent itself, not the operator or another actor, opens the PR.
+    'the agent opens project PRs itself with explicit inline gh pr create fields',
+    (prompt) =>
+      anyClause(prompt, (clause) => {
+        const at = clause.indexOf('gh pr create')
+        const opens = directs(clause, /\b(?:open|create|file)\s+(?:the|a)\s+(?:pr|pull request)\b/)
+        return (
+          at !== -1 &&
+          opens !== undefined &&
+          !/\b(?:operator|user|maintainer|human|someone)\b/.test(clause.slice(0, opens.start)) &&
+          PR_FIELDS.every((field) => new RegExp(String.raw`\s${field}\s`).test(clause.slice(at)))
+        )
+      }),
+  ],
+  [
+    'file, template, editor and fill PR inputs are refused',
+    (prompt) =>
+      anyClause(
+        prompt,
+        (clause, unit) =>
+          unit.text.includes('gh pr create') &&
+          [/\bfile\b/, /\btemplate\b/, /\beditor\b/, /\bfill\b/].every((input) => input.test(clause)) &&
+          /\b(?:are|is)\s+(?:refused|rejected|blocked|denied)\b/.test(clause),
+      ),
+  ],
+  ['multi-step work gets exactly one short progress update, not narration', requiresOneShortProgressUpdate],
+]
+
+const INTERACTIVE_OBLIGATIONS: readonly Obligation[] = [
+  ['an explicit research or investigation request must spawn researcher', mandatesResearcher],
+  ['training memory does not satisfy it', (prompt) => deniedAsSubstitute(prompt, /\btraining memory\b/)],
+  ['one inline web_search does not satisfy it', (prompt) => deniedAsSubstitute(prompt, /\bweb_search\b/)],
+  ['scout fan-out does not replace researcher', (prompt) => deniedAsSubstitute(prompt, /\bscout\b/, /\bresearcher\b/)],
+  [
+    'explorer fan-out does not replace researcher',
+    (prompt) => deniedAsSubstitute(prompt, /\bexplorer\b/, /\bresearcher\b/),
+  ],
+]
+
+const BRANDINGS = [
+  ['branding on', true],
+  ['branding off', false],
+] as const
+
+// Interactivity is stated here rather than read from `deriveSystemPromptMode`,
+// so a mode change that moves the researcher mandate fails too.
+const ORIGINS: ReadonlyArray<readonly [string, SessionOrigin | undefined, boolean]> = [
+  ['tui', { kind: 'tui', sessionId: 'ses_t' }, true],
+  ['channel', { kind: 'channel', adapter: 'slack-bot', workspace: 'T0', chat: 'C0', thread: null }, true],
+  ['no origin', undefined, true],
+  ['cron', { kind: 'cron', jobId: 'job-1', jobKind: 'prompt' }, false],
+  ['default subagent', { kind: 'subagent', subagent: 'tester', parentSessionId: 'ses_p' }, false],
+  ['system', { kind: 'system', component: 'tester' }, false],
+]
+
+function unmet(prompt: string, obligations: readonly Obligation[]): string[] {
+  return obligations.filter(([, holds]) => !holds(prompt)).map(([name]) => name)
+}
+
+describe('policy instruction-preservation guards', () => {
+  test.each(BRANDINGS)('the shared policy with %s states every shared obligation', (_name, branding) => {
+    expect(unmet(buildSystemPolicy(branding), SHARED_OBLIGATIONS)).toEqual([])
   })
 
-  test('branding off strips every "TypeClaw" clue from the slim prompt', () => {
-    const off = buildSlimSystemPrompt(false)
-    expect(off).not.toContain('TypeClaw')
-    expect(off).toContain('You are an AI agent.')
+  test('the interactive context states the mandatory researcher route', () => {
+    expect(unmet(renderInteractiveSessionContext(DEFAULT_SUBAGENT_ROSTER), INTERACTIVE_OBLIGATIONS)).toEqual([])
   })
 
-  test('branding off keeps the operational substance of the full prompt', () => {
-    const off = buildDefaultSystemPrompt(DEFAULT_SUBAGENT_ROSTER, false)
-    expect(off).toContain('## Version control')
-    expect(off).toContain('private backup repo')
-    expect(off).toContain('## Subagent orchestration')
-    expect(off).toContain('secrets.json')
+  describe.each(BRANDINGS)('composed prompts with %s', (_name, branding) => {
+    test.each(ORIGINS)(
+      'the %s prompt keeps the shared obligations, with the researcher mandate only when interactive',
+      (_kind, origin, interactive) => {
+        const prompt = composeSystemPrompt({
+          mode: deriveSystemPromptMode(origin),
+          branding,
+          self: 'SELF',
+          origin,
+          gitNudge: '',
+        })
+        expect(unmet(prompt, [...SHARED_OBLIGATIONS, ...(interactive ? INTERACTIVE_OBLIGATIONS : [])])).toEqual([])
+        expect(mandatesResearcher(prompt)).toBe(interactive)
+      },
+    )
   })
 
-  test('branding off keeps the safety substance of the slim prompt', () => {
-    const off = buildSlimSystemPrompt(false)
-    expect(off).toContain('Never echo secrets')
-    expect(off).toContain('never fabricate results')
-    expect(off).toContain('workspace/')
+  // The matcher itself: relation forms it accepts, and token co-occurrence it
+  // must reject. Synthetic text, not policy copies.
+  test.each([
+    [
+      'accepts a stage ban and a commit ban stated separately',
+      'Agent folder rules:\n\n- Do not stage `.env`, and never commit `.env`.',
+      (text: string) =>
+        forbidsInAgentFolder(text, 'stage', '.env', false) && forbidsInAgentFolder(text, 'commit', '.env', false),
+      true,
+    ],
+    [
+      'rejects the operand and verbs without a prohibition',
+      'Agent folder rules:\n\n- Stage and commit `.env`; never push it.',
+      (text: string) => forbidsInAgentFolder(text, 'stage', '.env', false),
+      false,
+    ],
+    [
+      'rejects a prohibition outside the agent folder',
+      'Project checkout rules:\n\n- Never stage or commit `.env`.',
+      (text: string) => forbidsInAgentFolder(text, 'commit', '.env', false),
+      false,
+    ],
+    [
+      'rejects a prohibition with an exception',
+      'Agent folder rules:\n\n- Never stage or commit `.env` unless asked.',
+      (text: string) => forbidsInAgentFolder(text, 'commit', '.env', false),
+      false,
+    ],
+    [
+      'binds each verb only to its own object',
+      'Agent folder rules:\n\n- Never stage `.env` or commit `workspace/`.',
+      (text: string) =>
+        forbidsInAgentFolder(text, 'commit', '.env', false) || forbidsInAgentFolder(text, 'stage', 'workspace/', false),
+      false,
+    ],
+    [
+      'rejects permissive researcher modality',
+      'When the user explicitly asks to research or investigate, you may spawn `researcher`.',
+      mandatesResearcher,
+      false,
+    ],
+    [
+      'rejects an alternative to the mandated researcher',
+      'When the user explicitly asks to research or investigate, you must spawn `researcher` or answer inline.',
+      mandatesResearcher,
+      false,
+    ],
+    [
+      'accepts an imperative researcher paraphrase',
+      'If the user explicitly requests research or an investigation, always delegate to `researcher`.',
+      mandatesResearcher,
+      true,
+    ],
+    [
+      'rejects a runner that is listed but not excluded',
+      'Run one-off binaries with `bunx` or `npx`.',
+      (text: string) => excludesRunner(text, /(?<![\w-])npx\b/),
+      false,
+    ],
+    [
+      'rejects reversed precedence',
+      'Run binaries with `bunx`. A skill telling you to use `npx` overrides this rule.',
+      bunxRuleOutranksSkillsAndDocs,
+      false,
+    ],
+    [
+      'accepts contrastive exclusion and asserted precedence',
+      'Use `bunx`, not `npx`. This rule takes precedence over any skill or doc.',
+      (text: string) =>
+        inBunxRule(text, requiresBunxIn) &&
+        excludesRunner(text, /(?<![\w-])npx\b/) &&
+        bunxRuleOutranksSkillsAndDocs(text),
+      true,
+    ],
+    [
+      'treats a case-changed code-span path or runner as a different target',
+      'Agent folder rules:\n\n- Never stage or commit `.ENV` or `Secrets.json`.\n\nRun one-off binaries with `bunx`, never `NPX`.',
+      (text: string) =>
+        forbidsInAgentFolder(text, 'stage', '.env', false) ||
+        forbidsInAgentFolder(text, 'commit', 'secrets.json', false) ||
+        excludesRunner(text, /(?<![\w-])npx\b/),
+      false,
+    ],
+    [
+      'rejects a negated obligation lead',
+      'When the user explicitly asks to research or investigate, you are not required to spawn `researcher`.',
+      mandatesResearcher,
+      false,
+    ],
+    [
+      'rejects precedence that outranks a doc but not the skill',
+      'Run binaries with `bunx`. A skill telling you to use `npx` overrides this rule, but a doc does not override it.',
+      bunxRuleOutranksSkillsAndDocs,
+      false,
+    ],
+    [
+      'does not scope a project rule by a nearby agent-folder mention',
+      'Never push your agent folder as the project. In a project checkout, never stage or commit `.env`.',
+      (text: string) => forbidsInAgentFolder(text, 'commit', '.env', false),
+      false,
+    ],
+    [
+      'ends an object list at a new predicate',
+      'Agent folder rules:\n\n- Never stage or commit `.env`, and `workspace/` is fine to commit.',
+      (text: string) =>
+        forbidsInAgentFolder(text, 'commit', '.env', false) &&
+        !forbidsInAgentFolder(text, 'commit', 'workspace/', false),
+      true,
+    ],
+    [
+      'accepts a root write ban with reordered request and task-path exceptions beside both identity edits',
+      'Never write to the root of the agent folder unless the task specifies that path or you are asked. As specific exceptions, update `IDENTITY.md` when your role changes; update `SOUL.md` rarely for durable persona changes.',
+      (text: string) =>
+        rootWriteBanUnits(text).length > 0 && exceptsIdentityEdits(text) && !grantsUnaskedRootFileEdit(text),
+      true,
+    ],
+    [
+      'rejects a create-only, new-file, project-root, advisory, or other-actor root ban',
+      '- Never create files at the agent-folder root unless asked or the task names the path.\n- Never write new files at the agent-folder root unless asked or the task names the path.\n- Never write at the project root unless asked or the task names the path.\n- You should not write at the agent-folder root unless asked or the task names the path.\n- The operator must never write at the agent-folder root unless asked or the task names the path.',
+      (text: string) => rootWriteBanUnits(text).length > 0,
+      false,
+    ],
+    [
+      'rejects a root ban with a dropped, broadened, or extra exception',
+      '- Never write at the agent-folder root unless asked.\n- Never write at the agent-folder root unless asked or any task names a path.\n- Never write at the agent-folder root unless asked, the task names the path, or the file exists.\n- Never write at the agent-folder root.',
+      (text: string) => rootWriteBanUnits(text).length > 0,
+      false,
+    ],
+    [
+      'requires both identity edits beside the root ban',
+      'Never write at the agent-folder root unless asked or the task names the path. As an exception, edit `IDENTITY.md` when your role changes.',
+      exceptsIdentityEdits,
+      false,
+    ],
+    [
+      'flags an unasked .gitignore edit allowed beside an intact root ban',
+      'Never write at the agent-folder root unless asked or the task names the path. You may edit the existing `.gitignore` there at any time.',
+      (text: string) => rootWriteBanUnits(text).length > 0 && grantsUnaskedRootFileEdit(text),
+      true,
+    ],
+    [
+      'flags an identity exception stretched to other root files',
+      'Never write at the agent-folder root unless asked or the task names the path. As exceptions, edit `IDENTITY.md` and any other root file when needed.',
+      grantsUnaskedRootFileEdit,
+      true,
+    ],
+    [
+      'accepts a .gitignore edit gated on a request',
+      'Never write at the agent-folder root unless asked or the task names the path. Edit `.gitignore` only when asked.',
+      (text: string) => rootWriteBanUnits(text).length > 0 && !grantsUnaskedRootFileEdit(text),
+      true,
+    ],
+    [
+      'flags a grant to write at the agent-folder root itself',
+      'Never write at the agent-folder root unless asked or the task names the path. Writing at the root of the agent folder is fine for quick notes.',
+      grantsUnaskedRootFileEdit,
+      true,
+    ],
+    [
+      'flags a negated or misbound request gate, a waived requirement, and a joined allowance as root grants',
+      '- Edit `.gitignore` freely, not only when asked.\n- Edit `.gitignore` at any time, and other root files when asked.\n- You do not need permission to edit `.gitignore`.\n- You need not ask before changing other root files.\n- Never delete `.gitignore`, and you may edit it whenever needed.',
+      (text: string) => text.split('\n').every(grantsUnaskedRootFileEdit),
+      true,
+    ],
+    [
+      'rejects a root ban narrowed by an inline condition, a narrowing follow-up, or manual writes',
+      '- Only in shared sessions: never write at the agent-folder root unless asked or the task names the path.\n- Never write at the agent-folder root unless asked or the task names the path. This applies only to new files.\n- Never write at the agent-folder root unless asked or the task names the path. Existing root files are outside this rule.\n- Never manually write at the agent-folder root unless asked or the task names the path.\n- Never directly write at the agent-folder root unless asked or the task names the path.',
+      (text: string) => rootWriteBanUnits(text).length > 0,
+      false,
+    ],
+    [
+      'rejects a third file or another actor among the identity exceptions',
+      '- Never write at the agent-folder root unless asked or the task names the path. As specific exceptions, edit `IDENTITY.md` when your role changes; edit `USER.md` for new user facts; edit `SOUL.md` rarely for durable voice changes.\n- Never write at the agent-folder root unless asked or the task names the path. As specific exceptions, the operator must edit `IDENTITY.md` when your role changes; the operator must edit `SOUL.md` rarely for durable voice changes.',
+      exceptsIdentityEdits,
+      false,
+    ],
+    [
+      'rejects identity exceptions with a dropped or negated condition',
+      '- Never write at the agent-folder root unless asked or the task names the path. As specific exceptions, edit `IDENTITY.md`; edit `SOUL.md` rarely for durable voice changes.\n- Never write at the agent-folder root unless asked or the task names the path. As specific exceptions, edit `IDENTITY.md` when your role does not change; edit `SOUL.md` rarely for durable voice changes.\n- Never write at the agent-folder root unless asked or the task names the path. As specific exceptions, edit `IDENTITY.md` when your role changes; edit `SOUL.md` for durable voice changes.\n- Never write at the agent-folder root unless asked or the task names the path. As specific exceptions, edit `IDENTITY.md` when your role changes; edit `SOUL.md` rarely for voice changes.',
+      exceptsIdentityEdits,
+      false,
+    ],
+    [
+      'keeps both identity exceptions beside a request-gated .gitignore edit',
+      'Never write at the agent-folder root unless asked or the task names the path. As specific exceptions, edit `IDENTITY.md` when your role changes; edit `SOUL.md` rarely for durable voice changes. Edit `.gitignore` only when asked.',
+      (text: string) => exceptsIdentityEdits(text) && !grantsUnaskedRootFileEdit(text),
+      true,
+    ],
+    [
+      'accepts a mandatory single brief progress update for multi-step tasks',
+      '**For multi-step tasks**, you must provide a *single* brief progress update rather than narration.',
+      requiresOneShortProgressUpdate,
+      true,
+    ],
+    [
+      'rejects an optional, conditional, or delegated progress update',
+      '- For multi-step work, you may give one short progress update, not narration.\n- For multi-step work, give one short progress update, not narration, when asked.\n- For multi-step work, the operator must give one short progress update, not narration.',
+      requiresOneShortProgressUpdate,
+      false,
+    ],
+    [
+      'rejects a progress update count other than exactly one',
+      '- For multi-step work, give a short progress update, not narration.\n- For multi-step work, give at least one short progress update, not narration.\n- For multi-step work, give one short progress update per step, not narration.',
+      requiresOneShortProgressUpdate,
+      false,
+    ],
+    [
+      'rejects a progress update that is not short or not contrasted with narration',
+      '- For multi-step work, give one detailed progress update, not narration.\n- For multi-step work, give one short progress update.\n- For multi-step work, give one short progress update, not narration, or narrate each step.',
+      requiresOneShortProgressUpdate,
+      false,
+    ],
+    [
+      'rejects narration or more updates allowed beside an intact progress rule',
+      '- For multi-step work, give one short progress update, not narration. You may also narrate each step.\n- For multi-step work, give one short progress update, not narration. You may give more updates whenever you like.',
+      requiresOneShortProgressUpdate,
+      false,
+    ],
+    [
+      'does not let a todo or no-narration rule stand in for the progress update',
+      'For multi-step work, call `todo_write` when you start. Do not narrate routine tool calls or give one short progress update.',
+      requiresOneShortProgressUpdate,
+      false,
+    ],
+    [
+      'rejects a progress rule undone by a waived limit, a joined allowance, an inline condition, or an optional follow-up',
+      '- For multi-step work, give one short progress update, not narration. You do not need to limit updates to one.\n- For multi-step work, give one short progress update, not narration. There is no limit on narration.\n- For multi-step work, give one short progress update, not narration. Do not narrate routine calls, and you may narrate the rest.\n- When asked: for multi-step work, give one short progress update, not narration.\n- For multi-step work, give one short progress update, not narration. This is optional.',
+      requiresOneShortProgressUpdate,
+      false,
+    ],
+  ])('the matcher %s', (_name, text, holds, expected) => {
+    expect(holds(text)).toBe(expected)
   })
 })
 
 describe('renderRuntimeNondisclosureRule', () => {
-  test('instructs the model to never name the runtime, and does not itself leak "TypeClaw"', () => {
+  test('does not itself leak "TypeClaw"', () => {
     const rule = renderRuntimeNondisclosureRule()
-    expect(rule).toContain('## Runtime disclosure')
-    expect(rule).toContain('branding: false')
-    expect(rule).toContain('Never reveal, name, or hint at the runtime')
     expect(rule).not.toContain('TypeClaw')
     expect(rule.toLowerCase()).not.toContain('typeclaw')
-  })
-
-  test('acknowledges that internal tokens (skills, CLI, config) stay usable', () => {
-    const rule = renderRuntimeNondisclosureRule()
-    expect(rule).toContain('Internal tokens you use for real work')
   })
 })
 

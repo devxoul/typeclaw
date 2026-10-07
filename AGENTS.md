@@ -54,7 +54,7 @@ Two live examples of the _diagnosability_ half of the same failure: issue **#137
 
 ## Debugging the system prompt
 
-`bun run debug:prompt` dumps the rendered system prompt for each session-origin kind (`tui`, `cron`, `channel`, `subagent`) with placeholder values, plus a per-section token/char/byte breakdown.
+`bun run debug:prompt` dumps the TypeClaw-composed system prompt for each session-origin kind (`tui`, `cron`, `channel`, `subagent` — a default subagent through the standard composer, not a `systemPromptOverride` subagent) with placeholder values, plus a per-section char/byte breakdown and a chars/4 token estimate (not a tokenizer count). It shows the preamble `composeSystemPrompt` builds; pi appends project context (`AGENTS.md` and friends), the skill catalog, and cwd afterwards when it assembles the session.
 
 ```sh
 bun run debug:prompt                       # all 4 origins
@@ -62,13 +62,13 @@ bun run debug:prompt --origin cron         # just one
 bun run debug:prompt --origin channel --no-git-nudge
 ```
 
-`composeSystemPrompt` (`src/agent/index.ts`) is the right entry point if you're adding a new section. The cache-suffix contract (least-volatile first → identity → runtime → origin+role → git → memory → now) is enforced by both the helper and `scripts/dump-system-prompt.test.ts`. Reorder one without the other and CI fails. The trailing `## Now` block is pinned last to keep the cache prefix stable across sessions — don't move it.
+`composeSystemPrompt` (`src/agent/index.ts`) is the right entry point if you're adding a new section. Cache-suffix order, least volatile first: shared policy (`buildSystemPolicy`) → identity (`IDENTITY.md` + `SOUL.md`, then plugin `session.prompt` appends) → runtime block → interactive context (full mode only; stable per agent, so it sits before the per-session origin) → session origin → role → MCP catalog → git nudge → proactive-model nudge. The composition tests pin that order; reorder one without the other and CI fails. Wall clock, live channel role, and retrieved memory are per-turn user-prompt context, never system-prompt suffixes — don't add a `## Now` or memory block back.
 
 Memory is injected per turn into the user prompt; the system prompt never contains long-term memory; vector memory is always on. The memory plugin's `session.turn.start` hook renders de-duplicated direct shards (under budget) or top-K hybrid-search results (over budget) into `event.retrievalContext.results`, which the four turn-drivers (server TUI, channel router, cron consumer, subagent runner) append to the user text.
 
 The other half of the memory loop is **consolidation**: the `dreaming` subagent (`src/bundled-plugins/memory/dreaming.ts`, cron `memory.dreaming.schedule`, default `*/30 * * * *`) reads undreamed daily-stream fragments and rebalances them into `memory/topics/<slug>.md` shards. Three load-bearing invariants make a bad LLM run non-destructive: the **citation-superset check** (every previously-cited fragment id must still be cited after the run, in `fragments:` or `superseded:`, else the whole run reverts via `restoreShardSnapshot`), **runtime-owned frontmatter** (`cites`/`days`/`lastReinforced` are recomputed from citations every run — the subagent never sets them), and **fragment-GC gating** (`compactDailyStreams` drops dreamed-and-uncited fragments only when shards were actually rewritten this run, never on stale citations). Dreamed-ids advance even on a citation-superset revert — the conscious anti-loop tradeoff. See [/docs/internals/memory](https://typeclaw.dev/docs/internals/memory).
 
-Slim vs full mode is decided by `deriveSystemPromptMode` (exhaustive `switch` on `origin.kind`). `tui` and `channel` get the full operator-facing prompt; `cron` and `subagent` get the slim base (~245 tok). Production subagents bypass the slim base entirely via `systemPromptOverride`; the slim path only fires for cron today.
+Every standard origin (`tui`, `channel`, `cron`, `subagent`, `system`, and undefined) starts with the same `buildSystemPolicy(branding)` text; origin, role, and roster never change it. `deriveSystemPromptMode` (exhaustive `switch` on `origin.kind`) only selects optional context: `full` (`tui`, `channel`, undefined) adds the interactive orchestration context, roster validation, git nudge, and MCP catalog; `slim` (`cron`, `subagent`, `system`) skips them. Registered subagents with their own `systemPrompt` go through `createOverrideResourceLoader` instead, which skips the shared policy and `IDENTITY.md`/`SOUL.md` but still gets pi's project-context discovery.
 
 ## Release
 

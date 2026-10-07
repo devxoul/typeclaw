@@ -39,9 +39,21 @@ import {
 import { LiveSubagentRegistry } from './live-subagents'
 import { PROACTIVE_NEXT_STEP_NUDGE } from './proactive-next-step-nudge'
 import { detectProviderError, wrapTransformContextWithLocalFailureMarker } from './provider-error'
-import type { SessionOrigin } from './session-origin'
+import { renderInteractiveSessionContext, type SessionOrigin } from './session-origin'
 import type { CreateSessionForSubagent, SubagentRegistry } from './subagents'
-import { DEFAULT_SYSTEM_PROMPT, SLIM_SYSTEM_PROMPT } from './system-prompt'
+import { buildSystemPolicy, DEFAULT_SUBAGENT_ROSTER } from './system-prompt'
+import { renderPublicSubagentRoster } from './tools/spawn-subagent'
+
+// Every origin kind the standard composer serves, plus the origin-less
+// back-compat path. Shared by the policy-equality contracts below.
+const STANDARD_ORIGINS: ReadonlyArray<readonly [string, SessionOrigin | undefined]> = [
+  ['tui', { kind: 'tui', sessionId: 'ses_t' }],
+  ['channel', { kind: 'channel', adapter: 'slack-bot', workspace: 'T0', chat: 'C0', thread: null }],
+  ['cron', { kind: 'cron', jobId: 'job-1', jobKind: 'prompt' }],
+  ['default subagent', { kind: 'subagent', subagent: 'tester', parentSessionId: 'ses_p' }],
+  ['system', { kind: 'system', component: 'tester' }],
+  ['no origin', undefined],
+]
 
 async function runGit(cwd: string, args: string[]): Promise<void> {
   const proc = Bun.spawn({
@@ -142,13 +154,13 @@ describe('wrapSystemTools', () => {
 })
 
 describe('createResourceLoader', () => {
-  test('starts the system prompt with the typeclaw default instead of pi default', async () => {
+  test('starts the system prompt with the shared TypeClaw policy instead of the pi default', async () => {
     // when
     const loader = await createResourceLoader({ agentDir })
 
     // then
     const prompt = loader.getSystemPrompt() ?? ''
-    expect(prompt.startsWith(DEFAULT_SYSTEM_PROMPT)).toBe(true)
+    expect(prompt.startsWith(`${buildSystemPolicy()}\n\n`)).toBe(true)
   })
 
   test('slim mode does not render or validate the public-subagent roster', async () => {
@@ -165,7 +177,8 @@ describe('createResourceLoader', () => {
       subagentRegistry: badRegistry,
     })
     const prompt = loader.getSystemPrompt() ?? ''
-    expect(prompt.startsWith(SLIM_SYSTEM_PROMPT)).toBe(true)
+    expect(prompt.startsWith(`${buildSystemPolicy()}\n\n`)).toBe(true)
+    expect(prompt).not.toContain('offender')
   })
 
   test('full mode surfaces a bad public rosterDescription as a thrown error', async () => {
@@ -619,6 +632,27 @@ describe('createResourceLoader', () => {
     expect(capturedOrigin).toEqual(origin)
   })
 
+  test('plugin session.prompt hooks see the same shared policy for interactive and unattended origins', async () => {
+    // given
+    const seen: string[] = []
+    const hooks = createHookBus()
+    hooks.registerAll('plugin-test', agentDir, silentLogger(), {
+      'session.prompt': async (event) => {
+        seen.push(event.prompt)
+      },
+    })
+    const plugins = { registry: emptyRegistry(), hooks, sessionId: 'test-session', agentDir }
+
+    // when
+    for (const [, origin] of STANDARD_ORIGINS) {
+      await createResourceLoader({ agentDir, plugins, ...(origin !== undefined ? { origin } : {}) })
+    }
+
+    // then
+    expect(seen).toHaveLength(STANDARD_ORIGINS.length)
+    for (const prompt of seen) expect(prompt.startsWith(`${buildSystemPolicy()}\n\n`)).toBe(true)
+  })
+
   test('renders the multi-speaker role policy (not the opener’s concrete role) for a channel session', async () => {
     // given: a permission service with an author-scoped member rule
     const { createPermissionService } = await import('@/permissions')
@@ -743,7 +777,60 @@ describe('createResourceLoader', () => {
     expect(permissions.resolveRole(origin)).toBe('owner')
   })
 
-  test('cron origin defaults to slim mode: uses SLIM_SYSTEM_PROMPT and drops git nudge', async () => {
+  test.each(STANDARD_ORIGINS)('%s session starts with the one shared policy, exactly once', async (_name, origin) => {
+    // when
+    const loader = await createResourceLoader({ agentDir, ...(origin !== undefined ? { origin } : {}) })
+
+    // then
+    const prompt = loader.getSystemPrompt() ?? ''
+    const policy = buildSystemPolicy()
+    expect(prompt.startsWith(`${policy}\n\n`)).toBe(true)
+    expect(prompt.split(policy)).toHaveLength(2)
+  })
+
+  test.each(STANDARD_ORIGINS)(
+    '%s session gets the interactive context only when its origin is interactive',
+    async (_name, origin) => {
+      // when
+      const loader = await createResourceLoader({ agentDir, ...(origin !== undefined ? { origin } : {}) })
+
+      // then
+      const prompt = loader.getSystemPrompt() ?? ''
+      const interactive = renderInteractiveSessionContext(DEFAULT_SUBAGENT_ROSTER)
+      expect(prompt.includes(interactive)).toBe(deriveSystemPromptMode(origin) === 'full')
+    },
+  )
+
+  test('interactive context lists the live public registry and hides internal subagents; unattended sessions render no roster', async () => {
+    // given
+    const registry: SubagentRegistry = {
+      'public-helper': { systemPrompt: 'x', visibility: 'public', rosterDescription: 'PUBLIC-ROSTER-SENTINEL' },
+      'private-helper': { systemPrompt: 'x', visibility: 'internal', rosterDescription: 'PRIVATE-ROSTER-SENTINEL' },
+    }
+
+    // when
+    const tui = await createResourceLoader({
+      agentDir,
+      origin: { kind: 'tui', sessionId: 'ses_t' },
+      subagentRegistry: registry,
+    })
+    const cron = await createResourceLoader({
+      agentDir,
+      origin: { kind: 'cron', jobId: 'job-1', jobKind: 'prompt' },
+      subagentRegistry: registry,
+    })
+
+    // then
+    const interactivePrompt = tui.getSystemPrompt() ?? ''
+    expect(interactivePrompt).toContain(renderInteractiveSessionContext(renderPublicSubagentRoster(registry)))
+    expect(interactivePrompt).toContain('public-helper')
+    expect(interactivePrompt).toContain('PUBLIC-ROSTER-SENTINEL')
+    expect(interactivePrompt).not.toContain('private-helper')
+    expect(interactivePrompt).not.toContain('PRIVATE-ROSTER-SENTINEL')
+    expect(cron.getSystemPrompt() ?? '').not.toContain('PUBLIC-ROSTER-SENTINEL')
+  })
+
+  test('cron origin drops the git nudge (slim session context)', async () => {
     // given: a dirty git repo so gitNudge WOULD render in full mode
     await initGitRepo(agentDir)
     await writeFile(join(agentDir, 'tracked.md'), 'initial')
@@ -757,44 +844,8 @@ describe('createResourceLoader', () => {
 
     // then
     const prompt = loader.getSystemPrompt() ?? ''
-    expect(prompt.startsWith(SLIM_SYSTEM_PROMPT)).toBe(true)
-    expect(prompt).not.toContain(DEFAULT_SYSTEM_PROMPT)
     expect(prompt).not.toContain('## Uncommitted changes at session start')
     expect(prompt).not.toContain('tracked.md')
-  })
-
-  test('subagent origin defaults to slim mode', async () => {
-    const origin: SessionOrigin = { kind: 'subagent', subagent: 'tester', parentSessionId: 'ses_p' }
-
-    const loader = await createResourceLoader({ agentDir, origin })
-
-    const prompt = loader.getSystemPrompt() ?? ''
-    expect(prompt.startsWith(SLIM_SYSTEM_PROMPT)).toBe(true)
-    expect(prompt).not.toContain(DEFAULT_SYSTEM_PROMPT)
-  })
-
-  test('tui origin stays in full mode', async () => {
-    const origin: SessionOrigin = { kind: 'tui', sessionId: 'ses_t' }
-
-    const loader = await createResourceLoader({ agentDir, origin })
-
-    const prompt = loader.getSystemPrompt() ?? ''
-    expect(prompt.startsWith(DEFAULT_SYSTEM_PROMPT)).toBe(true)
-  })
-
-  test('channel origin stays in full mode (humans read the chat)', async () => {
-    const origin: SessionOrigin = {
-      kind: 'channel',
-      adapter: 'slack-bot',
-      workspace: 'T0',
-      chat: 'C0',
-      thread: null,
-    }
-
-    const loader = await createResourceLoader({ agentDir, origin })
-
-    const prompt = loader.getSystemPrompt() ?? ''
-    expect(prompt.startsWith(DEFAULT_SYSTEM_PROMPT)).toBe(true)
   })
 
   test('explicit mode override beats the origin-derived default', async () => {
@@ -806,7 +857,8 @@ describe('createResourceLoader', () => {
 
     // then
     const prompt = loader.getSystemPrompt() ?? ''
-    expect(prompt.startsWith(DEFAULT_SYSTEM_PROMPT)).toBe(true)
+    expect(prompt.startsWith(`${buildSystemPolicy()}\n\n`)).toBe(true)
+    expect(prompt).toContain(renderInteractiveSessionContext(DEFAULT_SUBAGENT_ROSTER))
   })
 
   test('slim mode does not inject MEMORY.md into the system prompt', async () => {
@@ -817,130 +869,6 @@ describe('createResourceLoader', () => {
 
     const prompt = loader.getSystemPrompt() ?? ''
     expect(prompt).not.toContain('standup-summary-marker')
-  })
-
-  test('slim cron prompt carries the load-bearing guidance review surfaced (errors, narration, workspace, memory shards, runtime-managed paths)', async () => {
-    const origin: SessionOrigin = { kind: 'cron', jobId: 'job-1', jobKind: 'prompt' }
-
-    const loader = await createResourceLoader({ agentDir, origin })
-
-    const prompt = loader.getSystemPrompt() ?? ''
-    expect(prompt).toContain('Never echo secrets from `secrets.json` or `.env`')
-    expect(prompt).toContain('never fabricate results')
-    expect(prompt).toContain('Do not narrate routine')
-    expect(prompt).toContain('workspace/')
-    expect(prompt).toContain('Do not edit `memory/topics/` directly')
-    expect(prompt).toContain('Never stage or commit')
-  })
-
-  test('slim prompt does NOT contain the subagent-breaking "plain prose is invisible" claim', async () => {
-    const origin: SessionOrigin = { kind: 'subagent', subagent: 'tester', parentSessionId: 'ses_p' }
-
-    const loader = await createResourceLoader({ agentDir, origin })
-
-    const prompt = loader.getSystemPrompt() ?? ''
-    expect(prompt).not.toContain('Plain prose with no tool call is invisible')
-    expect(prompt).not.toContain('plain-text output is invisible')
-  })
-
-  test('trimmed full prompt still carries every load-bearing phrase (workspace, memory shards, secrets, git hygiene, persona, error honesty)', async () => {
-    const origin: SessionOrigin = { kind: 'tui', sessionId: 'ses_t' }
-
-    const loader = await createResourceLoader({ agentDir, origin })
-
-    const prompt = loader.getSystemPrompt() ?? ''
-    expect(prompt).toContain('`workspace/`')
-    expect(prompt).toContain('never edit memory shards directly')
-    expect(prompt).toContain('`.env`')
-    expect(prompt).toContain('`secrets.json`')
-    expect(prompt).toContain('Never echo, log, or commit')
-    expect(prompt).toContain('One logical change = one commit')
-    expect(prompt).toContain('SOUL.md specifies a voice')
-    expect(prompt).toContain('never fabricate results')
-    expect(prompt).toContain('re-read whenever process is unclear')
-    expect(prompt).toContain('You are not pi, not Claude, not ChatGPT')
-    // Mode B channel guidance: subagent completion reminder in a channel
-    // session is not a user message; the model needs explicit instruction
-    // to surface via channel_reply/channel_send rather than emit plain text
-    // that goes nowhere. Guards against the "spawn → silent" regression.
-    expect(prompt).toContain('completion `<system-reminder>`')
-    expect(prompt).toContain('Surface the result via `channel_reply`')
-  })
-
-  test('full prompt steers long-running/interactive shell work to tmux so a blocking foreground command cannot freeze the turn', async () => {
-    const origin: SessionOrigin = { kind: 'tui', sessionId: 'ses_t' }
-
-    const loader = await createResourceLoader({ agentDir, origin })
-
-    const prompt = loader.getSystemPrompt() ?? ''
-    expect(prompt).toContain('## Long-running and interactive shell work')
-    expect(prompt).toContain('tmux new-session -d')
-    expect(prompt).toContain('tmux send-keys')
-    expect(prompt).toContain('tmux capture-pane')
-    expect(prompt).toContain('tmux kill-session')
-  })
-
-  test('slim prompt does NOT carry the tmux shell-work section (full-mode-only budget guard)', async () => {
-    const origin: SessionOrigin = { kind: 'cron', jobId: 'job-1', jobKind: 'prompt' }
-
-    const loader = await createResourceLoader({ agentDir, origin })
-
-    const prompt = loader.getSystemPrompt() ?? ''
-    expect(prompt).not.toContain('## Long-running and interactive shell work')
-    expect(prompt).not.toContain('tmux new-session -d')
-  })
-
-  test('full prompt carries the Mode C troubleshooting hand-off so a stuck fix-it loop gets delegated to operator instead of burning the main session', async () => {
-    const origin: SessionOrigin = { kind: 'tui', sessionId: 'ses_t' }
-
-    const loader = await createResourceLoader({ agentDir, origin })
-
-    const prompt = loader.getSystemPrompt() ?? ''
-    expect(prompt).toContain('**Mode C — Troubleshooting.**')
-    expect(prompt).toContain('typeclaw-troubleshooting')
-    expect(prompt).toContain('hand the loop to `operator`')
-  })
-
-  test('slim prompt does NOT carry the Mode C troubleshooting hand-off (full-mode-only budget guard)', async () => {
-    const origin: SessionOrigin = { kind: 'cron', jobId: 'job-1', jobKind: 'prompt' }
-
-    const loader = await createResourceLoader({ agentDir, origin })
-
-    const prompt = loader.getSystemPrompt() ?? ''
-    expect(prompt).not.toContain('**Mode C — Troubleshooting.**')
-    expect(prompt).not.toContain('typeclaw-troubleshooting')
-  })
-
-  test('full prompt carries the post-hatching file-routing matrix so a tone preference cannot land in AGENTS.md and a process rule cannot land in SOUL.md', async () => {
-    // Without these assertions, a future trim of system-prompt.ts could
-    // quietly drop the routing matrix and the prompt would still
-    // type-check, render, and pass every other test — but the agent
-    // would lose the steady-state guidance for which file owns what.
-    const origin: SessionOrigin = { kind: 'tui', sessionId: 'ses_t' }
-
-    const loader = await createResourceLoader({ agentDir, origin })
-
-    const prompt = loader.getSystemPrompt() ?? ''
-    expect(prompt).toContain('role, function, scope of work')
-    expect(prompt).toContain('voice, tone, register')
-    expect(prompt).toContain('facts about the user')
-    expect(prompt).toContain('working conventions, repeatable procedures')
-    expect(prompt).toContain('how you sound')
-    expect(prompt).toContain('how you work')
-    expect(prompt).toContain('Edit discipline')
-    expect(prompt).toContain('SOUL.md should stay short')
-    expect(prompt).toContain("a single off-day request isn't a durable change")
-  })
-
-  test('slim prompt does NOT carry the post-hatching routing matrix (cron/subagent budget guard against copy-paste regression)', async () => {
-    const origin: SessionOrigin = { kind: 'cron', jobId: 'job-1', jobKind: 'prompt' }
-
-    const loader = await createResourceLoader({ agentDir, origin })
-
-    const prompt = loader.getSystemPrompt() ?? ''
-    expect(prompt).not.toContain('role, function, scope of work')
-    expect(prompt).not.toContain('how you sound')
-    expect(prompt).not.toContain('Edit discipline')
   })
 })
 
@@ -989,23 +917,89 @@ describe('deriveSystemPromptMode', () => {
   })
 })
 
-describe('composeSystemPrompt slim mode', () => {
-  test('uses SLIM_SYSTEM_PROMPT as the base when mode is slim', () => {
-    const prompt = composeSystemPrompt({
-      mode: 'slim',
-      self: '# Identity\n\nfoo',
-      gitNudge: '',
-    })
-    expect(prompt.startsWith(SLIM_SYSTEM_PROMPT)).toBe(true)
-    expect(prompt).not.toContain(DEFAULT_SYSTEM_PROMPT)
+describe('composeSystemPrompt shared policy', () => {
+  // Each session-varying input carries a sentinel that appears nowhere in the
+  // policy, so section positions are unambiguous.
+  const self = '# Identity\n\nSELF-SENTINEL'
+  const runtimeVersion = '9.9.9-sentinel'
+  const subagentRoster = 'ROSTER-SENTINEL'
+  const origin: SessionOrigin = { kind: 'subagent', subagent: 'ORIGIN-SENTINEL', parentSessionId: 'ses_p' }
+  const sessionParts = {
+    self,
+    runtimeVersion,
+    subagentRoster,
+    origin,
+    roleContext: { role: 'ROLE-SENTINEL', permissions: [] },
+    mcpCatalog: '## MCP servers\n\nMCP-SENTINEL',
+    gitNudge: '## Git nudge\n\nGIT-SENTINEL',
+    proactiveNextStepNudge: 'PROACTIVE-SENTINEL',
+  }
+
+  test('orders sections least- to most-volatile: policy, identity, runtime, interactive context, origin, role, MCP, git, proactive', () => {
+    // when
+    const prompt = composeSystemPrompt({ mode: 'full', ...sessionParts })
+
+    // then
+    const positions = [
+      'SELF-SENTINEL',
+      runtimeVersion,
+      subagentRoster,
+      'ORIGIN-SENTINEL',
+      'ROLE-SENTINEL',
+      'MCP-SENTINEL',
+      'GIT-SENTINEL',
+      'PROACTIVE-SENTINEL',
+    ].map((sentinel) => prompt.indexOf(sentinel))
+    expect(prompt.startsWith(`${buildSystemPolicy()}\n\n${self}`)).toBe(true)
+    expect(positions.every((position) => position > 0)).toBe(true)
+    expect(positions).toEqual([...positions].sort((a, b) => a - b))
   })
 
-  test('uses DEFAULT_SYSTEM_PROMPT when mode is unset (back-compat)', () => {
-    const prompt = composeSystemPrompt({
-      self: '# Identity\n\nfoo',
-      gitNudge: '',
-    })
-    expect(prompt.startsWith(DEFAULT_SYSTEM_PROMPT)).toBe(true)
+  test('mode adds or omits only the interactive context; every other section is identical', () => {
+    // when
+    const full = composeSystemPrompt({ mode: 'full', ...sessionParts })
+    const slim = composeSystemPrompt({ mode: 'slim', ...sessionParts })
+
+    // then
+    const interactive = `\n\n${renderInteractiveSessionContext(subagentRoster)}`
+    expect(full).toContain(interactive)
+    expect(full.replace(interactive, '')).toBe(slim)
+  })
+
+  test('defaults to the interactive context when mode is unset (back-compat)', () => {
+    expect(composeSystemPrompt(sessionParts)).toBe(composeSystemPrompt({ mode: 'full', ...sessionParts }))
+  })
+
+  test('origin, role, roster, MCP, and git inputs change only their suffix: the policy, identity, and runtime prefix is byte-identical and the policy appears once', () => {
+    // given: the prefix every standard session shares
+    const prefix = composeSystemPrompt({ mode: 'slim', self, runtimeVersion, gitNudge: '' })
+
+    // when
+    const variants = [
+      composeSystemPrompt({ mode: 'full', ...sessionParts }),
+      composeSystemPrompt({ mode: 'slim', ...sessionParts }),
+      composeSystemPrompt({ mode: 'full', ...sessionParts, subagentRoster: 'OTHER-ROSTER' }),
+      composeSystemPrompt({
+        mode: 'full',
+        self,
+        runtimeVersion,
+        origin: { kind: 'tui', sessionId: 's' },
+        gitNudge: '',
+      }),
+      composeSystemPrompt({
+        mode: 'slim',
+        self,
+        runtimeVersion,
+        origin: { kind: 'cron', jobId: 'job-1', jobKind: 'prompt' },
+        gitNudge: '',
+      }),
+    ]
+
+    // then
+    for (const prompt of variants) {
+      expect(prompt.startsWith(`${prefix}\n\n`)).toBe(true)
+      expect(prompt.split(buildSystemPolicy())).toHaveLength(2)
+    }
   })
 })
 
@@ -1031,7 +1025,6 @@ describe('composeSystemPrompt branding', () => {
       gitNudge: '',
     })
     expect(prompt).toContain('## Runtime disclosure')
-    expect(prompt).toContain('Never reveal, name, or hint at the runtime')
   })
 
   test('branding off drops the runtime block and every TypeClaw clue (slim mode)', () => {
@@ -1045,7 +1038,7 @@ describe('composeSystemPrompt branding', () => {
     expect(prompt).not.toContain('TypeClaw')
     expect(prompt).not.toContain('## Runtime\n')
     expect(prompt).toContain('## Runtime disclosure')
-    expect(prompt.startsWith('You are an AI agent.')).toBe(true)
+    expect(prompt.startsWith(`${buildSystemPolicy(false)}\n\n`)).toBe(true)
   })
 
   test('branding on (default) keeps the runtime block and omits the disclosure rule', () => {
@@ -1077,11 +1070,14 @@ describe('createOverrideResourceLoader', () => {
     expect(prompt).not.toContain('<current-time>')
   })
 
-  test('does not include the typeclaw default system prompt', async () => {
-    const loader = await createOverrideResourceLoader('SUBAGENT PROMPT')
+  test('does not include the shared policy or the interactive context, even for an interactive origin', async () => {
+    const loader = await createOverrideResourceLoader('SUBAGENT PROMPT', { kind: 'tui', sessionId: 'ses_t' })
 
     const prompt = loader.getSystemPrompt() ?? ''
-    expect(prompt).not.toContain(DEFAULT_SYSTEM_PROMPT)
+    expect(prompt.startsWith('SUBAGENT PROMPT')).toBe(true)
+    expect(prompt).toContain('## Session origin')
+    expect(prompt).not.toContain(buildSystemPolicy())
+    expect(prompt).not.toContain(renderInteractiveSessionContext(DEFAULT_SUBAGENT_ROSTER))
   })
 
   test('does not append SYSTEM.md files discovered by pi defaults', async () => {
@@ -1166,6 +1162,108 @@ describe('branding opt-out through config (getConfig().branding)', () => {
     const prompt = loader.getSystemPrompt() ?? ''
     expect(prompt).not.toContain('TypeClaw')
     expect(prompt).toContain('The runtime ships a `reviewer` subagent')
+  })
+})
+
+describe('assembled session system prompt', () => {
+  // Real pi assembly: TypeClaw's preamble followed by pi's project context,
+  // skill catalog, and cwd. Provider requests are denied and no prompt is
+  // ever sent; this checks composition, not model behavior.
+  let previousCwd: string
+  let previousFetch: typeof fetch
+  let previousApiKey: string | undefined
+  let sessionDir: string
+
+  beforeEach(async () => {
+    previousCwd = process.cwd()
+    previousFetch = globalThis.fetch
+    previousApiKey = process.env.ANTHROPIC_API_KEY
+    // given: an agent folder nested under an ancestor with its own AGENTS.md,
+    // and a local skill whose catalog metadata and body carry different markers
+    sessionDir = join(agentDir, 'agent')
+    const skillDir = join(sessionDir, '.agents', 'skills', 'sample-skill')
+    await mkdir(skillDir, { recursive: true })
+    await writeFile(join(agentDir, 'AGENTS.md'), 'ANCESTOR-AGENTS-SENTINEL')
+    await writeFile(join(sessionDir, 'AGENTS.md'), 'AGENT-AGENTS-SENTINEL')
+    await writeFile(join(sessionDir, 'IDENTITY.md'), 'IDENTITY-SENTINEL')
+    await writeFile(join(sessionDir, 'SOUL.md'), 'SOUL-SENTINEL')
+    await writeFile(
+      join(skillDir, 'SKILL.md'),
+      '---\nname: sample-skill\ndescription: SKILL-METADATA-SENTINEL\n---\n\nSKILL-BODY-SENTINEL',
+    )
+    await writeFile(
+      join(sessionDir, 'typeclaw.json'),
+      JSON.stringify({ models: { default: { model: 'anthropic/claude-sonnet-4-6' } } }),
+    )
+    process.chdir(sessionDir)
+    process.env.ANTHROPIC_API_KEY = 'test-anthropic-key'
+    reloadConfig(sessionDir)
+    invalidateProviderAuthCache()
+    globalThis.fetch = (async () => {
+      throw new Error('network access is denied in this test')
+    }) as unknown as typeof fetch
+  })
+
+  afterEach(() => {
+    globalThis.fetch = previousFetch
+    if (previousApiKey === undefined) delete process.env.ANTHROPIC_API_KEY
+    else process.env.ANTHROPIC_API_KEY = previousApiKey
+    invalidateProviderAuthCache()
+    __resetConfigForTesting()
+    process.chdir(previousCwd)
+  })
+
+  test.each<readonly [string, SessionOrigin]>([
+    ['tui', { kind: 'tui', sessionId: 'ses_t' }],
+    ['cron', { kind: 'cron', jobId: 'job-1', jobKind: 'prompt' }],
+  ])(
+    '%s session carries the shared policy, agent and ancestor AGENTS.md, and skill metadata but not the unloaded skill body',
+    async (_name, origin) => {
+      // when
+      const { session, dispose } = await createSessionWithDispose({
+        sessionManager: SessionManager.inMemory(sessionDir),
+        origin,
+        tools: ['read'],
+      })
+
+      // then
+      try {
+        const prompt = session.systemPrompt
+        expect(prompt.startsWith(`${buildSystemPolicy()}\n\n`)).toBe(true)
+        expect(prompt.split(buildSystemPolicy())).toHaveLength(2)
+        expect(prompt).toContain('IDENTITY-SENTINEL')
+        expect(prompt).toContain('AGENT-AGENTS-SENTINEL')
+        expect(prompt).toContain('ANCESTOR-AGENTS-SENTINEL')
+        expect(prompt).toContain('SKILL-METADATA-SENTINEL')
+        expect(prompt).not.toContain('SKILL-BODY-SENTINEL')
+        expect(prompt.indexOf('IDENTITY-SENTINEL')).toBeLessThan(prompt.indexOf('AGENT-AGENTS-SENTINEL'))
+        expect(prompt.indexOf('AGENT-AGENTS-SENTINEL')).toBeLessThan(prompt.indexOf('SKILL-METADATA-SENTINEL'))
+      } finally {
+        await dispose()
+      }
+    },
+  )
+
+  test('an override session keeps its custom prefix and AGENTS.md project context without the shared policy or identity files', async () => {
+    // when
+    const { session, dispose } = await createSessionWithDispose({
+      sessionManager: SessionManager.inMemory(sessionDir),
+      systemPromptOverride: 'OVERRIDE-SENTINEL',
+      origin: { kind: 'subagent', subagent: 'tester', parentSessionId: 'ses_p' },
+      tools: ['read'],
+    })
+
+    // then
+    try {
+      const prompt = session.systemPrompt
+      expect(prompt.startsWith('OVERRIDE-SENTINEL')).toBe(true)
+      expect(prompt).toContain('AGENT-AGENTS-SENTINEL')
+      expect(prompt).not.toContain(buildSystemPolicy())
+      expect(prompt).not.toContain('IDENTITY-SENTINEL')
+      expect(prompt).not.toContain('SOUL-SENTINEL')
+    } finally {
+      await dispose()
+    }
   })
 })
 

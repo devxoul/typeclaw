@@ -1,6 +1,6 @@
 ---
 name: typeclaw-skills
-description: Use this skill whenever the user asks you to install, find, list, update, or remove an agent skill, whenever you yourself want to add a new capability via a skill, or whenever you are about to edit any file under `.agents/skills/`. Triggers include "install skill", "add a skill", "find a skill", "update skills", "remove skill", "skill from <repo>", any mention of the `skills` CLI / `bunx skills`, any reference to `SKILL.md`, `skills-lock.json`, `.skill-lock.json`, and any time you read or write under `.agents/skills/<name>/`. Read it before you touch a skill — TypeClaw has three skill layers with different ownership rules, and editing a skill that the `skills` CLI manages will silently get overwritten on the next `bunx skills update`.
+description: Use this skill whenever the user asks you to install, find, list, update, or remove an agent skill, whenever you yourself want to add a new capability via a skill or record a durable procedure fix (deciding between an existing skill, its support doc, a new skill, or `AGENTS.md`), or whenever you are about to edit any file under `.agents/skills/`. Triggers include "install skill", "add a skill", "find a skill", "update skills", "remove skill", "skill from <repo>", any mention of the `skills` CLI / `bunx skills`, any reference to `SKILL.md`, `skills-lock.json`, `.skill-lock.json`, and any time you read or write under `.agents/skills/<name>/`. Read it before you touch a skill — TypeClaw has three skill layers with different ownership rules, and editing a skill that the `skills` CLI manages will silently get overwritten on the next `bunx skills update`.
 ---
 
 # typeclaw-skills
@@ -201,9 +201,26 @@ Do not invent a reason for a half-applied install. The lockfile and the working 
 
 If the agent folder is not a git repo, `bunx skills` still works — it just means there's no commit to make. Tell the user once: "Heads up, this folder isn't a git repo, so I can't snapshot the install."
 
+## Before authoring: find the owner
+
+A new skill is the last option, not the first, when you are the one deciding where a lesson goes. When a recurring task needs a durable correction or more detail, route it to one owner. If the user explicitly asks for a specific skill or file, that request stands, subject to the ownership rules in this skill.
+
+1. **An existing editable skill already covers the task** → edit that skill in place. Editable means a user-created skill under `.agents/skills/` that is in neither lockfile (see the workflow above), or a skill shipped by a local plugin you author in this agent folder (`packages/<name>/`, via its `skills`/`skillsDirs`) — edit that one in the plugin's source.
+2. **The owner is right, but the detail is long** (edge cases, a runbook) → put it in a support file the skill already links (or add one next to `SKILL.md` and link it), and keep a short pointer in `SKILL.md`.
+3. **The owner is not editable** → do not edit it. A system `typeclaw-*` skill is fixed with a typeclaw PR. A downloaded skill in a lockfile gets one of the three options from the workflow above (fork under a new name, propose upstream at its `<source>`, or `bunx skills remove` it first). A skill shipped by a published plugin package is proposed to that package. `memory/skills/` belongs to the dreaming subagent and is never hand-edited.
+4. **An independent recurring workflow with no fitting owner** → author a new user-created skill (below).
+
+Not every lesson belongs in a skill:
+
+- **`AGENTS.md`**, when present where the session's project-context discovery finds it, is loaded into each such session. Keep it to cross-task conventions and short pointers to the owning skill — not task procedures, which would duplicate the skill and grow every one of those sessions' context.
+- **Deterministic requirements** (fixed codes, mappings, thresholds, mandatory items) belong in code or config with a check that exercises the behavior. Prose in a skill is not enforcement.
+- **A one-off event or transient failure** (a single timeout, a flaky network call) is not a standing rule. Report it; don't write it down as procedure.
+
+None of this grants edit rights you don't already have: operator-owned files (`package.json` and dependencies, `.env`, secrets) keep their own rules.
+
 ## Authoring a user-created skill
 
-When the user says "write me a skill for X" or you decide a recurring procedure deserves to be a skill:
+When the user says "write me a skill for X", or the owner check above found no existing skill that fits a recurring procedure:
 
 1. **Pick a name that does not collide.** Check both `<typeclaw-package>/src/skills/` (system) and `.agents/skills/` (user). Prefer specific names (`postgres-backups`, not `db`). Do not prefix with `typeclaw-` — that prefix is reserved for system skills shipped by typeclaw.
 2. **Create the directory**: `mkdir -p .agents/skills/<name>`.

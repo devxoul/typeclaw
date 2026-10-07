@@ -1,5 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 
+import { buildSystemPolicy } from '@/agent/system-prompt'
+
 import {
   byteLength,
   dumpSystemPrompt,
@@ -7,14 +9,13 @@ import {
   dumpTurnPrompt,
   dumpTurnPromptWithBreakdown,
   estimateTokens,
-  TOKENS_PER_CHAR,
 } from './dump-system-prompt'
 
-describe('dumpSystemPrompt', () => {
-  const defaultLoaderKinds: Array<'tui' | 'cron' | 'channel'> = ['tui', 'cron', 'channel']
+const ALL_KINDS: Array<'tui' | 'cron' | 'channel' | 'subagent'> = ['tui', 'cron', 'channel', 'subagent']
 
-  test.each(defaultLoaderKinds)(
-    '%s origin (default-loader path) renders identity, runtime, origin, and role — wall clock lives in the per-turn anchor, not here',
+describe('dumpSystemPrompt', () => {
+  test.each(ALL_KINDS)(
+    '%s origin renders identity, runtime, origin, and role — wall clock lives in the per-turn anchor, not here',
     (kind) => {
       const out = dumpSystemPrompt(kind)
 
@@ -30,69 +31,25 @@ describe('dumpSystemPrompt', () => {
     },
   )
 
-  test('subagent origin (override path) renders only override + runtime + origin/role, NOT identity or any wall-clock anchor', () => {
-    const out = dumpSystemPrompt('subagent')
+  // The default subagent goes through the same standard composer as every
+  // other origin; explicit `systemPromptOverride` sessions are not dumped.
+  test.each(ALL_KINDS)('%s origin starts with the one shared policy row', (kind) => {
+    const result = dumpSystemPromptWithBreakdown(kind)
+    const policyRow = `${buildSystemPolicy()}\n\n`
 
-    expect(out).toContain('## Runtime')
-    expect(out).toContain('## Session origin')
-    expect(out).toContain('## Your role in this session')
-    expect(out).not.toContain('## Now')
-    expect(out).not.toContain('<current-time>')
-    expect(out).not.toContain('# Identity')
-    expect(out).not.toContain('# Memory')
-    expect(out).not.toContain('You are a general-purpose AI agent running inside TypeClaw.')
-    expect(out).not.toContain('You are an AI agent running inside TypeClaw.')
+    expect(result.prompt.startsWith(policyRow)).toBe(true)
+    expect(result.prompt.split(buildSystemPolicy())).toHaveLength(2)
+    expect(result.sections[0]).toEqual({
+      name: 'Shared policy',
+      bytes: byteLength(policyRow),
+      chars: policyRow.length,
+      tokens: estimateTokens(policyRow),
+    })
   })
 
-  const fullKinds: Array<'tui' | 'channel'> = ['tui', 'channel']
-  test.each(fullKinds)('%s origin uses the full base prompt and includes git nudge', (kind) => {
-    const out = dumpSystemPrompt(kind)
-
-    expect(out).toContain('You are a general-purpose AI agent running inside TypeClaw.')
-    expect(out).toContain('## Uncommitted changes at session start')
-  })
-
-  test.each(fullKinds)(
-    '%s origin carries the tmux long-running/interactive shell-work guidance inside the base prompt',
-    (kind) => {
-      const out = dumpSystemPrompt(kind)
-
-      expect(out).toContain('## Long-running and interactive shell work')
-      // Lives in the cacheable base-prompt prefix, ahead of the identity block.
-      expect(out.indexOf('## Long-running and interactive shell work')).toBeLessThan(out.indexOf('## IDENTITY.md'))
-    },
-  )
-
-  test('cron origin omits the tmux shell-work guidance (slim base prompt)', () => {
-    expect(dumpSystemPrompt('cron')).not.toContain('## Long-running and interactive shell work')
-  })
-
-  test('cron origin uses the slim base prompt and omits git nudge', () => {
+  test('cron origin renders the cron job metadata', () => {
     const out = dumpSystemPrompt('cron')
 
-    expect(out).toContain('You are an AI agent running inside TypeClaw.')
-    expect(out).not.toContain('You are a general-purpose AI agent running inside TypeClaw.')
-    expect(out).not.toContain('## Uncommitted changes at session start')
-  })
-
-  test('cron slim prompt carries the load-bearing guidance the audit identified', () => {
-    const out = dumpSystemPrompt('cron')
-
-    expect(out).toContain('Never echo secrets from `secrets.json` or `.env`')
-    expect(out).toContain('never fabricate results')
-    expect(out).toContain('Do not narrate routine')
-    expect(out).toContain('workspace/')
-    expect(out).toContain('Do not edit `memory/topics/` directly')
-  })
-
-  test('slim prompt does NOT contain the subagent-breaking "plain prose is invisible" claim', () => {
-    expect(dumpSystemPrompt('cron')).not.toContain('Plain prose with no tool call is invisible')
-  })
-
-  test('cron origin includes cron-specific text', () => {
-    const out = dumpSystemPrompt('cron')
-
-    expect(out).toContain('You are running an unattended cron job.')
     expect(out).toContain('- Job ID:')
     expect(out).toContain('- Job kind: prompt')
   })
@@ -119,16 +76,6 @@ describe('dumpSystemPrompt', () => {
     expect(out).not.toContain('# Memory')
   })
 
-  test('TOKENS_PER_CHAR is the documented 1/4 heuristic', () => {
-    expect(TOKENS_PER_CHAR).toBe(0.25)
-  })
-
-  test('estimateTokens rounds chars*0.25', () => {
-    expect(estimateTokens('')).toBe(0)
-    expect(estimateTokens('abcd')).toBe(1)
-    expect(estimateTokens('a'.repeat(100))).toBe(25)
-  })
-
   test('byteLength returns UTF-8 byte count, not String.length', () => {
     expect(byteLength('abc')).toBe(3)
     expect(byteLength('—')).toBe(3)
@@ -140,108 +87,51 @@ describe('dumpSystemPrompt', () => {
     expect(byteLength(text)).toBeGreaterThan(text.length)
   })
 
-  test.each(['tui', 'cron', 'channel', 'subagent'] as const)(
-    '%s breakdown has bytes / chars / tokens for every section, plus totals',
-    (kind) => {
-      const result = dumpSystemPromptWithBreakdown(kind)
+  test.each(ALL_KINDS)('%s breakdown rows include their separators and sum exactly to the rendered totals', (kind) => {
+    const result = dumpSystemPromptWithBreakdown(kind)
 
-      const minSections = kind === 'subagent' ? 3 : 5
-      expect(result.sections.length).toBeGreaterThanOrEqual(minSections)
-      for (const s of result.sections) {
-        expect(s.bytes).toBeGreaterThan(0)
-        expect(s.chars).toBeGreaterThan(0)
-        expect(s.tokens).toBeGreaterThanOrEqual(0)
-        expect(s.bytes).toBeGreaterThanOrEqual(s.chars)
-      }
-      expect(result.totalBytes).toBe(byteLength(result.prompt))
-      expect(result.totalChars).toBe(result.prompt.length)
-      expect(result.totalTokens).toBe(estimateTokens(result.prompt))
-      expect(result.totalBytes).toBeGreaterThanOrEqual(result.totalChars)
+    expect(result.totalBytes).toBe(byteLength(result.prompt))
+    expect(result.totalChars).toBe(result.prompt.length)
+    expect(result.totalTokens).toBe(estimateTokens(result.prompt))
+    expect(result.sections.reduce((sum, section) => sum + section.chars, 0)).toBe(result.prompt.length)
+    expect(result.sections.reduce((sum, section) => sum + section.bytes, 0)).toBe(byteLength(result.prompt))
+  })
+
+  test.each(['tui', 'channel'] as const)(
+    '%s breakdown lists the interactive session context and git nudge in cache order',
+    (kind) => {
+      expect(dumpSystemPromptWithBreakdown(kind).sections.map((s) => s.name)).toEqual([
+        'Shared policy',
+        'Identity (IDENTITY.md + SOUL.md)',
+        'Runtime block',
+        'Interactive context',
+        'Session origin',
+        'Role context',
+        'Git nudge',
+      ])
     },
   )
 
-  test('breakdown total tokens matches estimateTokens on the rendered prompt', () => {
-    const result = dumpSystemPromptWithBreakdown('cron')
-    expect(estimateTokens(result.prompt)).toBe(result.totalTokens)
-  })
-
-  test('tui breakdown lists each expected full-mode section in order', () => {
-    const names = dumpSystemPromptWithBreakdown('tui').sections.map((s) => s.name)
-    expect(names).toEqual([
-      'DEFAULT_SYSTEM_PROMPT (base)',
-      'Identity (IDENTITY.md + SOUL.md)',
-      'Runtime block',
-      'Session origin',
-      'Role context',
-      'Git nudge',
-    ])
-  })
-
-  test('cron breakdown uses the slim base and omits Git nudge', () => {
-    const names = dumpSystemPromptWithBreakdown('cron').sections.map((s) => s.name)
-    expect(names).toEqual([
-      'SLIM_SYSTEM_PROMPT (base)',
-      'Identity (IDENTITY.md + SOUL.md)',
-      'Runtime block',
-      'Session origin',
-      'Role context',
-    ])
-  })
-
-  test('subagent breakdown reflects production override path: override + runtime + origin/role', () => {
-    const names = dumpSystemPromptWithBreakdown('subagent').sections.map((s) => s.name)
-    expect(names).toEqual(['Subagent override prompt', 'Runtime block', 'Session origin + role'])
-    expect(names).not.toContain('SLIM_SYSTEM_PROMPT (base)')
-    expect(names).not.toContain('DEFAULT_SYSTEM_PROMPT (base)')
-    expect(names).not.toContain('Identity (IDENTITY.md + SOUL.md)')
-    expect(names).not.toContain('Memory (MEMORY.md + streams)')
-    expect(names).not.toContain('Git nudge')
-  })
-
-  test('slim cron prompt is meaningfully lighter than the full tui prompt', () => {
-    const cronTok = dumpSystemPromptWithBreakdown('cron').totalTokens
-    const tuiTok = dumpSystemPromptWithBreakdown('tui').totalTokens
-    expect(tuiTok - cronTok).toBeGreaterThan(800)
-  })
-
-  test('slim cron prompt stays under the 1000-token budget (regression guard)', () => {
-    expect(dumpSystemPromptWithBreakdown('cron').totalTokens).toBeLessThan(1000)
-  })
-
-  test('subagent override-path dump stays under the 500-token budget', () => {
-    expect(dumpSystemPromptWithBreakdown('subagent').totalTokens).toBeLessThan(500)
-  })
+  test.each(['cron', 'subagent'] as const)(
+    '%s breakdown has the same policy but no interactive context or git nudge',
+    (kind) => {
+      expect(dumpSystemPromptWithBreakdown(kind).sections.map((s) => s.name)).toEqual([
+        'Shared policy',
+        'Identity (IDENTITY.md + SOUL.md)',
+        'Runtime block',
+        'Session origin',
+        'Role context',
+      ])
+    },
+  )
 
   test('--no-git-nudge breakdown omits the Git nudge row on a full-mode origin', () => {
     const names = dumpSystemPromptWithBreakdown('tui', { gitNudge: false }).sections.map((s) => s.name)
     expect(names).not.toContain('Git nudge')
   })
 
-  test('full-mode section order is least-volatile to most-volatile (cache-suffix contract)', () => {
-    const out = dumpSystemPrompt('tui')
-    // Anchor on header strings that appear EXACTLY ONCE in the rendered
-    // prompt. `# Identity` and `## Uncommitted changes…` each appear inside
-    // DEFAULT_SYSTEM_PROMPT's prose as well, so indexOf on those would point at
-    // the docs mention rather than the real section header.
-    const idx = (needle: string) => out.indexOf(needle)
-
-    expect(idx('## IDENTITY.md')).toBeLessThan(idx('TypeClaw runtime version:'))
-    expect(idx('TypeClaw runtime version:')).toBeLessThan(idx('## Session origin'))
-    expect(idx('## Session origin')).toBeLessThan(idx('## Your role in this session'))
-    expect(idx('## Your role in this session')).toBeLessThan(idx('git reports 2 uncommitted files'))
-  })
-
-  test('slim-mode section order is least-volatile to most-volatile (cache-suffix contract)', () => {
-    const out = dumpSystemPrompt('cron')
-    const idx = (needle: string) => out.indexOf(needle)
-
-    expect(idx('## IDENTITY.md')).toBeLessThan(idx('TypeClaw runtime version:'))
-    expect(idx('TypeClaw runtime version:')).toBeLessThan(idx('You are running an unattended cron job.'))
-    expect(idx('You are running an unattended cron job.')).toBeLessThan(idx('## Your role in this session'))
-  })
-
-  test('no default-loader origin embeds long-term memory in the system prompt', () => {
-    for (const kind of ['tui', 'cron', 'channel'] as const) {
+  test('no origin kind embeds long-term memory in the system prompt', () => {
+    for (const kind of ALL_KINDS) {
       const out = dumpSystemPrompt(kind)
       expect(out).not.toContain('## MEMORY.md')
       expect(out).not.toContain('memory/<PLACEHOLDER:YYYY-MM-DD>.jsonl')
@@ -249,7 +139,7 @@ describe('dumpSystemPrompt', () => {
   })
 
   test('no origin kind embeds a wall-clock anchor in the system prompt (per-turn injection invariant)', () => {
-    for (const kind of ['tui', 'cron', 'channel', 'subagent'] as const) {
+    for (const kind of ALL_KINDS) {
       const out = dumpSystemPrompt(kind)
       expect(out).not.toContain('## Now')
       expect(out).not.toContain('Session started at')
@@ -280,18 +170,15 @@ describe('dumpSystemPrompt', () => {
     expect(out.indexOf('<PLACEHOLDER: interactive user request from the TUI>')).toBeLessThan(out.indexOf('# Memory'))
   })
 
-  test.each(['tui', 'cron', 'channel', 'subagent'] as const)(
-    '%s turn breakdown totals and section attribution cover the composed turn exactly',
-    (kind) => {
-      const result = dumpTurnPromptWithBreakdown(kind)
+  test.each(ALL_KINDS)('%s turn breakdown totals and section attribution cover the composed turn exactly', (kind) => {
+    const result = dumpTurnPromptWithBreakdown(kind)
 
-      expect(result.totalBytes).toBe(byteLength(result.prompt))
-      expect(result.totalChars).toBe(result.prompt.length)
-      expect(result.totalTokens).toBe(estimateTokens(result.prompt))
-      expect(result.sections.reduce((sum, section) => sum + section.chars, 0)).toBe(result.prompt.length)
-      expect(result.sections.reduce((sum, section) => sum + section.bytes, 0)).toBe(byteLength(result.prompt))
-    },
-  )
+    expect(result.totalBytes).toBe(byteLength(result.prompt))
+    expect(result.totalChars).toBe(result.prompt.length)
+    expect(result.totalTokens).toBe(estimateTokens(result.prompt))
+    expect(result.sections.reduce((sum, section) => sum + section.chars, 0)).toBe(result.prompt.length)
+    expect(result.sections.reduce((sum, section) => sum + section.bytes, 0)).toBe(byteLength(result.prompt))
+  })
 
   test('channel turn breakdown identifies each live envelope section in order', () => {
     expect(dumpTurnPromptWithBreakdown('channel').sections.map((section) => section.name)).toEqual([

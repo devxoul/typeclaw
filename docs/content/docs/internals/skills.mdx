@@ -4,7 +4,7 @@ description: Four loading sources, naming rules, and why descriptions are trigge
 icon: BookOpen
 ---
 
-Skills are markdown files with `name` + `description` frontmatter, surfaced to the agent in the `<available_skills>` system-prompt section. The agent loads one on demand by `read`-ing the `SKILL.md` at the `<location>` path that section advertises — there is no dedicated `skill` tool. (The `load_skill` tool is a separate, subagent-only mechanism for in-memory `LoadableSkill`s; see [Subagent skills](#subagent-skills-load_skill).) Four sources, each with a different owner:
+Skills are markdown files with `name` + `description` frontmatter, surfaced to the agent in the `<available_skills>` system-prompt section. The agent loads one on demand by `read`-ing the `SKILL.md` at the `<location>` path that section advertises — there is no dedicated `skill` tool. (The `load_skill` tool is a separate, subagent-only mechanism for in-memory `LoadableSkill`s; see [Subagent sessions](#subagent-sessions).) Four sources, each with a different owner:
 
 | Source                 | Path                                        | Owner             | When to add                                                                                                                 |
 | ---------------------- | ------------------------------------------- | ----------------- | --------------------------------------------------------------------------------------------------------------------------- |
@@ -25,9 +25,25 @@ Wiring: `setupSession` in `src/agent/index.ts`. Default to **bundled** when addi
 
 The LLM picks skills by description. Name the failure modes, platforms, and verbs that should activate the skill. Vague descriptions = dead weight.
 
-## Skills are lazy
+## Skills are lazy; the catalog is not
 
-Adding one costs zero tokens until loaded. Right home for platform-specific guidance and large runbooks. **Do not** copy skill content into tool descriptions — those reload into every tool-call prefix, which is exactly the cost model skills avoid.
+Only the body is lazy. Every discovered skill's `name`, `description`, and `<location>` are rendered into `<available_skills>` at session start, so each added skill carries an upfront catalog cost that grows with its description. The body costs nothing until the agent `read`s it, which makes skills the right home for platform-specific guidance and large runbooks. **Do not** copy skill content into tool descriptions — those reload into every tool-call prefix, which is exactly the cost model skills avoid.
+
+## Where durable guidance belongs
+
+The shared runtime policy (`buildSystemPolicy` in `src/agent/system-prompt.ts`) routes a durable rule the agent infers on its own to one owner instead of copying it into several places. This is the default for inferred lessons, not a ban on explicit artifact requests: when the user asks for a specific skill, doc, or file, that request stands, subject to the existing ownership, permission, and safety restrictions.
+
+1. **Existing editable owner skill** — when an available skill already covers the task, correct or extend that skill.
+2. **That skill's linked support document** — when the owner is right but the detail is long (edge cases, runbooks), put it in a reference file the skill already links, and keep a short pointer in `SKILL.md`.
+3. **New skill** — only for an independent recurring workflow that no existing owner fits.
+
+Other homes:
+
+- **`AGENTS.md` / project instructions** — cross-task conventions and short pointers to the owning skill, not task procedures. Upstream `DefaultResourceLoader` discovers these files (`AGENTS.override.md`, `AGENTS.md`, `CLAUDE.md`, per directory, including the agent dir and its ancestors) and, while default context-file loading is enabled, appends them as project context to every session rooted beneath them, including `systemPromptOverride` sessions. Every line there is paid on each of those sessions, and a procedure copied there competes with the skill that owns it.
+- **Code or config plus a behavior check** — deterministic requirements (fixed codes, mappings, thresholds, mandatory items). Prose is not enforcement.
+- **Nowhere** — a one-off event or transient failure is not a standing rule.
+
+A skill that isn't editable is not overwritten: a bundled `typeclaw-*` skill is fixed with a typeclaw PR; a `skills-lock.json` entry keeps the existing fork-under-a-new-name / propose-upstream / remove-first options; a skill from a published plugin package is proposed to that package. A skill from a local plugin authored in the agent folder (`packages/<name>/`) is edited in that plugin's source. `memory/skills/` stays owned by the dreaming subagent. This routing never grants edit authority over operator-owned files or overrides package, config, or security restrictions.
 
 ## How the agent loads a skill
 
@@ -35,8 +51,10 @@ The four sources above are all **file-based**: the upstream `DefaultResourceLoad
 
 The agent must use the exact `<location>` path verbatim. It must **not** construct or guess skill paths (e.g. `node_modules/typeclaw/src/skills/<name>/SKILL.md`): muscle-memory and user skills live under the agent dir, the bundled path resolves through the installed package, and a guessed path that doesn't exist is the most common skill-load failure. If a skill you expect isn't listed in `<available_skills>`, it isn't file-based — don't go hunting for its `SKILL.md` on disk.
 
-## Subagent skills (`load_skill`)
+## Subagent sessions
 
-Subagents bypass the file-based resource loader entirely, so the startup discovery path is unavailable to them. A plugin can instead hand a subagent a typed `load_skill` tool via `createLoadSkillTool` (`src/plugin/load-skill.ts`), passing in-memory `LoadableSkill` objects (`name` / `description` / `content`). The tool's `name` parameter is a Zod enum of the supplied skill names, so the subagent picks from a fixed menu — it can't read a `SKILL.md` off disk.
+A subagent-origin session without a custom prompt (for example a plugin command's `ctx.prompt`) uses the standard composer: the same shared policy as every other origin, the normal `additionalSkillPaths`, and therefore the normal `<available_skills>` catalog.
 
-This is distinct from the main-agent flow: `load_skill` returns a `content` string the plugin embedded at build time, not a discovered file. The only bundled consumer is the `reviewer` subagent (`src/bundled-plugins/reviewer/`), whose `code-review` and `general` skills are `LoadableSkill`s — there is no `code-review/SKILL.md` anywhere in the tree.
+A registered subagent with its own `systemPrompt` runs through `createOverrideResourceLoader` (`systemPromptOverride`). That path skips TypeClaw's shared policy and `IDENTITY.md`/`SOUL.md`, and it does not pass TypeClaw's `additionalSkillPaths` (bundled, muscle-memory, plugin, materialized). The upstream SDK still runs its own discovery for it: project context files (`AGENTS.md` and friends) and its default local skill locations (for example `.agents/skills/` under the working directory and its ancestors), so an override session can still carry a skill catalog. Don't rely on that for subagent-specific skills.
+
+Such a subagent can instead get a typed `load_skill` tool from its plugin via `createLoadSkillTool` (`src/plugin/load-skill.ts`), passing in-memory `LoadableSkill` objects (`name` / `description` / `content`). The tool's `name` parameter is a Zod enum of the supplied skill names, so the subagent picks from a fixed menu — it can't read a `SKILL.md` off disk. `load_skill` returns a `content` string the plugin embedded at build time, not a discovered file. The only bundled consumer is the `reviewer` subagent (`src/bundled-plugins/reviewer/`), whose `code-review` and `general` skills are `LoadableSkill`s — there is no `code-review/SKILL.md` anywhere in the tree.
