@@ -1,5 +1,5 @@
 import { existsSync } from 'node:fs'
-import { lstat, open, readFile, unlink, writeFile } from 'node:fs/promises'
+import { appendFile, lstat, open, readFile, stat, unlink, writeFile } from 'node:fs/promises'
 
 import lockfile from 'proper-lockfile'
 
@@ -34,6 +34,12 @@ const EXIT_SETTLE_MS = 500
 // seen as stale by a contender — only a crashed holder, whose refresh timer
 // died with it, is reclaimed. Mirrors the models/secrets locks' 30s ceiling.
 const LOCK_STALE_MS = 30_000
+// A pidfile child that is still unreachable this long after it was spawned is
+// wedged (e.g. stuck in Bun's crash handler after a segfault), not slow-booting.
+// The pidfile is written at spawn time, so its mtime is the child's birth time.
+const WEDGED_DAEMON_AGE_MS = 30_000
+const SHUTDOWN_EXIT_GRACE_MS = 2_000
+const KILL_GRACE_MS = 2_000
 const LOCK_RETRY_BACKOFF = {
   factor: 1,
   minTimeout: POLL_INTERVAL_MS,
@@ -90,6 +96,7 @@ async function readHttpPort(): Promise<number | null> {
 }
 
 async function requestShutdownAndWait(): Promise<boolean> {
+  const pid = await readPidQuiet()
   const reply = await send({ kind: 'shutdown' }, { timeoutMs: 1_000 })
   if (!reply.ok) return false
   const deadline = Date.now() + SHUTDOWN_TIMEOUT_MS
@@ -99,10 +106,29 @@ async function requestShutdownAndWait(): Promise<boolean> {
       await sleep(POLL_INTERVAL_MS)
       continue
     }
-    if (!existsSync(socketPath())) return true
+    if (!existsSync(socketPath())) {
+      await reapLingeringDaemon(pid)
+      return true
+    }
     await sleep(POLL_INTERVAL_MS)
   }
   return false
+}
+
+// The daemon unlinks its socket at the end of stop(), before exiting. A daemon
+// that never makes it to exit (observed in the field: "stopping" logged, process
+// alive for days) keeps its HTTP control port and renewal timers, so the fresh
+// daemon falls back to another port and two daemons run against one home.
+async function reapLingeringDaemon(pid: number): Promise<void> {
+  if (pid <= 0) return
+  if (await waitForExit(pid, SHUTDOWN_EXIT_GRACE_MS)) return
+  if (!(await isHostdProcess(pid))) return
+  const reaped = await terminateProcess(pid)
+  await appendSpawnLog(
+    reaped
+      ? `reaped host daemon pid ${pid} that acknowledged shutdown but did not exit`
+      : `host daemon pid ${pid} acknowledged shutdown but did not exit and could not be terminated`,
+  )
 }
 
 type SpawnAttemptResult = { ok: true; pid: number; spawned: boolean; httpPort: number } | { ok: false; reason: string }
@@ -135,9 +161,18 @@ async function spawnUnderLock(opts: EnsureDaemonOptions): Promise<SpawnAttemptRe
     // adopt the existing child and poll IT for readiness instead of re-spawning.
     const existingPid = await livePidfileChild()
     if (existingPid !== null) {
-      const ready = await pollForReadiness(opts.spawnTimeoutMs ?? DEFAULT_SPAWN_TIMEOUT_MS)
-      if (ready === null) return { ok: false, reason: 'daemon spawned but did not become reachable yet' }
-      return { ok: true, pid: existingPid, spawned: false, httpPort: ready }
+      if (!(await isWedgedDaemon(existingPid))) {
+        const ready = await pollForReadiness(opts.spawnTimeoutMs ?? DEFAULT_SPAWN_TIMEOUT_MS)
+        if (ready === null) return { ok: false, reason: 'daemon spawned but did not become reachable yet' }
+        return { ok: true, pid: existingPid, spawned: false, httpPort: ready }
+      }
+      // Adopting a wedged daemon would block every future start forever, so
+      // replace it. Only reached after isDaemonReachable() failed above.
+      if (!(await terminateProcess(existingPid))) {
+        await appendSpawnLog(`host daemon pid ${existingPid} is unresponsive and could not be terminated`)
+        return { ok: false, reason: `host daemon pid ${existingPid} is unresponsive and could not be terminated` }
+      }
+      await appendSpawnLog(`replaced unresponsive host daemon pid ${existingPid}`)
     }
     await opts.onSpawnEnter?.()
     return await spawnDaemonDetached(opts)
@@ -158,6 +193,72 @@ async function livePidfileChild(): Promise<number | null> {
   } catch {
     return null
   }
+}
+
+async function isWedgedDaemon(pid: number): Promise<boolean> {
+  if (isWindows()) return false
+  let spawnedAtMs: number
+  try {
+    spawnedAtMs = (await stat(pidfilePath())).mtimeMs
+  } catch {
+    return false
+  }
+  if (Date.now() - spawnedAtMs < WEDGED_DAEMON_AGE_MS) return false
+  return isHostdProcess(pid)
+}
+
+// PID-reuse guard: a pidfile pid is only signalled when its full command line
+// is exactly the three-token launch signature from spawnDaemonDetached — the
+// bun executable, the typeclaw CLI entry, `_hostd` — so a recycled pid that
+// mentions `_hostd`, or passes the whole signature as arguments to another
+// program (`watch … pgrep -f bun …/cli/index.ts _hostd`), is never killed.
+// Tokens are whitespace-free: `ps` joins argv with spaces, so a path containing
+// spaces is ambiguous and fails closed (adopted, never signalled).
+const HOSTD_COMMAND_SIGNATURE = /^(?:\S*\/)?bun \S*\/(?:cli\/index\.ts|typeclaw) _hostd$/
+
+async function isHostdProcess(pid: number): Promise<boolean> {
+  if (isWindows()) return false
+  try {
+    const proc = Bun.spawn({
+      cmd: ['ps', '-o', 'command=', '-p', String(pid)],
+      stdin: 'ignore',
+      stdout: 'pipe',
+      stderr: 'ignore',
+    })
+    const out = await new Response(proc.stdout).text()
+    await proc.exited
+    return HOSTD_COMMAND_SIGNATURE.test(out.trim())
+  } catch {
+    return false
+  }
+}
+
+// SIGTERM first so a merely-hung event loop can still run its shutdown handler;
+// SIGKILL for a process that can't (e.g. spinning inside a crash handler).
+async function terminateProcess(pid: number): Promise<boolean> {
+  for (const signal of ['SIGTERM', 'SIGKILL'] as const) {
+    try {
+      process.kill(pid, signal)
+    } catch (error) {
+      if (errorCode(error) === 'ESRCH') return true
+      return false
+    }
+    if (await waitForExit(pid, KILL_GRACE_MS)) return true
+  }
+  return false
+}
+
+async function waitForExit(pid: number, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs
+  while (processExists(pid)) {
+    if (Date.now() >= deadline) return false
+    await sleep(POLL_INTERVAL_MS)
+  }
+  return true
+}
+
+async function appendSpawnLog(message: string): Promise<void> {
+  await appendFile(logfilePath(), `${new Date().toISOString()} [hostd-spawn] ${message}\n`).catch(() => {})
 }
 
 async function pollForReadiness(timeoutMs: number): Promise<number | null> {
