@@ -5,11 +5,14 @@ import { mkdir, mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
+import type { AgentSession } from '@/agent'
+import { InboundJournal } from '@/channels/inbound-journal'
 import { createChannelRouter, type ChannelRouter } from '@/channels/router'
 import type { ChannelAdapterConfig, GithubAdapterConfig } from '@/channels/schema'
 import type { GithubSecretsBlock } from '@/secrets/schema'
 
 import { createGithubAdapter } from './index'
+import { DEFAULT_RECONCILE_COOLDOWN_MS, loadReconcileCooldownStore } from './reconcile-cooldown-store'
 
 const APP_PRIVATE_KEY_PEM = generateKeyPairSync('rsa', { modulusLength: 2048 })
   .privateKey.export({ type: 'pkcs8', format: 'pem' })
@@ -1676,6 +1679,185 @@ describe('createGithubAdapter lifecycle', () => {
         await adapter.stop()
       } finally {
         await rm(agentDir, { recursive: true, force: true })
+      }
+    })
+
+    // A session that never reaches a model provider, so the real router can
+    // admit replays fully offline.
+    class ProviderlessSession {
+      agent = { streamFunction: () => undefined, abort: () => {} }
+      prompt = async (): Promise<void> => {}
+      abort = async (): Promise<void> => {}
+      dispose = (): void => {}
+      subscribe = (): (() => void) => () => {}
+    }
+
+    // A real router over a caller-owned real inbound journal that records each
+    // replay's actual receipt, or `rejected` when routing threw.
+    function journaledRouter(routerDir: string, inboundJournal: InboundJournal, receipts: string[]): ChannelRouter {
+      const router = createChannelRouter({
+        agentDir: routerDir,
+        configForAdapter: () => ({
+          ...ADAPTER_DEFAULTS,
+          engagement: { ...ADAPTER_DEFAULTS.engagement, trigger: [...ADAPTER_DEFAULTS.engagement.trigger] },
+        }),
+        inboundJournal,
+        logger: silentLogger(),
+        createSessionForChannel: async ({ key }) => ({
+          session: new ProviderlessSession() as unknown as AgentSession,
+          sessionId: `ses_${key.chat.replace(':', '_')}`,
+          dispose: async () => {},
+        }),
+      })
+      const route = router.route.bind(router)
+      router.route = async (message) => {
+        try {
+          const receipt = await route(message)
+          receipts.push(`${message.chat}:${receipt.kind}`)
+          return receipt
+        } catch (err) {
+          receipts.push(`${message.chat}:rejected`)
+          throw err
+        }
+      }
+      return router
+    }
+
+    function admittedChat(record: unknown): string | undefined {
+      if (typeof record !== 'object' || record === null || !('type' in record) || record.type !== 'admitted') return
+      if (!('changes' in record) || !Array.isArray(record.changes)) return
+      const chat: unknown = record.changes[0]?.row?.target?.chat
+      return typeof chat === 'string' ? chat : undefined
+    }
+
+    async function coolingDown(reconcileDir: string, prId: number): Promise<boolean> {
+      const store = await loadReconcileCooldownStore(reconcileDir, silentLogger())
+      return store.isCoolingDown('acme/widgets', prId, Date.now(), DEFAULT_RECONCILE_COOLDOWN_MS)
+    }
+
+    test('a replay whose journal admission failed is retried after a restart and does not stop the next PR', async () => {
+      const reconcileDir = await mkdtemp(join(tmpdir(), 'gh-reconcile-lifecycle-'))
+      const routerDir = join(reconcileDir, 'router')
+      try {
+        const receipts: string[] = []
+        const start = async (journal: InboundJournal, logger = silentLogger()) => {
+          const router = journaledRouter(routerDir, journal, receipts)
+          const adapter = createGithubAdapter({
+            router,
+            configRef: reviewConfig('opened'),
+            secrets: patSecrets(),
+            agentDir: reconcileDir,
+            logger,
+            fetchImpl: unreviewedPrFetch([7, 8]).fetch,
+            httpListenImpl: () => ({ stop: async () => {} }),
+            webhookRegistrationDelayMs: 0,
+            tokenRefreshIntervalMs: 0,
+            reconcileIntervalMs: 0,
+          })
+          await adapter.start()
+          return async () => {
+            await adapter.stop()
+            await router.stop()
+            await journal.close()
+          }
+        }
+
+        // given a journal that fails right after writing PR #7's admission line
+        let failAdmission = true
+        const failingJournal = new InboundJournal(routerDir, {
+          onDurability: (phase, record) => {
+            if (!failAdmission || phase !== 'append-written' || admittedChat(record) !== 'pr:7') return
+            failAdmission = false
+            throw new Error('injected admission sync failure')
+          },
+        })
+
+        // when the first runtime reconciles both open PRs
+        const logger = recordingLogger()
+        const stopFirst = await start(failingJournal, logger)
+        await waitUntil(() => logger.messages.some((m) => m.includes('PR #8 replay failed')))
+        await stopFirst()
+
+        // then PR #7's rejected admission did not stop PR #8, and neither
+        // unadmitted replay holds a cooldown
+        expect(receipts).toEqual(['pr:7:rejected', 'pr:8:rejected'])
+        expect(await coolingDown(reconcileDir, 700)).toBe(false)
+        expect(await coolingDown(reconcileDir, 800)).toBe(false)
+
+        // when a restarted runtime reopens the journal and reconciles again
+        receipts.length = 0
+        const stopSecond = await start(new InboundJournal(routerDir))
+        await waitUntil(() => receipts.length === 2)
+        await stopSecond()
+
+        // then the admission written before the failure dedupes PR #7, PR #8 is
+        // admitted now, and both replays keep their cooldown
+        expect(receipts).toEqual(['pr:7:duplicate', 'pr:8:accepted'])
+        expect(await coolingDown(reconcileDir, 700)).toBe(true)
+        expect(await coolingDown(reconcileDir, 800)).toBe(true)
+      } finally {
+        await rm(reconcileDir, { recursive: true, force: true })
+      }
+    })
+
+    test("a stopped adapter's in-flight replay keeps its admitted cooldown without blocking the replacement", async () => {
+      const reconcileDir = await mkdtemp(join(tmpdir(), 'gh-reconcile-lifecycle-'))
+      const routerDir = join(reconcileDir, 'router')
+      const journal = new InboundJournal(routerDir)
+      const receipts: string[] = []
+      const router = journaledRouter(routerDir, journal, receipts)
+      try {
+        const build = (prNumbers: readonly number[]) =>
+          createGithubAdapter({
+            router,
+            configRef: reviewConfig('opened'),
+            secrets: patSecrets(),
+            agentDir: reconcileDir,
+            logger: silentLogger(),
+            fetchImpl: unreviewedPrFetch(prNumbers).fetch,
+            httpListenImpl: () => ({ stop: async () => {} }),
+            webhookRegistrationDelayMs: 0,
+            tokenRefreshIntervalMs: 0,
+            reconcileIntervalMs: 0,
+          })
+
+        // given a first adapter whose PR #7 replay is dispatched but held
+        // before the router answers
+        const recordedRoute = router.route
+        const dispatched = Promise.withResolvers<void>()
+        const answer = Promise.withResolvers<void>()
+        const routedChats: string[] = []
+        router.route = async (message) => {
+          routedChats.push(message.chat)
+          if (routedChats.length === 1) {
+            dispatched.resolve()
+            await answer.promise
+          }
+          return recordedRoute(message)
+        }
+        const first = build([7])
+        await first.start()
+        await dispatched.promise
+
+        // when that adapter stops and a replacement starts while it is pending
+        await first.stop()
+        const second = build([7, 8])
+        await second.start()
+
+        // then the replacement's pass reaches PR #8 (so it already decided
+        // PR #7) without replaying PR #7 a second time
+        await waitUntil(() => routedChats.includes('pr:8'))
+        expect(routedChats).toEqual(['pr:7', 'pr:8'])
+
+        // and once the router admits the stale replay its cooldown is kept
+        answer.resolve()
+        await waitUntil(() => receipts.includes('pr:7:accepted'))
+        await second.stop()
+        expect(await coolingDown(reconcileDir, 700)).toBe(true)
+      } finally {
+        await router.stop()
+        await journal.close()
+        await rm(reconcileDir, { recursive: true, force: true })
       }
     })
   })

@@ -20,8 +20,10 @@ import { LiveSubagentRegistry } from './src/agent/live-subagents.ts';
 import { createSpawnSubagentTool } from './src/agent/tools/spawn-subagent.ts';
 import { createStream } from './src/stream/index.ts';
 import { createSubagentCompletionBridge } from './src/channels/subagent-completion-bridge.ts';
+import { LegacyBackgroundHandoffReader } from './src/channels/background-handoff.ts';
 import { BackgroundObligationStore } from './src/channels/background-obligations.ts';
 import { InboundJournal } from './src/channels/inbound-journal.ts';
+import { bootBackgroundObligations } from './src/run/background-handoff-boot.ts';
 import { RecoveryOutbox } from './src/channels/recovery-outbox.ts';
 import { RecoveryDispatcher } from './src/channels/recovery-dispatcher.ts';
 import { createChannelRouter } from './src/channels/router.ts';
@@ -144,9 +146,7 @@ if(initial){
   await forever;
 }else{
   const outbox=new RecoveryOutbox(dir,{epoch:mode});
-  await journal.initialize();
-  await journal.importOldEpoch(outbox);
-  await store.importOldEpoch(outbox);
+  await bootBackgroundObligations({inboundJournal:journal,obligations:store,outbox,inventory:new LegacyBackgroundHandoffReader(dir,{processEpoch:mode})});
   if(mode==='receipt-death'){
     const delivered=outbox.delivered.bind(outbox);
     outbox.delivered=async(...args)=>{const result=await delivered(...args);if(result)await stopAt();return result};

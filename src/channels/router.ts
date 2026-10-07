@@ -34,7 +34,11 @@ import { extractClaimCode } from '@/role-claim'
 import type { Stream } from '@/stream'
 
 import { extractMentionedUserIds } from './adapters/mention-hints'
-import { BackgroundObligationStore, type BackgroundObligationRef } from './background-obligations'
+import {
+  BackgroundObligationStore,
+  type BackgroundObligation,
+  type BackgroundObligationRef,
+} from './background-obligations'
 import { formatChannelCommandHelp } from './commands'
 import { isQualifyingWorkResult } from './completion-claim'
 import { detectContinuationWillingness } from './continuation-willingness'
@@ -71,7 +75,7 @@ import {
   validateGithubReviewRound,
 } from './github-review-verdict-coordinator'
 import { renderPrVerdictStandDownReminder } from './github-verdict-activity'
-import { InboundJournal, type InboundRef } from './inbound-journal'
+import { InboundJournal, type InboundRecord, type InboundRef } from './inbound-journal'
 import {
   MEMBERSHIP_COLD_FETCH_TIMEOUT_MS,
   type MembershipCount,
@@ -88,6 +92,7 @@ import {
   saveChannelSessions,
   type ChannelSessionRecord,
 } from './persistence'
+import { recoveryNoticePartitionKey } from './recovery-notice'
 import { RecoveryOutbox } from './recovery-outbox'
 import {
   ADAPTER_READ_CAPABILITIES,
@@ -826,14 +831,39 @@ type PendingSystemReminder = {
   }
 }
 
+// Identity-only snapshot of the deferred durable coverage a session reloaded
+// mid-obligation still owes (typically a turn waiting on a running background
+// child). The journal claims stay authoritative under `turnId`/`ownerSessionId`
+// until the successor's in-lane consume moves them; nothing here prompts.
+type PendingReloadCoverage = {
+  inboundIds: string[]
+  backgroundIds: string[]
+  turnId: string
+  ownerSessionId: string
+  logicalTurnStartedAt: number
+  coverageDeferredSince: number | null
+  coverageDeferredParentSessionId: string | null
+  turnAccountIdentity?: string
+  // Author context a completion-only wake needs for author-scoped role
+  // resolution, exactly as the reloaded session would have restored it.
+  lastTurnAuthorId: string | null
+  lastTurnAuthorIds: string[]
+}
+
 type PendingReloadHandoff = {
   key: ChannelKey
+  // Session the work was retained from. A /stop that finds no live session
+  // withdraws this session's transferred notices, as a live stop would.
+  sessionId: string
   inbounds: QueuedInbound[]
   observed: ObservedInbound[]
   reminders: PendingSystemReminder[]
+  coverage: PendingReloadCoverage | null
   retainedAt: number
   estimatedBytes: number
 }
+
+const STOP_COMMAND_REPLY = 'Stopped the current turn.'
 
 const retryReminder = (text: string): PendingSystemReminder => ({ text, kind: 'retry' })
 
@@ -1024,6 +1054,10 @@ type LiveSession = {
   inboundCoverage: string[]
   turnAccountIdentity?: string
   backgroundTurnId: string
+  // Session holding the claims under `backgroundTurnId`: the creating session, a
+  // reload source restored at adoption, or this session once a consume acquires a
+  // turn. A successor may run under another ID than the one its adopted rows name.
+  backgroundTurnOwnerSessionId: string
   backgroundStopVersion: number
   // True only for the reminder-only iteration that consumed a willingness
   // nudge. `willingnessNudges` persists across the logical turn, so it remains
@@ -1077,11 +1111,17 @@ type LiveSession = {
   // `startedAt` against, to tell "this turn spawned it" from "it was already
   // running when unrelated work arrived".
   logicalTurnStartedAt: number
-  // `logicalTurnStartedAt` of the turn that deferred the open `inboundCoverage`
-  // to a background child, kept while fresh batches carry that coverage forward.
-  // Each carrying batch advances `logicalTurnStartedAt`, so without this a later
-  // batch would stop seeing the original child and declare the coverage lost.
+  // `logicalTurnStartedAt` of the turn that deferred open coverage (inbound requests,
+  // consumed child results, or both) to a background child, kept while fresh batches
+  // carry that coverage forward. Each carrying batch advances `logicalTurnStartedAt`,
+  // so without this a later batch would stop seeing the original child and declare
+  // the coverage lost.
   coverageDeferredSince: number | null
+  // Session that spawned the child that coverage was deferred to, kept with
+  // `coverageDeferredSince` while it is carried; null means the claim owner. A carry
+  // moves the claims to the carrying session, which after a reload can have another
+  // session ID than that child's parent.
+  coverageDeferredParentSessionId: string | null
   // Snapshot of `successfulChannelSends` taken at turn start (same
   // moment `turnSeq` increments). Lets `markTurnSkipped` detect "a
   // channel send already landed in this turn" and reject the skip,
@@ -2001,7 +2041,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         // requiresLiveSession:true guarantees the dispatch layer resolved a
         // session before running this handler, so `live` is non-null here.
         await stopCurrentChannelTurn(live!, 'user_stop')
-        return { reply: 'Stopped the current turn.' }
+        return { reply: STOP_COMMAND_REPLY }
       },
     },
   ]
@@ -2305,10 +2345,13 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     live: LiveSession,
     label: string,
     startedAt = live.logicalTurnStartedAt,
+    // Deferred coverage can wait on another session's child; a reload successor
+    // under a new session ID owns none of them in the registry.
+    parentSessionId = live.sessionId,
   ): boolean => {
-    const childStartedAt = newestRunningChildSubagentStartedAt(live.sessionId)
+    const childStartedAt = newestRunningChildSubagentStartedAt(parentSessionId)
     if (childStartedAt === null || childStartedAt < startedAt) return false
-    return isPinnedByRunningChild(live.sessionId, live.keyId, label)
+    return isPinnedByRunningChild(parentSessionId, live.keyId, label)
   }
 
   const shouldRolloverLive = (live: LiveSession, idleMs: number): boolean => {
@@ -2338,20 +2381,43 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   }
 
   const pendingReloadHandoffItemCount = (pending: PendingReloadHandoff): number =>
-    pending.inbounds.length + pending.observed.length + pending.reminders.length
+    pending.inbounds.length +
+    pending.observed.length +
+    pending.reminders.length +
+    (pending.coverage === null ? 0 : pending.coverage.inboundIds.length + pending.coverage.backgroundIds.length)
 
   const estimateReloadHandoffBytes = (
     inbounds: QueuedInbound[],
     observed: ObservedInbound[],
     reminders: PendingSystemReminder[],
+    coverage: PendingReloadCoverage | null,
   ): number => {
     try {
       const serializableInbounds = inbounds.map(({ engageReaction: _engageReaction, ...inbound }) => inbound)
-      return Buffer.byteLength(JSON.stringify({ inbounds: serializableInbounds, observed, reminders }), 'utf8')
+      return Buffer.byteLength(
+        JSON.stringify({ inbounds: serializableInbounds, observed, reminders, coverage }),
+        'utf8',
+      )
     } catch {
       return Number.POSITIVE_INFINITY
     }
   }
+
+  // Every durable identity a handoff owns, for the transfer that ends it
+  // without a successor (capacity, expiry, router stop).
+  const pendingReloadHandoffInputIds = (pending: PendingReloadHandoff): string[] => [
+    ...(pending.coverage?.inboundIds ?? []),
+    ...pending.inbounds.flatMap((input) => (input.inputId ? [input.inputId] : [])),
+    ...pending.reminders.flatMap((r) => r.inboundRetry?.inputIds ?? []),
+  ]
+
+  const pendingReloadHandoffBackgroundIds = (pending: PendingReloadHandoff): string[] => [
+    ...(pending.coverage?.backgroundIds ?? []),
+    ...pending.reminders.flatMap((r) => [
+      ...(r.backgroundObligationId ? [r.backgroundObligationId] : []),
+      ...(r.backgroundRetry?.obligationIds ?? []),
+    ]),
+  ]
 
   const pendingReloadHandoffTotalBytes = (): number => {
     let total = 0
@@ -2367,24 +2433,18 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   ): Promise<void> => {
     await ready
     inboundJournal.assertAvailable()
-    // Frozen notices retain the admission's principal, including its original author.
-    const partitionId = (accountIdentity: string, principal: object, parentSessionId?: string): string =>
-      JSON.stringify([
-        accountIdentity,
-        Object.entries(principal)
-          .filter(([, value]) => value !== undefined)
-          .sort(([left], [right]) => left.localeCompare(right)),
-        parentSessionId,
-      ])
+    // Frozen notices retain the admission's principal, including its original author,
+    // grouped by the same partition boot recovery uses for old-epoch rows.
     const groups = new Map<string, { inboundRefs: InboundRef[]; backgroundRefs: BackgroundObligationRef[] }>()
     for (const ref of inboundJournal.resolve([...new Set(inputIds)])) {
       const row = inboundJournal.get(ref.inputId)
       if (!row || row.phase === 'closed' || row.transfer) continue
-      const identity = partitionId(
-        row.accountIdentity,
-        row.principal,
-        row.claim?.ownerSessionId ?? ownerSessionId ?? row.sourceParentSessionId,
-      )
+      const identity = recoveryNoticePartitionKey({
+        target,
+        accountIdentity: row.accountIdentity,
+        principal: row.principal,
+        parentSessionId: row.claim?.ownerSessionId ?? ownerSessionId ?? row.sourceParentSessionId,
+      })
       let group = groups.get(identity)
       if (!group) {
         group = { inboundRefs: [], backgroundRefs: [] }
@@ -2398,11 +2458,12 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       if (!row || row.phase === 'closed' || row.transfer || channelKeyId(row.target) !== channelKeyId(target)) continue
       const ref = { obligationId: id, generation: row.generation }
       const group = groups.get(
-        partitionId(
-          row.accountIdentity,
-          row.principal,
-          row.claim?.ownerSessionId ?? ownerSessionId ?? row.parentSessionId,
-        ),
+        recoveryNoticePartitionKey({
+          target,
+          accountIdentity: row.accountIdentity,
+          principal: row.principal,
+          parentSessionId: row.claim?.ownerSessionId ?? ownerSessionId ?? row.parentSessionId,
+        }),
       )
       if (group) group.backgroundRefs.push(ref)
       else backgroundOnly.push(ref)
@@ -2469,88 +2530,136 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     return currentAccount
   }
 
-  const retainLiveQueuesInLane = async (live: LiveSession): Promise<boolean> => {
+  // Shared by the idle (immediate) and mid-drain (deferred tail) reload paths.
+  // Queued work and the identities of coverage still deferred to background work
+  // (a running child of the deferring turn, or its completion wake already queued)
+  // move together into one bounded handoff, so a reload never turns that wait
+  // into an interruption notice. Debt the session was not waiting on is an
+  // interruption exactly as before. Coverage bound to a replaced account is
+  // transferred under that original account first, so a fresh-account successor
+  // never inherits it. Whatever the bounds refuse is transferred as lost under
+  // its original principal.
+  const retainLiveWorkInLane = async (live: LiveSession): Promise<boolean> => {
     await ready
     inboundJournal.assertAvailable()
+    await transferMismatchedAccountCoverageInLane(live)
+    const hasCoverage = live.inboundCoverage.length > 0 || live.backgroundCoverage.length > 0
+    // Children of the session the coverage was deferred from and of its current claim owner.
+    const deferredParents = [
+      ...new Set([
+        live.coverageDeferredParentSessionId ?? live.backgroundTurnOwnerSessionId,
+        live.backgroundTurnOwnerSessionId,
+      ]),
+    ]
+    const deferredSince = live.coverageDeferredSince ?? live.logicalTurnStartedAt
+    const deferredToBackground =
+      hasCoverage &&
+      (live.pendingSystemReminders.some((reminder) => reminder.backgroundObligationId !== undefined) ||
+        deferredParents.some((parent) => isAwaitingBackgroundChild(live, 'reload-handoff', deferredSince, parent)))
+    if (hasCoverage && !deferredToBackground) {
+      await transferLostCoverageInLane(live.key, live.inboundCoverage, live.backgroundCoverage, live.sessionId)
+      live.inboundCoverage = []
+      live.backgroundCoverage = []
+    }
     const inbounds = live.promptQueue.slice()
     const observed = live.contextBuffer.slice()
     const reminders = live.pendingSystemReminders.slice()
-    const hasWork = inbounds.length > 0 || observed.length > 0 || reminders.length > 0
-    const retained = hasWork && retainReloadHandoff(live.key, inbounds, observed, reminders)
+    const coverage: PendingReloadCoverage | null = deferredToBackground
+      ? {
+          inboundIds: [...live.inboundCoverage],
+          backgroundIds: [...live.backgroundCoverage],
+          turnId: live.backgroundTurnId,
+          ownerSessionId: live.backgroundTurnOwnerSessionId,
+          logicalTurnStartedAt: live.logicalTurnStartedAt,
+          coverageDeferredSince: live.coverageDeferredSince,
+          coverageDeferredParentSessionId: live.coverageDeferredParentSessionId,
+          ...(live.turnAccountIdentity !== undefined ? { turnAccountIdentity: live.turnAccountIdentity } : {}),
+          lastTurnAuthorId: live.lastTurnAuthorId,
+          lastTurnAuthorIds: [...live.lastTurnAuthorIds],
+        }
+      : null
+    const incoming: PendingReloadHandoff = {
+      key: live.key,
+      sessionId: live.sessionId,
+      inbounds,
+      observed,
+      reminders,
+      coverage,
+      retainedAt: now(),
+      estimatedBytes: estimateReloadHandoffBytes(inbounds, observed, reminders, coverage),
+    }
+    const hasWork = pendingReloadHandoffItemCount(incoming) > 0
+    const retained = hasWork && retainReloadHandoff(incoming)
     if (hasWork && !retained) {
       await transferLostCoverageInLane(
         live.key,
-        [...inbounds.map((input) => input.inputId), ...reminders.flatMap((r) => r.inboundRetry?.inputIds ?? [])],
-        reminders.flatMap((r) => [
-          ...(r.backgroundObligationId ? [r.backgroundObligationId] : []),
-          ...(r.backgroundRetry?.obligationIds ?? []),
-        ]),
+        pendingReloadHandoffInputIds(incoming),
+        pendingReloadHandoffBackgroundIds(incoming),
         live.sessionId,
       )
     }
     live.promptQueue.length = 0
     live.contextBuffer.length = 0
     live.pendingSystemReminders.length = 0
+    live.inboundCoverage = []
+    live.backgroundCoverage = []
     return retained
   }
 
-  const reportDiscardedReloadHandoff = async (pending: PendingReloadHandoff, reason: string): Promise<void> => {
+  // Resolves false when the transfer failed: the rows stay owed and the caller
+  // keeps the handoff so the transfer can be retried.
+  const reportDiscardedReloadHandoff = async (pending: PendingReloadHandoff, reason: string): Promise<boolean> => {
     logger.error(
       `[channels] ${channelKeyId(pending.key)}: reload handoff unavailable (${pendingReloadHandoffItemCount(pending)} items): ${reason}`,
     )
+    let transferred = true
     try {
       await backgroundObligations.withTargetLane(pending.key, () =>
         transferLostCoverageInLane(
           pending.key,
-          [
-            ...pending.inbounds.flatMap((input) => (input.inputId ? [input.inputId] : [])),
-            ...pending.reminders.flatMap((r) => r.inboundRetry?.inputIds ?? []),
-          ],
-          pending.reminders.flatMap((r) => [
-            ...(r.backgroundObligationId ? [r.backgroundObligationId] : []),
-            ...(r.backgroundRetry?.obligationIds ?? []),
-          ]),
+          pendingReloadHandoffInputIds(pending),
+          pendingReloadHandoffBackgroundIds(pending),
         ),
       )
     } catch (error) {
       // The durable rows remain owed; failed transfer must never become an ad-hoc send.
+      transferred = false
       logger.error(`[channels] reload interruption transfer failed: ${describeError(error)}`)
     }
     void dropPendingReloadHandoffEngageReactions(pending)
+    return transferred
+  }
+
+  const discardExpiredReloadHandoff = async (
+    keyId: string,
+    pending: PendingReloadHandoff,
+    ageMs: number,
+  ): Promise<void> => {
+    if (pendingReloadHandoffs.get(keyId) === pending) pendingReloadHandoffs.delete(keyId)
+    const transferred = await reportDiscardedReloadHandoff(pending, `retention limit exceeded after ${ageMs}ms`)
+    if (!transferred && !pendingReloadHandoffs.has(keyId)) pendingReloadHandoffs.set(keyId, pending)
   }
 
   const expirePendingReloadHandoffs = async (): Promise<void> => {
-    const expired: Array<{ pending: PendingReloadHandoff; ageMs: number }> = []
+    const expired: Array<{ keyId: string; pending: PendingReloadHandoff; ageMs: number }> = []
     for (const [keyId, pending] of pendingReloadHandoffs) {
       const ageMs = now() - pending.retainedAt
       if (ageMs < handoffRetryRetentionMs) continue
-      pendingReloadHandoffs.delete(keyId)
-      expired.push({ pending, ageMs })
+      expired.push({ keyId, pending, ageMs })
     }
-    await Promise.all(
-      expired.map(({ pending, ageMs }) =>
-        reportDiscardedReloadHandoff(pending, `retention limit exceeded after ${ageMs}ms`),
-      ),
-    )
+    await Promise.all(expired.map(({ keyId, pending, ageMs }) => discardExpiredReloadHandoff(keyId, pending, ageMs)))
   }
 
-  const retainReloadHandoff = (
-    key: ChannelKey,
-    inbounds: QueuedInbound[],
-    observed: ObservedInbound[],
-    reminders: PendingSystemReminder[],
-  ): boolean => {
+  const retainReloadHandoff = (incoming: PendingReloadHandoff): boolean => {
     void expirePendingReloadHandoffs()
-    const keyId = channelKeyId(key)
+    const keyId = channelKeyId(incoming.key)
     const existing = pendingReloadHandoffs.get(keyId)
     if (existing !== undefined) {
-      const incoming: PendingReloadHandoff = {
-        key,
-        inbounds,
-        observed,
-        reminders,
-        retainedAt: now(),
-        estimatedBytes: estimateReloadHandoffBytes(inbounds, observed, reminders),
+      // A successor resumes exactly one turn lineage; a second coverage snapshot
+      // for the same conversation cannot share its cache.
+      if (existing.coverage !== null && incoming.coverage !== null) {
+        void reportDiscardedReloadHandoff(incoming, 'reload coverage already pending for this conversation')
+        return false
       }
       if (pendingReloadHandoffItemCount(existing) + pendingReloadHandoffItemCount(incoming) > handoffRetryItemLimit) {
         void reportDiscardedReloadHandoff(incoming, `per-key item limit ${handoffRetryItemLimit} would be exceeded`)
@@ -2567,37 +2676,33 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         )
         return false
       }
-      existing.inbounds.push(...inbounds)
-      existing.observed.push(...observed)
-      existing.reminders.push(...reminders)
+      existing.inbounds.push(...incoming.inbounds)
+      existing.observed.push(...incoming.observed)
+      existing.reminders.push(...incoming.reminders)
+      if (incoming.coverage !== null) existing.coverage = incoming.coverage
       existing.estimatedBytes += incoming.estimatedBytes
       return true
     }
-    const pending: PendingReloadHandoff = {
-      key,
-      inbounds,
-      observed,
-      reminders,
-      retainedAt: now(),
-      estimatedBytes: estimateReloadHandoffBytes(inbounds, observed, reminders),
-    }
-    if (pendingReloadHandoffItemCount(pending) > handoffRetryItemLimit) {
-      void reportDiscardedReloadHandoff(pending, `per-key item limit ${handoffRetryItemLimit} exceeded`)
+    if (pendingReloadHandoffItemCount(incoming) > handoffRetryItemLimit) {
+      void reportDiscardedReloadHandoff(incoming, `per-key item limit ${handoffRetryItemLimit} exceeded`)
       return false
     }
-    if (pending.estimatedBytes > handoffRetryByteLimit) {
-      void reportDiscardedReloadHandoff(pending, `per-key byte limit ${handoffRetryByteLimit} exceeded`)
+    if (incoming.estimatedBytes > handoffRetryByteLimit) {
+      void reportDiscardedReloadHandoff(incoming, `per-key byte limit ${handoffRetryByteLimit} exceeded`)
       return false
     }
-    if (pendingReloadHandoffTotalBytes() + pending.estimatedBytes > MAX_PENDING_RELOAD_HANDOFF_BYTES_TOTAL) {
-      void reportDiscardedReloadHandoff(pending, `global byte limit ${MAX_PENDING_RELOAD_HANDOFF_BYTES_TOTAL} exceeded`)
+    if (pendingReloadHandoffTotalBytes() + incoming.estimatedBytes > MAX_PENDING_RELOAD_HANDOFF_BYTES_TOTAL) {
+      void reportDiscardedReloadHandoff(
+        incoming,
+        `global byte limit ${MAX_PENDING_RELOAD_HANDOFF_BYTES_TOTAL} exceeded`,
+      )
       return false
     }
     if (pendingReloadHandoffs.size >= MAX_PENDING_RELOAD_HANDOFF_KEYS) {
-      void reportDiscardedReloadHandoff(pending, `key limit ${MAX_PENDING_RELOAD_HANDOFF_KEYS} reached`)
+      void reportDiscardedReloadHandoff(incoming, `key limit ${MAX_PENDING_RELOAD_HANDOFF_KEYS} reached`)
       return false
     }
-    pendingReloadHandoffs.set(keyId, pending)
+    pendingReloadHandoffs.set(keyId, incoming)
     return true
   }
 
@@ -2606,16 +2711,54 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     if (pending === undefined) return
     const ageMs = now() - pending.retainedAt
     if (ageMs >= handoffRetryRetentionMs) {
-      pendingReloadHandoffs.delete(live.keyId)
-      void reportDiscardedReloadHandoff(pending, `retention limit exceeded after ${ageMs}ms`)
+      void discardExpiredReloadHandoff(live.keyId, pending, ageMs)
       return
     }
+    // Coverage identities join only a session with no turn lineage of its own; a
+    // busy session leaves them pending (still bounded by expiry) rather than
+    // mixing two lineages in one cache.
+    const coverage = pending.coverage
+    const adoptCoverage =
+      coverage !== null &&
+      !live.draining &&
+      !live.pendingTeardown &&
+      live.inboundCoverage.length === 0 &&
+      live.backgroundCoverage.length === 0
     // Delete before enqueueing: once ownership moves to the live queues, a
     // second ensureLive must not replay the same batch and double-deliver it.
-    pendingReloadHandoffs.delete(live.keyId)
+    if (coverage !== null && !adoptCoverage) {
+      pendingReloadHandoffs.set(live.keyId, {
+        ...pending,
+        inbounds: [],
+        observed: [],
+        reminders: [],
+        estimatedBytes: estimateReloadHandoffBytes([], [], [], coverage),
+      })
+    } else {
+      pendingReloadHandoffs.delete(live.keyId)
+    }
     live.promptQueue.push(...pending.inbounds)
     live.contextBuffer.push(...pending.observed)
     live.pendingSystemReminders.push(...pending.reminders)
+    if (adoptCoverage) {
+      // Identity caches only. The journal claims stay with the source turn until
+      // this session's in-lane consume revalidates and moves them, which happens
+      // before any prompt; restoring the source turn and owner keeps that move and
+      // any retry lineage valid. A coverage-only handoff never prompts by itself: the
+      // child's completion (or the next real input) is what wakes this session.
+      live.inboundCoverage = [...coverage.inboundIds]
+      live.backgroundCoverage = [...coverage.backgroundIds]
+      live.backgroundTurnId = coverage.turnId
+      live.backgroundTurnOwnerSessionId = coverage.ownerSessionId
+      live.logicalTurnStartedAt = coverage.logicalTurnStartedAt
+      live.coverageDeferredSince = coverage.coverageDeferredSince
+      live.coverageDeferredParentSessionId = coverage.coverageDeferredParentSessionId
+      if (coverage.turnAccountIdentity !== undefined) live.turnAccountIdentity = coverage.turnAccountIdentity
+      if (live.lastTurnAuthorId === null && coverage.lastTurnAuthorId !== null) {
+        live.lastTurnAuthorId = coverage.lastTurnAuthorId
+        live.lastTurnAuthorIds = new Set(coverage.lastTurnAuthorIds)
+      }
+    }
     if ((pending.inbounds.length > 0 || pending.reminders.length > 0) && !live.draining) void drain(live)
   }
 
@@ -2921,6 +3064,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         inboundCoverage: [],
         backgroundStopVersion: 0,
         backgroundTurnId: randomUUID(),
+        backgroundTurnOwnerSessionId: created.sessionId,
         willingnessReminderIteration: false,
         contextBuffer: [],
         currentTurnAttachments: [],
@@ -2969,6 +3113,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         turnSeq: 0,
         logicalTurnStartedAt: now(),
         coverageDeferredSince: null,
+        coverageDeferredParentSessionId: null,
         successfulSendsAtTurnStart: 0,
         inFlightToolSends: new Map(),
         policyDeniedToolSendsThisTurn: new Map(),
@@ -3559,6 +3704,23 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           live.continueReplyTurn = { turnSeq: live.turnSeq, sendCount: live.successfulChannelSends }
         }
       }
+      // A landed channel_send settles only the debt its tool captured from this
+      // session before the send, and the tool returns a capture only for an exact
+      // origin destination. A send elsewhere, a no-op success, or a progress/status
+      // message never borrows the origin's debt. Unlike channel_reply this stays
+      // non-terminal: the follow-up provider call still runs, so the model can keep
+      // working after delivering its answer.
+      if (context.toolCall.name === 'channel_send' && !context.isError && details?.ok === true) {
+        const backgroundCoverage = Array.isArray(details.backgroundCoverage) ? details.backgroundCoverage : []
+        const inboundCoverage = Array.isArray(details.inboundCoverage) ? details.inboundCoverage : []
+        const text = (context.toolCall.arguments as { text?: unknown } | undefined)?.text
+        if (
+          (backgroundCoverage.length > 0 || inboundCoverage.length > 0) &&
+          !(typeof text === 'string' && detectContinuationWillingness(text))
+        ) {
+          await recordLandedBackgroundResponse(live, 'origin-channel-send', backgroundCoverage, inboundCoverage)
+        }
+      }
       if (succeeded && !keepTurnAlive && live.userStoppedTurnSeq !== live.turnSeq) {
         logger.info(
           `[channels] ${live.keyId} terminal_after_channel_reply site=terminal_after_channel_reply session=${live.sessionId} reason=terminal_after_channel_reply`,
@@ -4093,16 +4255,91 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     }
   }
 
+  // User-stop withdrawal for one conversation, independent of any live session:
+  // its open, untransferred inbound rows and result-ready/turn-owned background
+  // rows settle as intentionally suppressed. Rotation can leave the old actor's
+  // active turn beside a new actor's queued input, and a journal decision must
+  // keep one account scope, so each account settles separately. `withdrawn`
+  // records every group as its decision commits, so a caller can retire exactly
+  // those cache entries even when a later group fails. Call only in the lane.
+  const withdrawStoppedWorkInLane = async (
+    target: ChannelKey,
+    inputIds: readonly string[],
+    backgroundIds: readonly string[],
+    withdrawn: { inbound: Set<string>; background: Set<string> } = { inbound: new Set(), background: new Set() },
+  ): Promise<void> => {
+    const partitions = new Map<string, { inbound: InboundRef[]; background: BackgroundObligationRef[] }>()
+    const partition = (accountIdentity: string) => {
+      let group = partitions.get(accountIdentity)
+      if (!group) {
+        group = { inbound: [], background: [] }
+        partitions.set(accountIdentity, group)
+      }
+      return group
+    }
+    for (const ref of inboundJournal.resolve([...new Set(inputIds)])) {
+      const row = inboundJournal.get(ref.inputId)!
+      if (row.phase !== 'closed' && !row.transfer) partition(row.accountIdentity).inbound.push(ref)
+    }
+    for (const id of new Set(backgroundIds)) {
+      const row = await backgroundObligations.get(id)
+      if (
+        !row ||
+        row.transfer ||
+        channelKeyId(row.target) !== channelKeyId(target) ||
+        (row.phase !== 'result-ready' && row.phase !== 'turn-owned')
+      )
+        continue
+      backgroundObligations.assertAvailable()
+      partition(row.accountIdentity).background.push({ obligationId: id, generation: row.generation })
+    }
+    for (const group of partitions.values()) {
+      const outcome = { kind: 'intentionally-suppressed' as const, decisionId: randomUUID(), reason: 'user-stop' }
+      if (group.inbound.length > 0) {
+        await inboundJournal.settle(group.inbound, outcome, group.background, target)
+      } else {
+        inboundJournal.assertAvailable()
+        await backgroundObligations.settle(group.background, outcome)
+      }
+      for (const ref of group.inbound) withdrawn.inbound.add(ref.inputId)
+      for (const ref of group.background) withdrawn.background.add(ref.obligationId)
+    }
+  }
+
+  // A reload handoff holds stoppable work only when it carries owed or queued
+  // work: queued inputs, reminders or deferred coverage. Observed context alone
+  // is the idle bystander hasStoppableWork excludes, so /stop never answers for
+  // it, never withdraws it and never posts "stopped" on its behalf.
+  const isStoppableReloadHandoff = (pending: PendingReloadHandoff | undefined): pending is PendingReloadHandoff =>
+    pending !== undefined && (pending.inbounds.length > 0 || pending.reminders.length > 0 || pending.coverage !== null)
+
+  // After a committed stop withdrawal the handoff keeps only its observed
+  // context, which a live stop also leaves in place for the next turn.
+  const retireStoppedReloadHandoff = (keyId: string, pending: PendingReloadHandoff): void => {
+    if (pendingReloadHandoffs.get(keyId) !== pending) return
+    void dropPendingReloadHandoffEngageReactions(pending)
+    if (pending.observed.length === 0) {
+      pendingReloadHandoffs.delete(keyId)
+      return
+    }
+    pendingReloadHandoffs.set(keyId, {
+      ...pending,
+      inbounds: [],
+      reminders: [],
+      coverage: null,
+      estimatedBytes: estimateReloadHandoffBytes([], pending.observed, [], null),
+    })
+  }
+
   const stopCurrentChannelTurn = async (live: LiveSession, reason: string): Promise<boolean> => {
     await backgroundObligations.withTargetLane(live.key, async () => {
       try {
         if (reason === 'user_stop') {
+          // A reload handoff not yet adopted by this session is the same
+          // conversation's owed work; the stop withdraws it too.
+          const handoff = pendingReloadHandoffs.get(live.keyId)
+          const pending = isStoppableReloadHandoff(handoff) ? handoff : undefined
           // Select after predecessors commit; queued entries contain IDs only.
-          const ids = [
-            ...live.backgroundCoverage,
-            ...live.pendingSystemReminders.flatMap((r) => (r.backgroundObligationId ? [r.backgroundObligationId] : [])),
-            ...live.pendingSystemReminders.flatMap((r) => r.backgroundRetry?.obligationIds ?? []),
-          ]
           live.inboundCoverage = [
             ...new Set([
               ...live.inboundCoverage,
@@ -4110,35 +4347,27 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
               ...live.pendingSystemReminders.flatMap((r) => r.inboundRetry?.inputIds ?? []),
             ]),
           ]
-          // Rotation can leave the old actor's active turn beside a new actor's
-          // queued input. Journal decisions must retain one account scope.
-          const partitions = new Map<string, { inbound: InboundRef[]; background: BackgroundObligationRef[] }>()
-          const partition = (accountIdentity: string) => {
-            let group = partitions.get(accountIdentity)
-            if (!group) {
-              group = { inbound: [], background: [] }
-              partitions.set(accountIdentity, group)
-            }
-            return group
-          }
-          for (const ref of inboundJournal.resolve(live.inboundCoverage)) {
-            const row = inboundJournal.get(ref.inputId)!
-            if (row.phase !== 'closed' && !row.transfer) partition(row.accountIdentity).inbound.push(ref)
-          }
-          for (const ref of await resolveBackgroundCoverage(live, ids)) {
-            const row = (await backgroundObligations.get(ref.obligationId))!
-            partition(row.accountIdentity).background.push(ref)
-          }
-          for (const group of partitions.values()) {
-            await settleBackgroundCoverageInLane(
-              live,
-              'intentionally-suppressed',
-              'user-stop',
-              group.background.map((ref) => ref.obligationId),
-              group.inbound,
-              group.background,
+          const withdrawn = { inbound: new Set<string>(), background: new Set<string>() }
+          try {
+            await withdrawStoppedWorkInLane(
+              live.key,
+              [...live.inboundCoverage, ...(pending ? pendingReloadHandoffInputIds(pending) : [])],
+              [
+                ...live.backgroundCoverage,
+                ...live.pendingSystemReminders.flatMap((r) =>
+                  r.backgroundObligationId ? [r.backgroundObligationId] : [],
+                ),
+                ...live.pendingSystemReminders.flatMap((r) => r.backgroundRetry?.obligationIds ?? []),
+                ...(pending ? pendingReloadHandoffBackgroundIds(pending) : []),
+              ],
+              withdrawn,
             )
+          } finally {
+            live.inboundCoverage = live.inboundCoverage.filter((id) => !withdrawn.inbound.has(id))
+            retireBackgroundCache(live, withdrawn.background)
           }
+          // Retired only once withdrawn: a failed withdrawal keeps it owed.
+          if (pending) retireStoppedReloadHandoff(live.keyId, pending)
         }
       } catch (error) {
         // A failed withdrawal remains owed for conservative boot recovery.
@@ -4199,6 +4428,69 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     }
     await awaitLatestTodoOutcomeWrite(live)
     return aborted
+  }
+
+  // /stop for a conversation with no live session whose owed work is still a
+  // reload handoff (its successor recreate failed or has not installed yet).
+  // Withdraws that work by key without recreating a session, so a later
+  // successor cannot adopt and answer a stopped request. The handoff is retired
+  // only once the withdrawal commits; a failed withdrawal is logged and leaves
+  // it owed, the live stop's bookkeeping contract. A successor that installs
+  // meanwhile has adopted the handoff's queues, so it is stopped in turn.
+  // Resolves false when there was nothing to stop, including a handoff that
+  // holds only observed context.
+  const stopPendingReloadHandoff = async (keyId: string): Promise<boolean> => {
+    const pending = pendingReloadHandoffs.get(keyId)
+    if (!isStoppableReloadHandoff(pending)) return false
+    const sourceSessionId = await backgroundObligations.withTargetLane(pending.key, async () => {
+      const current = pendingReloadHandoffs.get(keyId)
+      if (!isStoppableReloadHandoff(current)) return undefined
+      try {
+        await ready
+        inboundJournal.assertAvailable()
+        await withdrawStoppedWorkInLane(
+          current.key,
+          pendingReloadHandoffInputIds(current),
+          pendingReloadHandoffBackgroundIds(current),
+        )
+        retireStoppedReloadHandoff(keyId, current)
+      } catch (error) {
+        logger.error(`[channels] ${keyId}: reload handoff stop withdrawal failed: ${describeError(error)}`)
+      }
+      return current.sessionId
+    })
+    const successor = liveSessions.get(keyId)
+    if (successor !== undefined && !successor.destroyed) {
+      await stopCurrentChannelTurn(successor, 'user_stop')
+      return true
+    }
+    if (sourceSessionId === undefined) return false
+    try {
+      await recoveryStopHandler?.(pending.key, sourceSessionId)
+    } catch (error) {
+      logger.error(`[channels] recovery stop withdrawal failed: ${describeError(error)}`)
+    }
+    logger.info(`[channels] ${keyId}: command /stop withdrew a pending reload handoff site=user_stop reason=user_stop`)
+    return true
+  }
+
+  // The exact-key / thread-null-fallback policy of resolveLiveSessionForCommand,
+  // applied to reload handoffs no live session has adopted.
+  const resolvePendingReloadHandoffForCommand = (
+    key: ChannelKey,
+  ): { kind: 'found'; keyId: string } | { kind: 'ambiguous'; count: number } | { kind: 'none' } => {
+    const exact = channelKeyId(key)
+    if (isStoppableReloadHandoff(pendingReloadHandoffs.get(exact))) return { kind: 'found', keyId: exact }
+    if (key.thread !== null) return { kind: 'none' }
+    const matches = Array.from(pendingReloadHandoffs).filter(
+      ([, pending]) =>
+        isStoppableReloadHandoff(pending) &&
+        pending.key.adapter === key.adapter &&
+        pending.key.workspace === key.workspace &&
+        pending.key.chat === key.chat,
+    )
+    if (matches.length > 1) return { kind: 'ambiguous', count: matches.length }
+    return matches[0] !== undefined ? { kind: 'found', keyId: matches[0][0] } : { kind: 'none' }
   }
 
   // ensureLive() installs a session BEFORE the engage/observe decision, so a
@@ -4426,6 +4718,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           const queued = live.pendingSystemReminders.slice(0, reminderCount)
           const eligible = new Set<PendingSystemReminder>()
           const refs: BackgroundObligationRef[] = []
+          const readyRows: BackgroundObligation[] = []
           for (const reminder of queued) {
             if (!reminder.backgroundObligationId) {
               eligible.add(reminder)
@@ -4444,6 +4737,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
               continue
             eligible.add(reminder)
             refs.push({ obligationId: row.obligationId, generation: row.generation })
+            readyRows.push(row)
           }
           const fresh = batchCount > 0 || queued.some((r) => eligible.has(r) && r.kind === 'wakeup')
           const carried = fresh ? undefined : queued.find((r) => r.backgroundRetry)?.backgroundRetry
@@ -4455,25 +4749,86 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
             .slice(0, batchCount)
             .flatMap((input) => (input.inputId ? [input.inputId] : []))
           const inboundRefs = await inboundJournal.resolve(inputIds)
-          if (live.inboundCoverage.length === 0) live.coverageDeferredSince = null
-          if (fresh && live.inboundCoverage.length > 0) {
-            // Coverage left open by a turn deferred to a still-running background child
-            // is owed, not lost: carry it forward like a wakeup instead of posting a
-            // restart notice.
+          let carriedBackground: BackgroundObligationRef[] = []
+          if (live.inboundCoverage.length === 0 && live.backgroundCoverage.length === 0) {
+            live.coverageDeferredSince = null
+            live.coverageDeferredParentSessionId = null
+          }
+          if (fresh && (live.inboundCoverage.length > 0 || live.backgroundCoverage.length > 0)) {
+            // Coverage left open by a turn deferred to background work is owed, not
+            // lost: carry it forward like a wakeup instead of posting a restart
+            // notice. That covers deferred inputs and child results the deferring
+            // turn already consumed, together or alone. Cached IDs are hints (a reload
+            // successor adopts them), so only rows the recorded source turn and owner
+            // still hold at their current generation, target and account are carried.
+            const sourceOwner = live.backgroundTurnOwnerSessionId
+            const sourceAccount = live.turnAccountIdentity ?? currentAccountIdentityFor(live.key)
+            const cached: Array<InboundRecord | BackgroundObligation | undefined> = live.inboundCoverage.map((id) =>
+              inboundJournal.get(id),
+            )
+            for (const id of new Set(live.backgroundCoverage)) cached.push(await backgroundObligations.get(id))
+            const held = cached.filter(
+              (row): row is InboundRecord | BackgroundObligation =>
+                row?.phase === 'turn-owned' &&
+                !row.transfer &&
+                row.claim?.turnId === live.backgroundTurnId &&
+                row.claim.ownerSessionId === sourceOwner &&
+                row.claim.epoch === inboundJournal.epoch &&
+                row.claim.generation === row.generation &&
+                channelKeyId(row.target) === live.keyId &&
+                row.accountIdentity === sourceAccount,
+            )
+            const deferred = held.flatMap((row) => ('inputId' in row ? [row] : []))
+            const deferredBackground = held.flatMap((row) => ('obligationId' in row ? [row] : []))
+            live.inboundCoverage = deferred.map((row) => row.inputId)
+            live.backgroundCoverage = deferredBackground.map((row) => row.obligationId)
             const deferredSince = live.coverageDeferredSince ?? live.logicalTurnStartedAt
-            if (batchCount > 0 && !isAwaitingBackgroundChild(live, 'fresh-inbound-coverage', deferredSince)) {
-              await transferLostCoverageInLane(live.key, live.inboundCoverage, live.backgroundCoverage, live.sessionId)
+            // The deferred work is a child of the session the coverage was deferred from
+            // or of the session now holding its claims; the two differ once a successor
+            // under another session ID has carried it.
+            const deferredParent = live.coverageDeferredParentSessionId ?? sourceOwner
+            const parents = [...new Set([deferredParent, sourceOwner])]
+            // A child of the deferring turn that already finished no longer shows as
+            // running, yet its durable result-ready wake in this same batch still
+            // carries the debt into the coalesced turn. Only an exact match counts:
+            // spawned by one of those sessions, during the deferred interval, under the
+            // source account. Generic wake text or an unrelated child never does.
+            const awaitingDeferredWork =
+              readyRows.some(
+                (row) =>
+                  parents.includes(row.parentSessionId) &&
+                  row.accountIdentity === sourceAccount &&
+                  row.acceptedAt >= deferredSince,
+              ) ||
+              parents.some((parent) =>
+                isAwaitingBackgroundChild(live, 'fresh-deferred-coverage', deferredSince, parent),
+              )
+            if (held.length === 0) {
               live.coverageDeferredSince = null
+              live.coverageDeferredParentSessionId = null
+            } else if (batchCount > 0 && !awaitingDeferredWork) {
+              await transferLostCoverageInLane(live.key, live.inboundCoverage, live.backgroundCoverage, sourceOwner)
+              live.coverageDeferredSince = null
+              live.coverageDeferredParentSessionId = null
             } else {
+              // A wake-only batch still carries deferred inputs, but a consumed child
+              // result moves only on evidence that its deferred work is pending; an
+              // abandoned one stays with its source turn for durable recovery.
+              const background = awaitingDeferredWork
+                ? deferredBackground.map((row) => ({ obligationId: row.obligationId, generation: row.generation }))
+                : []
               if (batchCount > 0) live.coverageDeferredSince = deferredSince
-              const previous = await inboundJournal.resolve(live.inboundCoverage)
-              const movedInputs = await inboundJournal.move(previous, {
-                fromTurnId: live.backgroundTurnId,
-                turnId,
-                ownerSessionId: live.sessionId,
-                target: live.key,
-              })
-              inboundRefs.push(...movedInputs.inboundRefs)
+              live.coverageDeferredParentSessionId = deferredParent
+              if (deferred.length > 0 || background.length > 0) {
+                // One journal decision moves both kinds out of the source turn.
+                const moved = await inboundJournal.move(
+                  inboundJournal.resolve(live.inboundCoverage),
+                  { fromTurnId: live.backgroundTurnId, turnId, ownerSessionId: live.sessionId, target: live.key },
+                  background,
+                )
+                inboundRefs.push(...moved.inboundRefs)
+                carriedBackground = moved.backgroundRefs
+              }
             }
           }
           const owner = { turnId, ownerSessionId: live.sessionId, target: live.key }
@@ -4516,7 +4871,10 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           }
           live.inboundCoverage = [...carriedInboundIds, ...claimedCoverage.inboundRefs.map((ref) => ref.inputId)]
           live.backgroundTurnId = turnId
-          if (fresh) live.backgroundCoverage = []
+          if (fresh || carried) live.backgroundTurnOwnerSessionId = live.sessionId
+          // Moved results and newly claimed completions are disjoint: one was
+          // turn-owned, the other unclaimed and result-ready when the lane read it.
+          if (fresh) live.backgroundCoverage = carriedBackground.map((ref) => ref.obligationId)
           else
             live.backgroundCoverage = (await resolveBackgroundCoverage(live, live.backgroundCoverage, true)).map(
               (ref) => ref.obligationId,
@@ -4957,28 +5315,32 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       const retained = await backgroundObligations.withTargetLane(live.key, async () => {
         const retry =
           live.promptQueue.length === 0 ? live.pendingSystemReminders.find((r) => r.kind === 'retry') : undefined
-        const refs = retry ? await resolveBackgroundCoverage(live, live.backgroundCoverage, true) : []
-        if (retry && (refs.length > 0 || live.inboundCoverage.length > 0)) {
-          retry.backgroundRetry = {
-            turnId: live.backgroundTurnId,
-            obligationIds: refs.map((ref) => ref.obligationId),
-            emptyTurnRetries: live.emptyTurnRetries,
-            toolLeakRetries: live.toolLeakRetries,
-            willingnessNudges: live.willingnessNudges,
-            nextPromptMaxTokens: live.nextPromptMaxTokens,
+        if (retry) {
+          // A queued retry already carries this turn's lineage and retry budgets
+          // forward; the coverage rides on it rather than as a separate snapshot.
+          const refs = await resolveBackgroundCoverage(live, live.backgroundCoverage, true)
+          if (refs.length > 0 || live.inboundCoverage.length > 0) {
+            retry.backgroundRetry = {
+              turnId: live.backgroundTurnId,
+              obligationIds: refs.map((ref) => ref.obligationId),
+              emptyTurnRetries: live.emptyTurnRetries,
+              toolLeakRetries: live.toolLeakRetries,
+              willingnessNudges: live.willingnessNudges,
+              nextPromptMaxTokens: live.nextPromptMaxTokens,
+            }
           }
-        }
-        if (retry && live.inboundCoverage.length > 0) {
-          retry.inboundRetry = { inputIds: [...live.inboundCoverage], turnId: live.backgroundTurnId }
-        }
-        if (!retry) {
-          await transferLostCoverageInLane(live.key, live.inboundCoverage, live.backgroundCoverage, live.sessionId)
+          if (live.inboundCoverage.length > 0) {
+            retry.inboundRetry = { inputIds: [...live.inboundCoverage], turnId: live.backgroundTurnId }
+          }
           live.inboundCoverage = []
           live.backgroundCoverage = []
         }
-        return retainLiveQueuesInLane(live)
+        const kept = await retainLiveWorkInLane(live)
+        // Unpublish inside the lane: an admission queued behind this lane must
+        // reach the successor (which adopts the handoff), not the dying session.
+        if (liveSessions.get(live.keyId) === live) liveSessions.delete(live.keyId)
+        return kept
       })
-      liveSessions.delete(live.keyId)
       await tearDownLive(live)
       if (retained) await handOffToSuccessor(live.key)
     }
@@ -5029,11 +5391,21 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   // recreate attempt so a timeout leaves it available to the next successful
   // ensureLive rather than dropping the user's messages at the handoff seam.
   const handOffToSuccessor = async (key: ChannelKey): Promise<void> => {
+    const keyId = channelKeyId(key)
     try {
+      // A creation begun before this reload cannot install anymore, but ensureLive
+      // would hand back its pending rejection. Let it settle first (bounded) so
+      // the recreate runs under the current generation and adopts the handoff.
+      const inFlight = creating.get(keyId)
+      if (inFlight !== undefined) {
+        await raceWithTimeout(inFlight, ensureLiveTimeoutMs, `[channels] ${keyId} superseded creation`).catch(
+          () => undefined,
+        )
+      }
       await ensureLive(key)
     } catch (err) {
       logger.warn(
-        `[channels] ${channelKeyId(key)}: successor recreate after reload failed; queued work retained for the next successful session: ${describeError(err)}`,
+        `[channels] ${keyId}: successor recreate after reload failed; queued work retained for the next successful session: ${describeError(err)}`,
       )
     }
   }
@@ -5109,23 +5481,25 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   // at the call sites — this helper only runs the handler and delivers the reply.
   const runChannelCommand = async (event: InboundMessage, live: LiveSession | null): Promise<CommandResult> => {
     const result = await commands.execute(event.text, { live, event, invokerId: event.authorId })
-    if (result.kind === 'handled' && result.reply !== undefined) {
-      await send(
-        {
-          adapter: event.adapter,
-          workspace: event.workspace,
-          chat: event.chat,
-          thread: event.thread,
-          text: result.reply,
-        },
-        {
-          source: 'system',
-          outputKind: 'meta',
-          expectedAccountIdentity: event.accountIdentity ?? currentAccountIdentityFor(event),
-        },
-      )
-    }
+    if (result.kind === 'handled' && result.reply !== undefined) await postCommandReply(event, result.reply)
     return result
+  }
+
+  const postCommandReply = async (event: InboundMessage, reply: string): Promise<void> => {
+    await send(
+      {
+        adapter: event.adapter,
+        workspace: event.workspace,
+        chat: event.chat,
+        thread: event.thread,
+        text: reply,
+      },
+      {
+        source: 'system',
+        outputKind: 'meta',
+        expectedAccountIdentity: event.accountIdentity ?? currentAccountIdentityFor(event),
+      },
+    )
   }
 
   const route = async (event: InboundMessage): Promise<RouteReceipt> => {
@@ -5229,6 +5603,12 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       if (commandInfo.requiresLiveSession) {
         existingLive = liveSessions.get(keyId) ?? null
         if (existingLive === null || existingLive.destroyed) {
+          // Work a reload retained for a successor that never installed still
+          // belongs to this conversation; /stop withdraws it by key.
+          if (commandInfo.name === 'stop' && (await stopPendingReloadHandoff(keyId))) {
+            await postCommandReply(event, STOP_COMMAND_REPLY)
+            return { kind: 'control' }
+          }
           logger.info(`[channels] ${keyId}: ignoring command /${parsedCommand.name} with no live session`)
           return { kind: 'control' }
         }
@@ -5242,9 +5622,21 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     const generation = liveGeneration
     await ready.catch(() => undefined)
     const accountIdentity = event.accountIdentity ?? (await getRecoveryAccountIdentity(event.adapter, event.workspace))
+    // The early duplicate lookup and the in-lane admit share this identity and
+    // its principal, so a duplicate is checked against the same author
+    // provenance admission would record: a different author is a conflict,
+    // never a fresh slot or a silent duplicate.
     const identity = {
       accountIdentity: accountIdentity ?? '',
       target: key,
+      principal: {
+        kind: 'channel' as const,
+        adapter: event.adapter,
+        workspace: event.workspace,
+        chat: event.chat,
+        ...(event.room?.parentChat !== undefined ? { parentChat: event.room.parentChat } : {}),
+        lastInboundAuthorId: event.authorId,
+      },
       messageId: event.externalMessageId || undefined,
       eventKind: event.eventKind ?? 'message',
       revision: event.revision ?? '',
@@ -5334,19 +5726,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         live.room = event.room
       }
       if (isChannelRespondDenied(event)) return { kind: 'denied' }
-      const principal = {
-        kind: 'channel' as const,
-        adapter: event.adapter,
-        workspace: event.workspace,
-        chat: event.chat,
-        ...(event.room?.parentChat !== undefined ? { parentChat: event.room.parentChat } : {}),
-        lastInboundAuthorId: event.authorId,
-      }
-      const admission = await inboundJournal.admit({
-        ...identity,
-        principal,
-        ownerSessionId: live.sessionId,
-      })
+      const admission = await inboundJournal.admit({ ...identity, ownerSessionId: live.sessionId })
       if (admission.kind === 'duplicate')
         return { kind: 'duplicate', inputId: admission.inputId, outcome: admission.outcome?.kind }
       publishInbound(event, 'engage', live.sessionId)
@@ -7445,20 +7825,20 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     // Seal only around the flush — unlike stop() the router keeps serving after a
     // roles reload, so re-enable persist() once pending writes have drained.
     closing = true
-    const successors: ChannelKey[] = []
+    const successors = new Map<string, ChannelKey>()
     for (const live of immediate) {
-      const retained = await backgroundObligations.withTargetLane(live.key, async () => {
-        await transferLostCoverageInLane(live.key, live.inboundCoverage, live.backgroundCoverage, live.sessionId)
-        live.inboundCoverage = []
-        live.backgroundCoverage = []
-        return retainLiveQueuesInLane(live)
-      })
-      if (retained) successors.push(live.key)
+      const retained = await backgroundObligations.withTargetLane(live.key, () => retainLiveWorkInLane(live))
+      if (retained) successors.set(live.keyId, live.key)
       await tearDownLive(live)
+    }
+    // A handoff from an earlier reload whose successor never installed (this
+    // reload superseded its creation, or it failed) is recreated now as well.
+    for (const [keyId, pending] of pendingReloadHandoffs) {
+      if (!liveSessions.has(keyId)) successors.set(keyId, pending.key)
     }
     await persistChain
     closing = false
-    await Promise.all(successors.map(handOffToSuccessor))
+    await Promise.all(Array.from(successors.values(), handOffToSuccessor))
   }
 
   // Graceful-restart shutdown: mark every live channel session's todo scope so
@@ -7659,6 +8039,14 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     if (commandInfo.requiresLiveSession) {
       const resolved = resolveLiveSessionForCommand(liveSessions, key)
       if (resolved.kind === 'none') {
+        if (lowered !== 'stop') return { kind: 'no-live-session' }
+        // A reload handoff whose successor never installed is this
+        // conversation's owed work; /stop withdraws it without a session.
+        const pending = resolvePendingReloadHandoffForCommand(key)
+        if (pending.kind === 'ambiguous') return { kind: 'ambiguous', matchCount: pending.count }
+        if (pending.kind === 'found' && (await stopPendingReloadHandoff(pending.keyId))) {
+          return { kind: 'handled', name: commandInfo.name, reply: STOP_COMMAND_REPLY }
+        }
         return { kind: 'no-live-session' }
       }
       if (resolved.kind === 'ambiguous') {
@@ -7674,7 +8062,12 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       // empty and incorrectly reported no-live-session. Always pass that exact
       // session to stopCurrentChannelTurn so the user's escape hatch remains.
       const exactDiscordSession = key.adapter === 'discord-bot' && resolved.session.keyId === channelKeyId(key)
-      if (lowered === 'stop' && !exactDiscordSession && !hasStoppableWork(resolved.session)) {
+      if (
+        lowered === 'stop' &&
+        !exactDiscordSession &&
+        !hasStoppableWork(resolved.session) &&
+        !isStoppableReloadHandoff(pendingReloadHandoffs.get(resolved.session.keyId))
+      ) {
         return { kind: 'no-live-session' }
       }
       live = resolved.session
@@ -7927,6 +8320,79 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         if (row && channelKeyId(row.target) !== successor.keyId) return { kind: 'no-live-session' }
         return queueCompletion(successor)
       }
+    }
+    // A reload retained this parent's deferred coverage and its successor has not
+    // installed yet (or failed to). Queue the wake on that explicit handoff so the
+    // successor adopts both together; no session is created here, and a result
+    // without such a handoff stays owed for durable recovery as before.
+    if (row) {
+      const keyId = channelKeyId(row.target)
+      const queued = await backgroundObligations.withTargetLane(row.target, async () => {
+        await ready
+        inboundJournal.assertAvailable()
+        const current = await backgroundObligations.get(row.obligationId)
+        const pending = pendingReloadHandoffs.get(keyId)
+        if (
+          !current ||
+          current.phase === 'closed' ||
+          current.transfer ||
+          liveSessions.has(keyId) ||
+          !pending?.coverage ||
+          ![pending.coverage.coverageDeferredParentSessionId, pending.coverage.ownerSessionId].includes(
+            args.parentSessionId,
+          )
+        )
+          return false
+        if (pending.reminders.some((reminder) => reminder.backgroundObligationId === current.obligationId)) return true
+        const reminders: PendingSystemReminder[] = [
+          ...pending.reminders,
+          {
+            ...wakeupReminder(
+              renderSubagentCompletionReminder({
+                subagent: args.subagent,
+                taskId: args.taskId,
+                ok: args.ok,
+                durationMs: args.durationMs,
+                ...(args.error !== undefined ? { error: args.error } : {}),
+                ...(args.hasRecoverableOutput === true ? { hasRecoverableOutput: true } : {}),
+                channel: true,
+                adapter: row.target.adapter,
+              }),
+            ),
+            backgroundObligationId: current.obligationId,
+          },
+        ]
+        // The same bounds as retention, checked on the candidate before anything
+        // changes: a refused wake leaves the handoff exactly as it was and the
+        // result owed for durable recovery.
+        const estimatedBytes = estimateReloadHandoffBytes(
+          pending.inbounds,
+          pending.observed,
+          reminders,
+          pending.coverage,
+        )
+        const exceeded =
+          pendingReloadHandoffItemCount({ ...pending, reminders }) > handoffRetryItemLimit
+            ? `per-key item limit ${handoffRetryItemLimit}`
+            : estimatedBytes > handoffRetryByteLimit
+              ? `per-key byte limit ${handoffRetryByteLimit}`
+              : pendingReloadHandoffTotalBytes() - pending.estimatedBytes + estimatedBytes >
+                  MAX_PENDING_RELOAD_HANDOFF_BYTES_TOTAL
+                ? `global byte limit ${MAX_PENDING_RELOAD_HANDOFF_BYTES_TOTAL}`
+                : undefined
+        if (exceeded !== undefined) {
+          logger.error(
+            `[channels] ${keyId}: subagent-completion reminder not held for reload successor (${exceeded} would be exceeded); result stays owed task=${args.taskId}`,
+          )
+          return false
+        }
+        pending.reminders = reminders
+        pending.estimatedBytes = estimatedBytes
+        forgetSharedLoopGuardTool(args.parentSessionId, SUBAGENT_OUTPUT_TOOL_NAME)
+        logger.info(`[channels] ${keyId}: subagent-completion reminder held for reload successor task=${args.taskId}`)
+        return true
+      })
+      if (queued) return { kind: 'delivered', keyId }
     }
     return { kind: 'no-live-session' }
   }

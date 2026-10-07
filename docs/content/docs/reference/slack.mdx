@@ -23,6 +23,10 @@ This is the **user-account** Slack adapter (`slack`). It signs in as your own Sl
 
 Durable waiting cleanup uses `reactions.remove` for the original channel/message timestamp and normalized emoji, removing only this authenticated user account's reaction. Already absent succeeds; a changed account blocks the old cleanup. Replies do not await cleanup transport. Protected acknowledgments survive temporary cleanup and reboot; see [waiting reaction ownership](/docs/internals/engagement#waiting-reaction-ownership).
 
+## Edited messages
+
+The adapter responds to a Slack message at most once. If it engaged the original, later edits never trigger it again, including after a restart. If it only observed the original, an edit that adds a mention of this account (`<@you>` or `<!here>` / `<!channel>` / `<!everyone>`) can engage it once. Slack's raw `message_changed` event must show previous text without that mention, new text with it, and an `edited.ts` revision. Typo and other content edits, unchanged or removed mentions, unfurl or metadata-only updates and edits without previous text are dropped. An edit containing a slash command or claim code is dropped before any handler runs.
+
 ## Crash recovery notices
 
 Background admission snapshots the authenticated team/user from the running

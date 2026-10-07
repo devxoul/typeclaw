@@ -1,12 +1,15 @@
 import { afterEach, expect, test } from 'bun:test'
-import { mkdtemp, readFile, writeFile, appendFile, rm, stat } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
+import { mkdir, mkdtemp, readFile, writeFile, appendFile, rm, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 
 import type { MatchableOrigin } from '../permissions/resolve'
 import { BackgroundObligationStore } from './background-obligations'
 import { InboundJournal } from './inbound-journal'
+import type { InboundAdmission } from './inbound-journal'
 import { RecoveryOutbox } from './recovery-outbox'
+import { channelKeyId } from './types'
 import type { ChannelKey } from './types'
 const directories: string[] = []
 afterEach(async () => {
@@ -344,7 +347,7 @@ test('independent process death at compaction boundaries retains admissions and 
   }
 }, 20000)
 
-test('duplicate decision identity remains strict after compaction, while generations and event revisions reject stale ownership', async () => {
+test('duplicate decision identity remains strict after compaction, generations reject stale ownership and a closed Slack message stays answered', async () => {
   const dir = await directory()
   const journal = new InboundJournal(dir, { epoch: 'one' })
   const a = await journal.admit(input)
@@ -372,8 +375,9 @@ test('duplicate decision identity remains strict after compaction, while generat
   await expect(boot.settle(moved.inboundRefs, { ...outcome, kind: 'intentionally-suppressed' })).rejects.toThrow(
     'Conflicting duplicate',
   )
-  expect((await boot.admit({ ...input, eventKind: 'edit', revision: '1' })).kind).toBe('accepted')
-  expect((await boot.admit({ ...input, eventKind: 'edit', revision: '2' })).kind).toBe('accepted')
+  // Later Slack revisions of the answered message neither reopen nor re-admit it.
+  expect(await boot.admit({ ...input, revision: '1' })).toEqual({ kind: 'duplicate', inputId: a.inputId, outcome })
+  expect(boot.list()).toHaveLength(1)
   await boot.close()
 })
 
@@ -498,7 +502,7 @@ test('independent mixed claim move and notice crashes repair exact JSON receipts
       const source = `import {InboundJournal} from ${JSON.stringify(import.meta.resolve('./inbound-journal.ts'))}; import {BackgroundObligationStore} from ${JSON.stringify(import.meta.resolve('./background-obligations.ts'))};
         let armed=false; const target=${JSON.stringify(target)}; const bg=new BackgroundObligationStore(${JSON.stringify(dir)},{epoch:'old'});
         const j=new InboundJournal(${JSON.stringify(dir)},{backgroundObligations:bg,onDurability:async (phase,record)=>{if(armed && phase===${JSON.stringify(phase)} && record.type===${JSON.stringify(type)}){console.log(${JSON.stringify(JSON.stringify(token))});await Bun.stdin.text();throw new Error('Crash boundary resumed')}}});
-        const accepted=await j.admit(${JSON.stringify(input)}); let refs=[{inputId:accepted.inputId,generation:accepted.generation}];
+        const accepted=await j.admit(${JSON.stringify({ ...input, ownerSessionId: 'p' })}); let refs=[{inputId:accepted.inputId,generation:accepted.generation}];
         const child=await bg.accept({taskId:'child',parentSessionId:'p',accountIdentity:'bot',target,principal:${JSON.stringify(principal)}}); const ready=await bg.resultReady(child.obligationId); let backgroundRefs=[{obligationId:ready.obligationId,generation:ready.generation}];
         if(${JSON.stringify(operation)}==='move'){const claimed=await bg.withTargetLane(target,()=>j.claim(refs,{turnId:'first',target},backgroundRefs,'first-claim'));refs=claimed.inboundRefs;backgroundRefs=claimed.backgroundRefs;}
         armed=true; await bg.withTargetLane(target,async ()=>{if(${JSON.stringify(operation)}==='claim')await j.claim(refs,{turnId:'op',target},backgroundRefs,'op');else if(${JSON.stringify(operation)}==='move')await j.move(refs,{fromTurnId:'first',turnId:'op',target},backgroundRefs,'op');else await j.prepareNotice(refs,target,backgroundRefs)});`
@@ -650,6 +654,80 @@ test('queued and moved notice coverage freezes parent coordinates for exact pare
   await boot.close()
 })
 
+test('a covered child must share the notice effective parent; a claimed owner supersedes its launch parent', async () => {
+  const dir = await directory()
+  const bg = new BackgroundObligationStore(dir, { epoch: 'one' })
+  const journal = new InboundJournal(dir, { backgroundObligations: bg })
+  const owned = await journal.admit({ ...input, ownerSessionId: 'parent' })
+  const launched = await bg.accept({
+    taskId: 'foreign',
+    parentSessionId: 'other',
+    accountIdentity: 'bot',
+    target,
+    principal,
+  })
+  const foreign = (await bg.resultReady(launched.obligationId))!
+  const refs = [{ inputId: owned.inputId, generation: 1 }]
+  const before = await readFile(journal.path)
+  await expect(
+    bg.withTargetLane(target, () =>
+      journal.prepareNotice(refs, target, [{ obligationId: foreign.obligationId, generation: foreign.generation }]),
+    ),
+  ).rejects.toThrow('partitioned by owner')
+  expect(await readFile(journal.path)).toEqual(before)
+  expect(await bg.get(foreign.obligationId)).toEqual(foreign)
+  const adopted = await bg.withTargetLane(target, () =>
+    bg.claim([{ obligationId: foreign.obligationId, generation: foreign.generation }], {
+      turnId: 'turn',
+      ownerSessionId: 'parent',
+      target,
+    }),
+  )
+  const transfer = await bg.withTargetLane(target, () => journal.prepareNotice(refs, target, adopted))
+  expect(transfer.sourceParentSessionId).toBe('parent')
+  expect(transfer.covers.map((c) => [c.store, c.id, c.generation]).sort()).toEqual(
+    [
+      ['background', foreign.obligationId, foreign.generation + 2],
+      ['inbound', owned.inputId, 2],
+    ].sort(),
+  )
+  await journal.close()
+})
+
+test('a known background freeze rejects a mixed decision before it is durable and leaves admission open', async () => {
+  const dir = await directory()
+  const bg = new BackgroundObligationStore(dir, { epoch: 'one' })
+  const journal = new InboundJournal(dir, { backgroundObligations: bg })
+  const owned = await journal.admit({ ...input, ownerSessionId: 'parent' })
+  const launched = await bg.accept({
+    taskId: 'child',
+    parentSessionId: 'parent',
+    accountIdentity: 'bot',
+    target,
+    principal,
+  })
+  const ready = (await bg.resultReady(launched.obligationId))!
+  const refs = [{ inputId: owned.inputId, generation: 1 }]
+  const brefs = [{ obligationId: ready.obligationId, generation: ready.generation }]
+  const owner = { turnId: 'turn', ownerSessionId: 'parent', target }
+  bg.setFrozen(new Error('legacy migration failed'))
+  const before = await readFile(journal.path)
+  await expect(bg.withTargetLane(target, () => journal.claim(refs, owner, brefs, 'mixed-claim'))).rejects.toThrow(
+    'frozen',
+  )
+  expect(await readFile(journal.path)).toEqual(before)
+  expect(journal.health().available).toBe(true)
+  expect(journal.get(owned.inputId)).toMatchObject({ phase: 'admitted', generation: 1 })
+  expect((await journal.admit({ ...input, messageId: 'unrelated' })).kind).toBe('accepted')
+  bg.setFrozen(undefined)
+  const claimed = await bg.withTargetLane(target, () => journal.claim(refs, owner, brefs, 'mixed-claim'))
+  expect(claimed.backgroundRefs).toEqual([{ obligationId: ready.obligationId, generation: ready.generation + 1 }])
+  expect((await bg.get(ready.obligationId))?.applications.filter((r) => r.transitionId === 'mixed-claim')).toHaveLength(
+    1,
+  )
+  await journal.close()
+})
+
 test('partial two-child JSON claim repairs chronologically with background frozen through all-applied', async () => {
   const dir = await directory()
   const token = { boundary: 'first-child-json-applied' }
@@ -717,4 +795,246 @@ test('actual journal handle is closed before replace and subsequent append uses 
   expect(await child.exited).toBe(0)
   expect(stderr).toBe('')
   expect(JSON.parse(stdout)).toEqual({ closedBeforeReplace: true, distinctHandles: true, messages: ['after', 'm'] })
+})
+
+const slackMessage = (adapter: 'slack' | 'slack-bot' = 'slack-bot'): InboundAdmission => ({
+  accountIdentity: `${adapter}:T1:UBOT`,
+  target: { adapter, workspace: 'T1', chat: 'C1', thread: null },
+  principal: { kind: 'channel', adapter, workspace: 'T1', chat: 'C1', lastInboundAuthorId: 'U1' },
+  messageId: '1700000000.000100',
+  eventKind: 'message',
+  revision: 'original',
+  ownerSessionId: 'parent',
+})
+
+for (const adapter of ['slack', 'slack-bot'] as const) {
+  for (const phase of ['admitted', 'closed', 'notice-owned'] as const) {
+    for (const compacted of [false, true]) {
+      test(`${adapter} legacy edited-only ${phase} row${compacted ? ' (compacted)' : ''} answers a later original delivery unchanged`, async () => {
+        const dir = await directory()
+        const message = slackMessage(adapter)
+        const legacy = new InboundJournal(dir, { epoch: 'legacy' })
+        // Schema-1 rows admitted under the per-edit policy carry the edit ts as their revision.
+        const edited = await legacy.admit({ ...message, revision: '1700000001.000200' })
+        if (phase === 'closed')
+          await legacy.settle(legacy.resolve([edited.inputId]), { kind: 'delivered', decisionId: 'answer' })
+        if (phase === 'notice-owned')
+          await legacy.importPrepared(
+            new RecoveryOutbox(dir, { epoch: 'legacy' }),
+            await legacy.prepareNotice(legacy.resolve([edited.inputId]), message.target),
+          )
+        if (compacted) await legacy.compact()
+        await legacy.close()
+        const bytes = await readFile(legacy.path)
+        const journal = new InboundJournal(dir, { epoch: 'new' })
+        await journal.initialize()
+        const row = journal.get(edited.inputId)!
+        expect(row.phase).toBe(phase)
+        expect(journal.lookupAdmission(message)).toEqual(row)
+        expect(await journal.admit(message)).toEqual({
+          kind: 'duplicate',
+          inputId: edited.inputId,
+          outcome: row.outcome,
+        })
+        expect(journal.list()).toEqual([row])
+        expect(await readFile(journal.path)).toEqual(bytes)
+        await journal.close()
+      })
+    }
+  }
+}
+
+test('a Slack message is one admission across routing-thread shapes; its debt never follows the new thread', async () => {
+  const dir = await directory()
+  const message = slackMessage()
+  const journal = new InboundJournal(dir)
+  const root = await journal.admit(message)
+  const before = journal.get(root.inputId)
+  for (const thread of [message.messageId!, 'other-thread'])
+    expect(await journal.admit({ ...message, target: { ...message.target, thread } })).toMatchObject({
+      kind: 'duplicate',
+      inputId: root.inputId,
+    })
+  expect(journal.get(root.inputId)).toEqual(before)
+  const threadedDir = await directory()
+  const threaded = new InboundJournal(threadedDir)
+  const reply = await threaded.admit({ ...message, target: { ...message.target, thread: message.messageId! } })
+  expect(await threaded.admit(message)).toMatchObject({ kind: 'duplicate', inputId: reply.inputId })
+  expect(
+    (
+      await threaded.admit({
+        ...message,
+        messageId: '1700000002.000300',
+        target: { ...message.target, thread: message.messageId! },
+      })
+    ).kind,
+  ).toBe('accepted')
+  // Racing deliveries of one message in different thread shapes serialize to one admission.
+  const racingDir = await directory()
+  const racing = new InboundJournal(racingDir)
+  const results = await Promise.all([
+    racing.admit(message),
+    racing.admit({ ...message, target: { ...message.target, thread: message.messageId! } }),
+  ])
+  expect(results.map((r) => r.kind).sort()).toEqual(['accepted', 'duplicate'])
+  expect(new Set(results.map((r) => r.inputId)).size).toBe(1)
+  expect(racing.list()).toHaveLength(1)
+  await Promise.all([journal.close(), threaded.close(), racing.close()])
+})
+
+test('a different author on the same Slack message is a conflict in lookup and admission, never a fresh slot', async () => {
+  const dir = await directory()
+  const message = slackMessage()
+  const journal = new InboundJournal(dir)
+  await journal.admit(message)
+  const bytes = await readFile(journal.path)
+  const impostor: InboundAdmission = {
+    ...message,
+    target: { ...message.target, thread: 'elsewhere' },
+    revision: '1700000001.000200',
+    principal: { kind: 'channel', adapter: 'slack-bot', workspace: 'T1', chat: 'C1', lastInboundAuthorId: 'U2' },
+  }
+  expect(() => journal.lookupAdmission(impostor)).toThrow('Conflicting duplicate admission principal')
+  await expect(journal.admit(impostor)).rejects.toThrow('Conflicting duplicate admission principal')
+  expect(await readFile(journal.path)).toEqual(bytes)
+  expect(journal.health().available).toBe(true)
+  expect((await journal.admit({ ...message, messageId: '1700000002.000300' })).kind).toBe('accepted')
+  await journal.close()
+})
+
+test('Slack message namespaces stay independent; revision and thread do not; other identities keep exact dedupe', async () => {
+  const dir = await directory()
+  const message = slackMessage('slack')
+  const journal = new InboundJournal(dir)
+  const base = await journal.admit(message)
+  const otherWorkspace = { ...message.target, workspace: 'T2' }
+  const otherChat = { ...message.target, chat: 'C2' }
+  const independent: InboundAdmission[] = [
+    { ...message, accountIdentity: 'slack:T1:UOTHER' },
+    { ...slackMessage('slack-bot'), accountIdentity: message.accountIdentity },
+    { ...message, target: otherWorkspace, principal: { ...message.principal, workspace: 'T2' } as MatchableOrigin },
+    { ...message, target: otherChat, principal: { ...message.principal, chat: 'C2' } as MatchableOrigin },
+    { ...message, messageId: '1700000002.000300' },
+    { ...message, eventKind: 'app_mention' },
+  ]
+  for (const admission of independent) expect((await journal.admit(admission)).kind).toBe('accepted')
+  for (const admission of [
+    { ...message, revision: '1700000001.000200' },
+    { ...message, target: { ...message.target, thread: message.messageId! } },
+  ])
+    expect(await journal.admit(admission)).toMatchObject({ kind: 'duplicate', inputId: base.inputId })
+  // Non-Slack revisions and Slack receipt-only identities keep exact-identity semantics.
+  const discord: InboundAdmission = {
+    ...message,
+    accountIdentity: 'discord-bot:B',
+    target: { adapter: 'discord-bot', workspace: 'G', chat: 'R', thread: null },
+    principal: { kind: 'channel', adapter: 'discord-bot', workspace: 'G', chat: 'R', lastInboundAuthorId: 'U1' },
+    messageId: 'M1',
+  }
+  const receiptOnly: InboundAdmission = { ...message, messageId: undefined, receiptId: 'R1' }
+  for (const exact of [discord, receiptOnly]) {
+    const first = await journal.admit(exact)
+    expect(await journal.admit(exact)).toMatchObject({ kind: 'duplicate', inputId: first.inputId })
+    expect((await journal.admit({ ...exact, revision: 'second' })).kind).toBe('accepted')
+    expect((await journal.admit({ ...exact, target: { ...exact.target, thread: 'other' } })).kind).toBe('accepted')
+  }
+  expect(journal.list()).toHaveLength(1 + independent.length + 2 * 3)
+  await journal.close()
+})
+
+test('multiple legacy revisions keep every row and receipt; a new delivery resolves deterministically and stale claims still fail', async () => {
+  const dir = await directory()
+  const message = slackMessage()
+  const path = join(dir, 'channels', 'inbound-continuity.jsonl')
+  // Two revisions admitted under the previous per-edit policy, with identical acceptance times.
+  const rows = ['1700000001.000200', '1700000003.000400'].map((revision) => {
+    const identity = JSON.stringify([
+      dirname(dirname(path)),
+      message.accountIdentity,
+      channelKeyId(message.target),
+      message.messageId,
+      message.eventKind,
+      revision,
+    ])
+    const inputId = createHash('sha256')
+      .update(JSON.stringify(['inbound', identity]))
+      .digest('hex')
+    return {
+      schemaVersion: 1,
+      inputId,
+      identity,
+      generation: 1,
+      accountIdentity: message.accountIdentity,
+      target: message.target,
+      principal: message.principal,
+      epoch: 'legacy',
+      acceptedAt: 1_000,
+      phase: 'admitted',
+      reference: { messageId: message.messageId },
+      sourceParentSessionId: 'parent',
+    }
+  })
+  await mkdir(dirname(path), { recursive: true })
+  await writeFile(
+    path,
+    rows
+      .map((row, index) =>
+        JSON.stringify({
+          schemaVersion: 1,
+          seq: index + 1,
+          transitionId: `admit:${row.inputId}`,
+          epoch: 'legacy',
+          type: 'admitted',
+          changes: [{ expected: { inputId: row.inputId, generation: 0 }, row }],
+          backgroundChanges: [],
+        }),
+      )
+      .map((line) => `${line}\n`)
+      .join(''),
+  )
+  const [representative, other] = rows.map((row) => row.inputId).sort()
+  if (!representative || !other) throw new Error('Expected two seeded legacy rows')
+  const journal = new InboundJournal(dir, { epoch: 'one' })
+  await journal.initialize()
+  expect(
+    journal
+      .list()
+      .map((row) => row.inputId)
+      .sort(),
+  ).toEqual([representative, other])
+  const owner = { turnId: 'turn', ownerSessionId: 'parent', target: message.target }
+  await journal.claim([{ inputId: representative, generation: 1 }], owner, [], 'claim-representative')
+  const outbox = new RecoveryOutbox(dir, { epoch: 'one' })
+  const transfer = await journal.prepareNotice([{ inputId: other, generation: 1 }], message.target)
+  await journal.importPrepared(outbox, transfer)
+  await journal.compact()
+  await journal.close()
+
+  const boot = new InboundJournal(dir, { epoch: 'two' })
+  await boot.initialize()
+  const retained = boot.list()
+  expect(retained).toHaveLength(2)
+  // The representative is chosen per message: a new original, an exact redelivery of either legacy
+  // revision, and any thread shape all resolve to the same row and outcome.
+  const representativeRow = boot.get(representative)!
+  const revisions = rows.map((row) => JSON.parse(row.identity)[5] as string)
+  for (const revision of ['original', ...revisions])
+    for (const thread of [null, message.messageId!]) {
+      const delivery = { ...message, revision, target: { ...message.target, thread } }
+      expect(await boot.admit(delivery)).toEqual({ kind: 'duplicate', inputId: representative, outcome: undefined })
+      expect(boot.lookupAdmission(delivery)).toEqual(representativeRow)
+    }
+  expect(representativeRow.phase).toBe('turn-owned')
+  expect(boot.get(other)?.phase).toBe('notice-owned')
+  expect(boot.list()).toEqual(retained)
+  expect(await boot.prepareNotice([{ inputId: other, generation: 1 }], message.target)).toEqual(transfer)
+  // The retained claim receipt still binds its identity; the old epoch's ownership is superseded.
+  await expect(
+    boot.claim([{ inputId: representative, generation: 1 }], owner, [], 'claim-representative'),
+  ).rejects.toThrow('superseded')
+  expect(boot.get(representative)).toMatchObject({ phase: 'turn-owned', generation: 2, target: message.target })
+  await expect(boot.claim([{ inputId: representative, generation: 1 }], { ...owner, turnId: 'late' })).rejects.toThrow(
+    'coverage',
+  )
+  await boot.close()
 })

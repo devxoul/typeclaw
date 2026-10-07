@@ -12,11 +12,23 @@ export type SlackInboundMessageEvent = SlackRTMMessageEvent & {
   // Modern RTM file messages are subtype-less but retain the `files` array.
   files?: SlackFile[]
   is_mpim?: boolean
+  // `message_changed` envelopes carry the edited message and its previous body;
+  // admitSlackInbound validates both before anything reads them.
+  message?: unknown
+  previous_message?: unknown
 }
 
 export type SlackConversationType = 'im' | 'mpim' | 'channel'
 
-export type InboundDropReason = 'self_author' | 'no_user' | 'slack_system_message' | 'empty_text' | 'pre_connect'
+export type InboundDropReason =
+  | 'self_author'
+  | 'no_user'
+  | 'slack_system_message'
+  | 'empty_text'
+  | 'pre_connect'
+  | 'unverified_edit'
+  | 'edit_without_new_mention'
+  | 'edited_control'
 
 export type InboundClassification =
   | { kind: 'drop'; reason: InboundDropReason }
@@ -29,14 +41,18 @@ export type SlackInboundContext = {
   conversationType?: SlackConversationType
 }
 
-import { normalizeSlackInbound, slackInboundRevision } from './slack-inbound-revision'
+import { addressesSlackSelf, admitSlackInbound } from './slack-inbound-revision'
 
 export function classifyInbound(
   event: SlackInboundMessageEvent,
   _config: ChannelAdapterConfig,
   context: SlackInboundContext,
 ): InboundClassification {
-  event = normalizeSlackInbound(event)
+  // Edits are gated on the raw envelope before normalization drops its subtype.
+  // RTM has no app_mention stream, so every user-session delivery is a 'message'.
+  const admission = admitSlackInbound(event, context.selfUserId)
+  if (admission.kind === 'drop') return { kind: 'drop', reason: admission.reason }
+  event = admission.event
   if (context.selfUserId !== null && event.user === context.selfUserId) return { kind: 'drop', reason: 'self_author' }
   if (event.user === undefined || event.user === '') return { kind: 'drop', reason: 'no_user' }
   if (!isRouteableSlackMessageSubtype(event.subtype)) return { kind: 'drop', reason: 'slack_system_message' }
@@ -48,8 +64,7 @@ export function classifyInbound(
   const conversationType = classifyConversation(event, context.conversationType)
   const isDm = conversationType === 'im'
   const workspace = isDm ? '@dm' : context.teamId
-  const hasGroupMention = GROUP_MENTION_PATTERN.test(rawText)
-  const isBotMention = hasGroupMention || rawText.includes(`<@${context.selfUserId}>`)
+  const isBotMention = addressesSlackSelf(rawText, context.selfUserId)
   const aliasMatched = !isBotMention && matchesAnyAlias(rawText, context.selfAliases ?? [])
   const thread = event.thread_ts ?? (!isDm && (isBotMention || aliasMatched) ? event.ts : null)
   const mentionedUserIds = extractMentionedUserIds(rawText)
@@ -68,7 +83,8 @@ export function classifyInbound(
       externalMessageId: event.ts,
       accountIdentity: `slack:${context.teamId}:${context.selfUserId}`,
       eventKind: 'message',
-      revision: slackInboundRevision(event),
+      // One engagement per Slack message: edits never mint a new revision.
+      revision: 'original',
       reactionRef: encodeSlackReactionRef({ channel: event.channel, ts: event.ts }),
       authorId: event.user,
       authorName: event.user,
@@ -133,7 +149,6 @@ function renderPlaceholder(attachment: InboundAttachment): string {
 }
 
 const MENTION_PATTERN = /<@([UW][A-Z0-9]+)(?:\|[^>]*)?>/g
-const GROUP_MENTION_PATTERN = /<!(?:here|channel|everyone)(?:\|[^>]*)?>/
 
 function extractMentionedUserIds(text: string): string[] {
   const seen = new Set<string>()

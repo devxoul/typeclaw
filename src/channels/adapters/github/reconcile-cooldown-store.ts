@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto'
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 
@@ -26,6 +27,11 @@ import { canonicalGithubRepo } from '../../github-repo'
 // was LAUNCHED (not when a review completed): posted-review suppression stays
 // the authoritative "done" signal in reconcile-open-prs.ts; this store only
 // bounds retry frequency.
+//
+// A launch marker is a reservation owned by one replay attempt (`replayId`).
+// The attempt keeps it once the router durably admits the replay, and rolls
+// back only its own reservation when the replay was never admitted, so a later
+// pass retries the PR instead of losing it for a whole cooldown window.
 
 const FILE_VERSION = 1
 
@@ -43,6 +49,22 @@ export type ReconcileMarker = {
   repo: string
   prId: number
   lastReplayAt: number
+  // The attempt that owns this launch reservation. Markers written before
+  // reservations had owners omit it: they keep their cooldown meaning, and no
+  // attempt's rollback can remove them.
+  replayId?: string
+}
+
+export type ReconcileReplayReservation = {
+  readonly replayId: string
+}
+
+export type ReconcileReplayOptions = {
+  now: number
+  cooldownMs: number
+  // The reconcile pass runs detached from its adapter lifecycle. Once this
+  // flips, the replay this reservation would guard is never dispatched.
+  isCancelled?: () => boolean
 }
 
 type FileV1 = {
@@ -71,39 +93,53 @@ function markerKey(repo: string, prId: number): string {
 }
 
 export type ReconcileCooldownStore = {
+  // Snapshot as of this instance's most recent read or write of the file. It
+  // can be stale across store instances, so it must not decide a launch; only
+  // markReplayed's serialized check against the latest file does.
   isCoolingDown: (repo: string, prId: number, now: number, cooldownMs: number) => boolean
-  // Flush BEFORE routing the synthetic inbound: a crash between marking and
-  // session creation must not re-trigger a replay on the next restart.
-  // Resolves false when `isCancelled` flipped during the write; the marker is
-  // then rolled back within the same tracked write, because the replay it
-  // guarded will never be dispatched.
-  markReplayed: (repo: string, prId: number, now: number, isCancelled?: () => boolean) => Promise<boolean>
+  // Persists a launch reservation BEFORE the synthetic inbound is routed: a
+  // crash between reserving and session creation must not re-trigger a replay
+  // on the next restart. Resolves null without launching when the latest
+  // persisted marker is still cooling down (another attempt holds it), or when
+  // `isCancelled` flipped — a reservation written before the cancellation was
+  // observed is rolled back inside the same serialized write. Rejects when the
+  // reservation could not be persisted; the caller must not route then.
+  markReplayed: (
+    repo: string,
+    prId: number,
+    options: ReconcileReplayOptions,
+  ) => Promise<ReconcileReplayReservation | null>
+  // Releases a reservation whose replay was not durably admitted. Removes the
+  // marker only while it is still owned by `replayId`, so an older attempt
+  // settling late never erases a newer attempt's reservation. Rejects when the
+  // release could not be persisted: the cooldown then still stands.
+  rollbackReplay: (repo: string, prId: number, replayId: string) => Promise<void>
+  // Unconditionally forgets the PR's marker, whichever attempt owns it.
   clear: (repo: string, prId: number) => Promise<void>
   prune: (repo: string, openPrIds: ReadonlySet<number>, now: number) => Promise<void>
 }
 
-// Writes in flight per cooldown file, shared across store instances. A stopped
-// adapter's detached reconcile pass may still be persisting or rolling back a
-// marker when a replacement adapter loads the file; loading waits for those
-// writes (never for router receipts) so it can't read a marker about to vanish.
-const pendingWrites = new Map<string, Set<Promise<unknown>>>()
+// One mutation lane per cooldown file, shared by every store instance in this
+// process. A stopped adapter's detached pass and its replacement hold separate
+// instances of the same file; each mutation re-reads the file inside the lane
+// and applies only its own change, so no instance rewrites the file from a
+// stale snapshot, erases another attempt's reservation, or races another write
+// on the shared tmp path. Lane tasks do file I/O only — never await a router
+// receipt — so a replacement store load queued behind them waits for writes,
+// not for pending routing.
+const fileLanes = new Map<string, Promise<void>>()
 
-function trackWrite<T>(path: string, write: Promise<T>): Promise<T> {
-  let pending = pendingWrites.get(path)
-  if (pending === undefined) {
-    pending = new Set()
-    pendingWrites.set(path, pending)
-  }
-  const settled = write.then(
+function onFileLane<T>(path: string, task: () => Promise<T>): Promise<T> {
+  const result = (fileLanes.get(path) ?? Promise.resolve()).then(task)
+  const tail = result.then(
     () => undefined,
     () => undefined,
   )
-  pending.add(settled)
-  void settled.then(() => {
-    pending.delete(settled)
-    if (pending.size === 0 && pendingWrites.get(path) === pending) pendingWrites.delete(path)
+  fileLanes.set(path, tail)
+  void tail.then(() => {
+    if (fileLanes.get(path) === tail) fileLanes.delete(path)
   })
-  return write
+  return result
 }
 
 export async function loadReconcileCooldownStore(
@@ -111,18 +147,25 @@ export async function loadReconcileCooldownStore(
   logger: ReconcileCooldownLogger = consoleLogger,
 ): Promise<ReconcileCooldownStore> {
   const path = reconcileCooldownPath(agentDir)
-  await Promise.all(pendingWrites.get(path) ?? [])
-  const markers = new Map<string, ReconcileMarker>()
-  for (const marker of await readMarkers(path, logger)) {
-    markers.set(markerKey(marker.repo, marker.prId), marker)
-  }
+  let markers = await onFileLane(path, async () => {
+    try {
+      return await readMarkers(path, logger)
+    } catch (err) {
+      logger.error(`[github] ${path} unreadable: ${describeError(err)}; starting fresh`)
+      return new Map<string, ReconcileMarker>()
+    }
+  })
 
-  const flush = async (): Promise<void> => {
-    const payload: FileV1 = { version: FILE_VERSION, markers: Array.from(markers.values()) }
-    await mkdir(dirname(path), { recursive: true })
-    const tmp = `${path}.tmp`
-    await writeFile(tmp, `${JSON.stringify(payload, null, 2)}\n`, 'utf8')
-    await rename(tmp, path)
+  // Lane-only helpers. `latest` refreshes this instance's view from disk and
+  // hands back a working copy; `persist` publishes the copy once it is on disk.
+  // A mutation that fails before the rename leaves the file and view unchanged.
+  const latest = async (): Promise<Map<string, ReconcileMarker>> => {
+    markers = await readMarkers(path, logger)
+    return new Map(markers)
+  }
+  const persist = async (next: Map<string, ReconcileMarker>): Promise<void> => {
+    await writeMarkers(path, next)
+    markers = next
   }
 
   return {
@@ -131,105 +174,117 @@ export async function loadReconcileCooldownStore(
       if (marker === undefined) return false
       return now - marker.lastReplayAt < cooldownMs
     },
-    // Roll the in-memory marker back and rethrow if the disk write fails, so the
-    // caller skips routing rather than replaying a PR with no durable record —
-    // otherwise a restart would replay it immediately, defeating the cooldown.
-    markReplayed(repo, prId, now, isCancelled): Promise<boolean> {
-      const key = markerKey(repo, prId)
-      const previous = markers.get(key)
-      const restore = () => {
-        if (previous === undefined) markers.delete(key)
-        else markers.set(key, previous)
-      }
-      return trackWrite(
-        path,
-        (async () => {
-          markers.set(key, { repo, prId, lastReplayAt: now })
-          try {
-            await flush()
-          } catch (err) {
-            restore()
-            throw err
-          }
-          if (isCancelled?.() !== true) return true
-          restore()
-          await flush()
-          return false
-        })(),
-      )
+    markReplayed(repo, prId, { now, cooldownMs, isCancelled }): Promise<ReconcileReplayReservation | null> {
+      return onFileLane(path, async () => {
+        const next = await latest()
+        if (isCancelled?.() === true) return null
+        const key = markerKey(repo, prId)
+        const previous = next.get(key)
+        if (previous !== undefined && now - previous.lastReplayAt < cooldownMs) return null
+        const replayId = randomUUID()
+        next.set(key, { repo, prId, lastReplayAt: now, replayId })
+        await persist(next)
+        if (isCancelled?.() !== true) return { replayId }
+        const restored = new Map(next)
+        if (previous === undefined) restored.delete(key)
+        else restored.set(key, previous)
+        try {
+          await persist(restored)
+        } catch (err) {
+          throw new Error(`cancelled replay reservation was not rolled back: ${describeError(err)}`, { cause: err })
+        }
+        return null
+      })
+    },
+    rollbackReplay(repo, prId, replayId): Promise<void> {
+      return onFileLane(path, async () => {
+        const next = await latest()
+        const key = markerKey(repo, prId)
+        if (next.get(key)?.replayId !== replayId) return
+        next.delete(key)
+        await persist(next)
+      })
     },
     clear(repo, prId): Promise<void> {
-      const key = markerKey(repo, prId)
-      const previous = markers.get(key)
-      if (previous === undefined) return Promise.resolve()
-      return trackWrite(
-        path,
-        (async () => {
-          markers.delete(key)
-          try {
-            await flush()
-          } catch (err) {
-            markers.set(key, previous)
-            throw err
-          }
-        })(),
-      )
+      return onFileLane(path, async () => {
+        const next = await latest()
+        if (!next.delete(markerKey(repo, prId))) return
+        await persist(next)
+      })
     },
     async prune(repo, openPrIds, now): Promise<void> {
-      let changed = false
-      for (const [key, marker] of markers) {
-        const stale = now - marker.lastReplayAt >= MARKER_RETENTION_MS
-        const closed = marker.repo === repo && !openPrIds.has(marker.prId)
-        if (stale || closed) {
-          markers.delete(key)
-          changed = true
-        }
-      }
-      if (changed) {
-        try {
-          await trackWrite(path, flush())
-        } catch (err) {
-          logger.error(`[github] failed to persist reconcile cooldown: ${describeError(err)}`)
-        }
+      try {
+        await onFileLane(path, async () => {
+          const next = await latest()
+          let changed = false
+          for (const [key, marker] of next) {
+            const stale = now - marker.lastReplayAt >= MARKER_RETENTION_MS
+            const closed = marker.repo === repo && !openPrIds.has(marker.prId)
+            if (stale || closed) {
+              next.delete(key)
+              changed = true
+            }
+          }
+          if (changed) await persist(next)
+        })
+      } catch (err) {
+        logger.error(`[github] failed to persist reconcile cooldown: ${describeError(err)}`)
       }
     },
   }
 }
 
-async function readMarkers(path: string, logger: ReconcileCooldownLogger): Promise<ReconcileMarker[]> {
+async function writeMarkers(path: string, markers: ReadonlyMap<string, ReconcileMarker>): Promise<void> {
+  const payload: FileV1 = { version: FILE_VERSION, markers: Array.from(markers.values()) }
+  await mkdir(dirname(path), { recursive: true })
+  const tmp = `${path}.tmp`
+  await writeFile(tmp, `${JSON.stringify(payload, null, 2)}\n`, 'utf8')
+  await rename(tmp, path)
+}
+
+// A missing file is an empty store and unparseable content is replaced on the
+// next write, but any other read failure throws: a mutation that treated an
+// unreadable file as empty would overwrite every other PR's marker.
+async function readMarkers(path: string, logger: ReconcileCooldownLogger): Promise<Map<string, ReconcileMarker>> {
+  const markers = new Map<string, ReconcileMarker>()
   let raw: string
   try {
     raw = await readFile(path, 'utf8')
-  } catch {
-    return []
+  } catch (err) {
+    if (err instanceof Error && 'code' in err && err.code === 'ENOENT') return markers
+    throw err
   }
   let parsed: unknown
   try {
     parsed = JSON.parse(raw)
   } catch (err) {
     logger.error(`[github] ${path} corrupted: ${describeError(err)}; starting fresh`)
-    return []
+    return markers
   }
   if (!isObject(parsed)) {
     logger.warn(`[github] ${path} not an object; ignored`)
-    return []
+    return markers
   }
-  const version = (parsed as { version?: unknown }).version
-  if (version !== FILE_VERSION) {
-    logger.warn(`[github] ${path} version ${String(version)} not supported (expected ${FILE_VERSION}); ignored`)
-    return []
+  if (parsed.version !== FILE_VERSION) {
+    logger.warn(`[github] ${path} version ${String(parsed.version)} not supported (expected ${FILE_VERSION}); ignored`)
+    return markers
   }
-  const file = parsed as FileV1
-  if (!Array.isArray(file.markers)) return []
-  return file.markers.filter(isValidMarker)
+  if (!Array.isArray(parsed.markers)) return markers
+  for (const entry of parsed.markers) {
+    const marker = parseMarker(entry)
+    if (marker !== null) markers.set(markerKey(marker.repo, marker.prId), marker)
+  }
+  return markers
 }
 
 function isObject(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null && !Array.isArray(v)
 }
 
-function isValidMarker(v: unknown): v is ReconcileMarker {
-  if (!isObject(v)) return false
-  const r = v as Record<string, unknown>
-  return typeof r.repo === 'string' && typeof r.prId === 'number' && typeof r.lastReplayAt === 'number'
+function parseMarker(v: unknown): ReconcileMarker | null {
+  if (!isObject(v)) return null
+  const { repo, prId, lastReplayAt, replayId } = v
+  if (typeof repo !== 'string' || typeof prId !== 'number' || typeof lastReplayAt !== 'number') return null
+  if (replayId === undefined) return { repo, prId, lastReplayAt }
+  return typeof replayId === 'string' ? { repo, prId, lastReplayAt, replayId } : null
 }

@@ -5,8 +5,6 @@ import { defaultHistoryConfig, type ChannelAdapterConfig } from '@/channels/sche
 import { isDmChannelOrigin } from '@/permissions'
 
 import { classifyInbound, type SlackInboundMessageEvent } from './slack-bot-classify'
-import { createSlackDedupe } from './slack-bot-dedupe'
-import { normalizeSlackInbound } from './slack-inbound-revision'
 
 const TEAM_ID = 'T0ACME'
 const BOT_USER_ID = 'UBOT'
@@ -32,31 +30,188 @@ function buildEvent(overrides: Partial<SlackInboundMessageEvent> = {}): SlackInb
   }
 }
 
-test('a mention added by editing an observed message remains a distinct engageable revision', () => {
-  const original = buildEvent({ text: '안녕하세요', client_msg_id: 'gesture-1' })
-  const context = { teamId: TEAM_ID, botUserId: BOT_USER_ID }
-  const before = classifyInbound(original, baseConfig, context)
-  expect(before.kind).toBe('route')
-  if (before.kind !== 'route') throw new Error('Expected original message')
-  expect(before.payload.isBotMention).toBe(false)
-  const dedupe = createSlackDedupe()
-  dedupe.mark(original, before.payload.isBotMention)
-  const edited = normalizeSlackInbound({
-    ...original,
-    user: undefined,
+const EDIT_TS = '1700000060.000200'
+
+type EditOverrides = {
+  message?: Record<string, unknown>
+  previous?: Record<string, unknown>
+  envelope?: Record<string, unknown>
+}
+
+// Socket Mode `message_changed` envelope as Slack delivers it: the nested
+// message keeps its original ts and gains `edited`, the previous body sits in
+// `previous_message`, and the envelope has its own ts.
+function editEnvelope(previousText: string, text: string, over: EditOverrides = {}): SlackInboundMessageEvent {
+  const original = buildEvent({ client_msg_id: 'gesture-1' })
+  return {
+    type: 'message',
     subtype: 'message_changed',
-    ts: '1700000001.000100',
-    message: { ...original, text: '<@UBOT> 확인해줘', edited: { ts: '1700000001.000099' } },
+    channel: original.channel,
+    channel_type: original.channel_type,
+    hidden: true,
+    ts: '1700000060.000300',
+    event_ts: '1700000060.000300',
+    message: { ...original, text, edited: { user: 'UALICE', ts: EDIT_TS }, ...over.message },
+    previous_message: { ...original, text: previousText, ...over.previous },
+    ...over.envelope,
+  }
+}
+
+// Shape of a captured edited app_mention (slack-go issue #961): `ts` and
+// `event_ts` both carry the original message ts; only `edited.ts` marks the edit.
+function editedAppMention(text: string, over: Partial<SlackInboundMessageEvent> = {}): SlackInboundMessageEvent {
+  return buildEvent({
+    ts: '1628259917.003000',
+    event_ts: '1628259917.003000',
+    text,
+    edited: { user: 'UALICE', ts: '1628260114.000000' },
+    ...over,
   })
-  const after = classifyInbound(edited, baseConfig, context)
-  if (after.kind !== 'route') throw new Error('Expected edited message')
-  expect(after.payload.isBotMention).toBe(true)
-  expect(dedupe.check(edited, after.payload.isBotMention)).toBeNull()
-  expect(after.payload.externalMessageId).toBe(before.payload.externalMessageId)
-  expect(after.payload.revision).toBe('1700000001.000099')
-  expect(after.payload.accountIdentity).toBe(`slack-bot:${TEAM_ID}:${BOT_USER_ID}`)
-  dedupe.mark(edited, after.payload.isBotMention)
-  expect(dedupe.check(edited, after.payload.isBotMention)).not.toBeNull()
+}
+
+describe('slack-bot classifyInbound — edits', () => {
+  const context = { teamId: TEAM_ID, botUserId: BOT_USER_ID }
+  const appMention = { ...context, source: 'app_mention' as const }
+
+  test('a freshly added English or Korean self mention routes as the original message', () => {
+    for (const [before, after] of [
+      ['please check the deploy', '<@UBOT> please check the deploy'],
+      ['배포 확인해 주세요', '<@UBOT> 배포 확인해 주세요'],
+    ] as const) {
+      const verdict = classifyInbound(editEnvelope(before, after), baseConfig, context)
+
+      expect(verdict.kind).toBe('route')
+      if (verdict.kind !== 'route') throw new Error('expected route')
+      expect(verdict.payload).toMatchObject({
+        text: after,
+        externalMessageId: '1700000000.000100',
+        revision: 'original',
+        accountIdentity: `slack-bot:${TEAM_ID}:${BOT_USER_ID}`,
+        authorId: 'UALICE',
+        isBotMention: true,
+        thread: '1700000000.000100',
+      })
+    }
+  })
+
+  test('a freshly added group mention routes like an original group mention', () => {
+    const verdict = classifyInbound(editEnvelope('배포 확인', '<!here> 배포 확인'), baseConfig, context)
+
+    expect(verdict.kind === 'route' && verdict.payload.isBotMention).toBe(true)
+  })
+
+  test('edits that do not newly address the bot are not new inbounds', () => {
+    const cases: Array<[string, SlackInboundMessageEvent]> = [
+      ['DM typo fix', editEnvelope('helo', 'hello', { envelope: { channel_type: 'im', channel: 'D0DM' } })],
+      ['Korean DM typo fix', editEnvelope('안녕하세여', '안녕하세요', { envelope: { channel_type: 'im' } })],
+      ['typo fix keeping the mention', editEnvelope('<@UBOT> chek this', '<@UBOT> check this')],
+      ['self mention after a group mention', editEnvelope('<!here> 질문', '<!here> <@UBOT> 질문')],
+      ['mention removed', editEnvelope('<@UBOT> 확인해줘', '확인해줘')],
+      ['mention of someone else added', editEnvelope('question', '<@UOTHER> question')],
+      ['metadata-only edit', editEnvelope('<@UBOT> see link', '<@UBOT> see link')],
+    ]
+    for (const [label, event] of cases) {
+      expect([label, classifyInbound(event, baseConfig, context)]).toEqual([
+        label,
+        { kind: 'drop', reason: 'edit_without_new_mention' },
+      ])
+    }
+  })
+
+  test('edits without provable previous body or a valid edit marker drop', () => {
+    const cases: Array<[string, SlackInboundMessageEvent, typeof context & { source?: 'app_mention' }]> = [
+      [
+        'missing previous_message',
+        editEnvelope('q', '<@UBOT> q', { envelope: { previous_message: undefined } }),
+        context,
+      ],
+      ['previous body without text', editEnvelope('q', '<@UBOT> q', { previous: { text: undefined } }), context],
+      [
+        'previous body of another message',
+        editEnvelope('q', '<@UBOT> q', { previous: { ts: '1700000000.000999' } }),
+        context,
+      ],
+      ['unfurl update without edited', editEnvelope('q', '<@UBOT> q', { message: { edited: undefined } }), context],
+      ['empty edit revision', editEnvelope('q', '<@UBOT> q', { message: { edited: { user: 'U', ts: '' } } }), context],
+      ['non-ts edit revision', editEnvelope('q', '<@UBOT> q', { message: { edited: { ts: 'yesterday' } } }), context],
+      [
+        'edit revision equal to message ts',
+        editEnvelope('q', '<@UBOT> q', { message: { edited: { user: 'UALICE', ts: '1700000000.000100' } } }),
+        context,
+      ],
+      ['missing nested message', editEnvelope('q', '<@UBOT> q', { envelope: { message: undefined } }), context],
+      ['flattened edited message copy', editedAppMention('<@UBOT> 확인'), context],
+      [
+        'app_mention with a malformed edited marker',
+        editedAppMention('<@UBOT> 확인', { edited: { user: 'UALICE', ts: '1628259917.003000' } }),
+        appMention,
+      ],
+    ]
+    for (const [label, event, ctx] of cases) {
+      expect([label, classifyInbound(event, baseConfig, ctx)]).toEqual([
+        label,
+        { kind: 'drop', reason: 'unverified_edit' },
+      ])
+    }
+  })
+
+  test('an edited app_mention addressing the bot may engage once without the previous body', () => {
+    for (const text of ['<@UBOT> please review', '<@UBOT> 리뷰 부탁해요']) {
+      const verdict = classifyInbound(editedAppMention(text), baseConfig, appMention)
+
+      expect(verdict.kind).toBe('route')
+      if (verdict.kind !== 'route') throw new Error('expected route')
+      expect(verdict.payload).toMatchObject({
+        externalMessageId: '1628259917.003000',
+        revision: 'original',
+        authorId: 'UALICE',
+        isBotMention: true,
+      })
+    }
+  })
+
+  test('an app_mention without an edited marker stays on the original path', () => {
+    const verdict = classifyInbound(
+      buildEvent({ text: '<@UBOT> 안녕', ts: '1628259917.003000' }),
+      baseConfig,
+      appMention,
+    )
+
+    expect(verdict.kind === 'route' && verdict.payload.revision).toBe('original')
+  })
+
+  test('edit-derived slash commands and claim codes drop as control; originals still route to the router', () => {
+    const controls = ['/help <@UBOT>', '/stop <@UBOT>', '<@UBOT> claim-AB12-CD34']
+    for (const text of controls) {
+      const raw = editEnvelope(text.replace('<@UBOT>', '').trim(), text)
+      expect([text, classifyInbound(raw, baseConfig, context)]).toEqual([
+        text,
+        { kind: 'drop', reason: 'edited_control' },
+      ])
+      expect([text, classifyInbound(editedAppMention(text), baseConfig, appMention)]).toEqual([
+        text,
+        { kind: 'drop', reason: 'edited_control' },
+      ])
+      expect(classifyInbound(buildEvent({ text }), baseConfig, context).kind).toBe('route')
+    }
+    for (const text of ['//help <@UBOT>', '<@UBOT> !deploy now']) {
+      expect([text, classifyInbound(editedAppMention(text), baseConfig, appMention).kind]).toEqual([text, 'route'])
+    }
+  })
+
+  test('self-authored or pre-connect edits keep the existing floors', () => {
+    const selfEdit = editEnvelope('note', '<@UBOT> note', { message: { user: BOT_USER_ID } })
+
+    expect(classifyInbound(selfEdit, baseConfig, context)).toEqual({ kind: 'drop', reason: 'self_author' })
+    expect(classifyInbound(editEnvelope('q', '<@UBOT> q'), baseConfig, { ...context, botUserId: null })).toEqual({
+      kind: 'drop',
+      reason: 'pre_connect',
+    })
+    expect(classifyInbound(editedAppMention('<@UBOT> q'), baseConfig, { ...appMention, botUserId: null })).toEqual({
+      kind: 'drop',
+      reason: 'pre_connect',
+    })
+  })
 })
 
 describe('slack-bot classifyInbound — drop paths', () => {

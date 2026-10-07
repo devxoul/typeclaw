@@ -75,7 +75,7 @@ import {
 } from './slack-bot-slash-commands'
 import { slackTsToMillis } from './slack-bot-time'
 import { toSlackMrkdwn } from './slack-format'
-import { normalizeSlackInbound } from './slack-inbound-revision'
+import { admitSlackInbound, type SlackInboundSource } from './slack-inbound-revision'
 import { invalidSlackThreadTs } from './slack-thread-ts'
 
 // One slash command per logical agent gesture. Mirrors the discord-bot
@@ -255,7 +255,8 @@ export function createThreadCommandHandler(
 // promote them to a message-shaped event for the shared classifier. The
 // promoted event is classified as a regular channel message; the
 // `<@BOT_USER_ID>` substring inside `text` is what makes the classifier
-// mark it as a mention.
+// mark it as a mention. `edited` is carried over because an app_mention for an
+// edit lacks the previous body and must stay subject to the edit gate.
 export function promoteAppMentionToMessage(event: SlackInboundAppMentionEvent): SlackInboundMessageEvent {
   return {
     type: 'message',
@@ -267,6 +268,7 @@ export function promoteAppMentionToMessage(event: SlackInboundAppMentionEvent): 
     ...(event.thread_ts !== undefined ? { thread_ts: event.thread_ts } : {}),
     ...(event.event_ts !== undefined ? { event_ts: event.event_ts } : {}),
     ...(event.client_msg_id !== undefined ? { client_msg_id: event.client_msg_id } : {}),
+    ...(event.edited !== undefined ? { edited: event.edited as SlackInboundMessageEvent['edited'] } : {}),
   }
 }
 
@@ -1281,29 +1283,48 @@ export function createSlackBotAdapter(options: SlackBotAdapterOptions): SlackBot
     },
   })
 
-  // Normalize edits before dedupe, commands and reference enrichment.
-  const handleMessageEvent = async (
-    event: SlackInboundMessageEvent,
-    source: 'message' | 'app_mention',
-  ): Promise<void> => {
+  // Gate raw edits before dedupe, commands and reference enrichment. `source`
+  // is the listener that delivered the event: app_mention promotion rewrites
+  // its type to 'message', so it cannot be recovered from the event itself.
+  const handleMessageEvent = async (rawEvent: SlackInboundMessageEvent, source: SlackInboundSource): Promise<void> => {
     const inboundTeamId = teamId
     const inboundBotId = botUserId
-    event = normalizeSlackInbound(event)
     let admissionReservation: SlackDedupeReservation | undefined
     inflightInbounds++
     try {
-      const text = event.text ?? ''
-      const userId = event.user ?? 'unknown'
-      const inboundWorkspace = event.channel_type === 'im' ? '@dm' : (inboundTeamId ?? 'unknown')
-
       if (inboundTeamId === null) {
-        logger.warn(`[slack-bot] dropped ts=${event.ts} reason=pre_connected (team_id unknown)`)
+        logger.warn(`[slack-bot] dropped ts=${rawEvent.ts} reason=pre_connected (team_id unknown)`)
         return
       }
 
-      const verdict = classifyInbound(event, options.configRef(), {
+      // A rejected edit must not reach `!cmd` interception: edited control
+      // text would otherwise execute without a fresh, original gesture.
+      const admission = admitSlackInbound(rawEvent, inboundBotId, source)
+      if (admission.kind === 'drop') {
+        logger.info(`[slack-bot] dropped ts=${rawEvent.ts} reason=${admission.reason} (source=${source})`)
+        return
+      }
+      const event = admission.event
+      const text = event.text ?? ''
+      const userId = event.user ?? 'unknown'
+      const inboundWorkspace = event.channel_type === 'im' ? '@dm' : inboundTeamId
+      const commandInput = {
+        text,
+        channel: event.channel,
+        threadTs: event.thread_ts ?? null,
+        isDm: event.channel_type === 'im',
+        teamId: inboundTeamId,
+        invokerId: userId,
+      }
+      if (admission.isEdit && parseThreadCommand(commandInput, SLACK_SLASH_COMMAND_NAMES).kind === 'parsed') {
+        logger.info(`[slack-bot] dropped ts=${event.ts} reason=edited_control (source=${source})`)
+        return
+      }
+
+      const verdict = classifyInbound(rawEvent, options.configRef(), {
         teamId: inboundTeamId,
         botUserId: inboundBotId,
+        source,
         ...(options.selfAliasesRef ? { selfAliases: options.selfAliasesRef() } : {}),
       })
       const isBotMention = verdict.kind === 'route' && verdict.payload.isBotMention
@@ -1327,17 +1348,7 @@ export function createSlackBotAdapter(options: SlackBotAdapterOptions): SlackBot
           commandReserved = true
           return true
         }
-        const outcomePromise = handleThreadCommand(
-          {
-            text: event.text ?? '',
-            channel: event.channel,
-            threadTs: event.thread_ts ?? null,
-            isDm: event.channel_type === 'im',
-            teamId: inboundTeamId,
-            invokerId: event.user,
-          },
-          reserve,
-        )
+        const outcomePromise = handleThreadCommand(commandInput, reserve)
         // The handler reserves synchronously before its first await. Do not
         // await a non-command: regular delivery must reserve in this same tick.
         if (commandReserved) {
@@ -1571,6 +1582,9 @@ function dropHint(reason: InboundDropReason): string {
     case 'pre_connect':
     case 'self_author':
     case 'slack_system_message':
+    case 'unverified_edit':
+    case 'edit_without_new_mention':
+    case 'edited_control':
       return ''
   }
 }

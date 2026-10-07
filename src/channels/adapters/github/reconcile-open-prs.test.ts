@@ -1,8 +1,15 @@
-import { describe, expect, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
-import type { InboundMessage } from '@/channels/types'
+import type { InboundMessage, RouteReceipt } from '@/channels/types'
 
-import { DEFAULT_RECONCILE_COOLDOWN_MS, type ReconcileCooldownStore } from './reconcile-cooldown-store'
+import {
+  DEFAULT_RECONCILE_COOLDOWN_MS,
+  loadReconcileCooldownStore,
+  type ReconcileCooldownStore,
+} from './reconcile-cooldown-store'
 import { reconcileOpenPrs, type ReconcileOpenPrsOptions } from './reconcile-open-prs'
 import type { TeamMembershipChecker } from './team-membership'
 
@@ -66,6 +73,8 @@ function fakeGithub(prs: PrFixture[]): typeof fetch {
   return Object.assign(fn, { preconnect: () => {} }) as typeof fetch
 }
 
+const ACCEPTED: RouteReceipt = { kind: 'accepted', inputId: 'input', generation: 1 }
+
 function baseOptions(
   overrides: Partial<ReconcileOpenPrsOptions> & { routed: InboundMessage[] },
 ): ReconcileOpenPrsOptions {
@@ -78,7 +87,7 @@ function baseOptions(
     token: async () => 'tok',
     route: async (m) => {
       routed.push(m)
-      return { kind: 'observed' as const }
+      return ACCEPTED
     },
     logger: { info: () => {}, warn: () => {} },
     fetchImpl: fakeGithub([]),
@@ -235,57 +244,55 @@ describe('reconcileOpenPrs', () => {
   })
 })
 
-function fakeCooldownStore(initial: ReadonlyArray<{ repo: string; prId: number; lastReplayAt: number }> = []): {
-  store: ReconcileCooldownStore
-  markers: Map<string, number>
-  pruned: Array<{ repo: string; ids: number[] }>
-} {
-  const markers = new Map<string, number>()
-  for (const m of initial) markers.set(`${m.repo}#${m.prId}`, m.lastReplayAt)
-  const pruned: Array<{ repo: string; ids: number[] }> = []
-  const store: ReconcileCooldownStore = {
-    isCoolingDown: (repo, prId, now, cooldownMs) => {
-      const at = markers.get(`${repo}#${prId}`)
-      return at !== undefined && now - at < cooldownMs
-    },
-    markReplayed: async (repo, prId, now) => {
-      markers.set(`${repo}#${prId}`, now)
-      return true
-    },
-    clear: async (repo, prId) => {
-      markers.delete(`${repo}#${prId}`)
-    },
-    prune: async (repo, openPrIds) => {
-      pruned.push({ repo, ids: Array.from(openPrIds) })
-    },
-  }
-  return { store, markers, pruned }
-}
-
 describe('reconcileOpenPrs cooldown', () => {
-  test('replays a never-reconciled PR and records the marker before routing', async () => {
+  const REPO = 'acme/widgets'
+  const WINDOW = DEFAULT_RECONCILE_COOLDOWN_MS
+  const silentStoreLogger = { info: () => {}, warn: () => {}, error: () => {} }
+  let agentDir: string
+
+  beforeEach(async () => {
+    agentDir = await mkdtemp(join(tmpdir(), 'reconcile-open-prs-'))
+  })
+
+  afterEach(async () => {
+    await rm(agentDir, { recursive: true, force: true })
+  })
+
+  function loadStore(): Promise<ReconcileCooldownStore> {
+    return loadReconcileCooldownStore(agentDir, silentStoreLogger)
+  }
+
+  async function coolingAfterReload(prId: number, now = 1_001, repo = REPO): Promise<boolean> {
+    return (await loadStore()).isCoolingDown(repo, prId, now, WINDOW)
+  }
+
+  async function seedMarker(prId: number, now: number): Promise<void> {
+    await (await loadStore()).markReplayed(REPO, prId, { now, cooldownMs: WINDOW })
+  }
+
+  test('replays a never-reconciled PR and keeps its cooldown once the router admits it', async () => {
     const routed: InboundMessage[] = []
-    const { store, markers } = fakeCooldownStore()
-    await reconcileOpenPrs(
+    const outcomes = await reconcileOpenPrs(
       baseOptions({
         routed,
-        cooldownStore: store,
+        cooldownStore: await loadStore(),
         now: () => 1_000,
         fetchImpl: fakeGithub([{ number: 7, id: 700 }]),
       }),
     )
     expect(routed.map((m) => m.chat)).toEqual(['pr:7'])
-    expect(markers.get('acme/widgets#700')).toBe(1_000)
+    expect(outcomes).toEqual([{ repo: REPO, scanned: 1, replayed: 1 }])
+    expect(await coolingAfterReload(700)).toBe(true)
   })
 
   test('skips a PR replayed within the cooldown window (restart within cooldown)', async () => {
+    await seedMarker(700, 1_000)
     const routed: InboundMessage[] = []
-    const { store } = fakeCooldownStore([{ repo: 'acme/widgets', prId: 700, lastReplayAt: 1_000 }])
     await reconcileOpenPrs(
       baseOptions({
         routed,
-        cooldownStore: store,
-        now: () => 1_000 + DEFAULT_RECONCILE_COOLDOWN_MS - 1,
+        cooldownStore: await loadStore(),
+        now: () => 1_000 + WINDOW - 1,
         fetchImpl: fakeGithub([{ number: 7, id: 700 }]),
       }),
     )
@@ -293,12 +300,12 @@ describe('reconcileOpenPrs cooldown', () => {
   })
 
   test('an updatedAt change within the cooldown does NOT re-trigger a replay', async () => {
+    await seedMarker(700, 1_000)
     const routed: InboundMessage[] = []
-    const { store } = fakeCooldownStore([{ repo: 'acme/widgets', prId: 700, lastReplayAt: 1_000 }])
     await reconcileOpenPrs(
       baseOptions({
         routed,
-        cooldownStore: store,
+        cooldownStore: await loadStore(),
         now: () => 1_000 + 60_000,
         fetchImpl: fakeGithub([{ number: 7, id: 700, updatedAt: '2026-02-02T00:00:00Z' }]),
       }),
@@ -307,72 +314,401 @@ describe('reconcileOpenPrs cooldown', () => {
   })
 
   test('retries a still-unreviewed PR after the cooldown expires', async () => {
+    await seedMarker(700, 1_000)
     const routed: InboundMessage[] = []
-    const { store, markers } = fakeCooldownStore([{ repo: 'acme/widgets', prId: 700, lastReplayAt: 1_000 }])
-    const now = 1_000 + DEFAULT_RECONCILE_COOLDOWN_MS + 1
+    const now = 1_000 + WINDOW + 1
     await reconcileOpenPrs(
       baseOptions({
         routed,
-        cooldownStore: store,
+        cooldownStore: await loadStore(),
         now: () => now,
         fetchImpl: fakeGithub([{ number: 7, id: 700 }]),
       }),
     )
     expect(routed.map((m) => m.chat)).toEqual(['pr:7'])
-    expect(markers.get('acme/widgets#700')).toBe(now)
+    expect(await coolingAfterReload(700, now + 1)).toBe(true)
   })
 
   test('a posted review suppresses replay even when the cooldown has expired', async () => {
+    await seedMarker(700, 1_000)
     const routed: InboundMessage[] = []
-    const { store } = fakeCooldownStore([{ repo: 'acme/widgets', prId: 700, lastReplayAt: 1_000 }])
     await reconcileOpenPrs(
       baseOptions({
         routed,
-        cooldownStore: store,
-        now: () => 1_000 + DEFAULT_RECONCILE_COOLDOWN_MS + 1,
+        cooldownStore: await loadStore(),
+        now: () => 1_000 + WINDOW + 1,
         fetchImpl: fakeGithub([{ number: 7, id: 700, selfReviewed: true }]),
       }),
     )
     expect(routed).toHaveLength(0)
   })
 
-  test('prunes the cooldown store with the currently-open PR ids', async () => {
-    const routed: InboundMessage[] = []
-    const { store, pruned } = fakeCooldownStore()
+  test('prunes markers of PRs that are no longer open and keeps open ones', async () => {
+    await seedMarker(700, 1_000)
+    await seedMarker(900, 1_000)
     await reconcileOpenPrs(
       baseOptions({
-        routed,
-        cooldownStore: store,
-        now: () => 1_000,
+        routed: [],
+        cooldownStore: await loadStore(),
+        now: () => 2_000,
         fetchImpl: fakeGithub([
-          { number: 7, id: 700 },
-          { number: 8, id: 800, selfReviewed: true },
+          { number: 7, id: 700, selfReviewed: true },
+          { number: 8, id: 800 },
         ]),
       }),
     )
-    expect(pruned).toEqual([{ repo: 'acme/widgets', ids: [700, 800] }])
+    expect(await coolingAfterReload(700, 2_001)).toBe(true)
+    expect(await coolingAfterReload(800, 2_001)).toBe(true)
+    expect(await coolingAfterReload(900, 2_001)).toBe(false)
   })
 
-  test('does NOT route when persisting the cooldown marker fails', async () => {
+  test('does NOT route when persisting the reservation fails', async () => {
+    await writeFile(join(agentDir, 'channels'), 'not a directory', 'utf8')
     const routed: InboundMessage[] = []
-    const { store } = fakeCooldownStore()
-    const failingStore: ReconcileCooldownStore = {
-      ...store,
-      markReplayed: async () => {
-        throw new Error('ENOSPC: disk full')
-      },
-    }
     const warnings: string[] = []
     await reconcileOpenPrs(
       baseOptions({
         routed,
-        cooldownStore: failingStore,
+        cooldownStore: await loadStore(),
         now: () => 1_000,
         logger: { info: () => {}, warn: (m) => warnings.push(m) },
         fetchImpl: fakeGithub([{ number: 7, id: 700 }]),
       }),
     )
     expect(routed).toHaveLength(0)
-    expect(warnings.some((w) => w.includes('cooldown persist failed'))).toBe(true)
+    expect(warnings.some((w) => w.includes('PR #7') && w.includes('cooldown persist failed'))).toBe(true)
+  })
+
+  test('a rejected replay does not stop the remaining PRs or repos and is retried on later passes and after reload', async () => {
+    // given a route that rejects acme/widgets PR #7 on its first two attempts
+    let failuresLeft = 2
+    const attempts: string[] = []
+    const warnings: string[] = []
+    const pass = (store: ReconcileCooldownStore) =>
+      reconcileOpenPrs(
+        baseOptions({
+          routed: [],
+          repos: [REPO, 'acme/other'],
+          route: async (m) => {
+            attempts.push(`${m.workspace} ${m.chat}`)
+            if (m.workspace === REPO && m.chat === 'pr:7' && failuresLeft-- > 0) {
+              throw new Error('journal append failed')
+            }
+            return ACCEPTED
+          },
+          cooldownStore: store,
+          now: () => 1_000,
+          logger: { info: () => {}, warn: (w) => warnings.push(w) },
+          fetchImpl: fakeGithub([
+            { number: 7, id: 700 },
+            { number: 8, id: 800 },
+          ]),
+        }),
+      )
+
+    // when the first pass runs, every other PR is still replayed and admitted
+    const store = await loadStore()
+    expect(await pass(store)).toEqual([
+      { repo: REPO, scanned: 2, replayed: 1 },
+      { repo: 'acme/other', scanned: 2, replayed: 2 },
+    ])
+    expect(attempts).toEqual([`${REPO} pr:7`, `${REPO} pr:8`, 'acme/other pr:7', 'acme/other pr:8'])
+    expect(warnings.some((w) => w.includes(`${REPO}: PR #7`) && w.includes('journal append failed'))).toBe(true)
+
+    // then a later pass on the same store retries only the failed PR
+    attempts.length = 0
+    await pass(store)
+    expect(attempts).toEqual([`${REPO} pr:7`])
+
+    // and so does a pass after the store reloads, whose admission is kept
+    attempts.length = 0
+    expect(await pass(await loadStore())).toEqual([
+      { repo: REPO, scanned: 2, replayed: 1 },
+      { repo: 'acme/other', scanned: 2, replayed: 0 },
+    ])
+    expect(attempts).toEqual([`${REPO} pr:7`])
+    attempts.length = 0
+    await pass(await loadStore())
+    expect(attempts).toEqual([])
+  })
+
+  test('only accepted or duplicate receipts keep the cooldown; observed, denied and control release it', async () => {
+    const receipts: Record<string, RouteReceipt> = {
+      'pr:1': ACCEPTED,
+      'pr:2': { kind: 'duplicate', inputId: 'input-2' },
+      'pr:3': { kind: 'observed' },
+      'pr:4': { kind: 'denied' },
+      'pr:5': { kind: 'control' },
+    }
+    const prs = [1, 2, 3, 4, 5].map((number) => ({ number, id: number * 100 }))
+    const attempts: string[] = []
+    const infos: string[] = []
+    const pass = async () =>
+      reconcileOpenPrs(
+        baseOptions({
+          routed: [],
+          route: async (m) => {
+            attempts.push(m.chat)
+            return receipts[m.chat]!
+          },
+          cooldownStore: await loadStore(),
+          now: () => 1_000,
+          logger: { info: (m) => infos.push(m), warn: () => {} },
+          fetchImpl: fakeGithub(prs),
+        }),
+      )
+
+    expect(await pass()).toEqual([{ repo: REPO, scanned: 5, replayed: 2 }])
+    expect(infos.some((m) => m.includes('replayed 2/5'))).toBe(true)
+    for (const [number, kind] of [
+      [3, 'observed'],
+      [4, 'denied'],
+      [5, 'control'],
+    ] as const) {
+      expect(infos.some((m) => m.includes(`PR #${number}`) && m.includes(kind))).toBe(true)
+    }
+    const cooling = await Promise.all(prs.map((pr) => coolingAfterReload(pr.id)))
+    expect(cooling).toEqual([true, true, false, false, false])
+
+    attempts.length = 0
+    await pass()
+    expect(attempts).toEqual(['pr:3', 'pr:4', 'pr:5'])
+  })
+
+  test('a pass stopped after reserving but before dispatch releases its reservation and routes nothing', async () => {
+    // given a stop that lands right after the reservation is persisted
+    let cancelled = false
+    const real = await loadStore()
+    const store: ReconcileCooldownStore = {
+      ...real,
+      markReplayed: async (...args) => {
+        const reservation = await real.markReplayed(...args)
+        cancelled = true
+        return reservation
+      },
+    }
+    const routed: InboundMessage[] = []
+
+    await reconcileOpenPrs(
+      baseOptions({
+        routed,
+        cooldownStore: store,
+        now: () => 1_000,
+        isCancelled: () => cancelled,
+        fetchImpl: fakeGithub([{ number: 7, id: 700 }]),
+      }),
+    )
+
+    expect(routed).toHaveLength(0)
+    expect(await coolingAfterReload(700)).toBe(false)
+  })
+
+  async function stopDuringDispatch(settle: (route: PromiseWithResolvers<RouteReceipt>) => void) {
+    let cancelled = false
+    const dispatched = Promise.withResolvers<void>()
+    const route = Promise.withResolvers<RouteReceipt>()
+    const attempts: string[] = []
+    const pass = reconcileOpenPrs(
+      baseOptions({
+        routed: [],
+        route: (m) => {
+          attempts.push(m.chat)
+          dispatched.resolve()
+          return route.promise
+        },
+        cooldownStore: await loadStore(),
+        now: () => 1_000,
+        isCancelled: () => cancelled,
+        fetchImpl: fakeGithub([
+          { number: 7, id: 700 },
+          { number: 8, id: 800 },
+        ]),
+      }),
+    )
+    await dispatched.promise
+    cancelled = true
+    // A replacement adapter loads the store while the stale route is pending.
+    const replacement = await loadStore()
+    const coolingWhilePending = replacement.isCoolingDown(REPO, 700, 1_001, WINDOW)
+    settle(route)
+    return { coolingWhilePending, outcomes: await pass, attempts }
+  }
+
+  test('stopping during a dispatched replay neither clears an admitted cooldown nor blocks a replacement load', async () => {
+    const result = await stopDuringDispatch((route) => route.resolve(ACCEPTED))
+
+    expect(result.coolingWhilePending).toBe(true)
+    expect(result.outcomes).toEqual([{ repo: REPO, scanned: 2, replayed: 1 }])
+    expect(result.attempts).toEqual(['pr:7'])
+    expect(await coolingAfterReload(700)).toBe(true)
+    expect(await coolingAfterReload(800)).toBe(false)
+  })
+
+  test('a dispatched replay that fails after the adapter stopped releases its own reservation', async () => {
+    const result = await stopDuringDispatch((route) => route.reject(new Error('router stopped')))
+
+    expect(result.coolingWhilePending).toBe(true)
+    expect(result.outcomes).toEqual([{ repo: REPO, scanned: 2, replayed: 0 }])
+    expect(await coolingAfterReload(700)).toBe(false)
+  })
+
+  test('an old attempt failing after a newer pass re-reserved the PR on the same clock keeps the newer cooldown', async () => {
+    // given an old lifecycle whose replay of PR #7 is still being routed
+    let oldCancelled = false
+    const oldDispatched = Promise.withResolvers<void>()
+    const oldRoute = Promise.withResolvers<RouteReceipt>()
+    const oldPass = reconcileOpenPrs(
+      baseOptions({
+        routed: [],
+        route: () => {
+          oldDispatched.resolve()
+          return oldRoute.promise
+        },
+        cooldownStore: await loadStore(),
+        now: () => 1_000,
+        isCancelled: () => oldCancelled,
+        fetchImpl: fakeGithub([{ number: 7, id: 700 }]),
+      }),
+    )
+    await oldDispatched.promise
+    oldCancelled = true
+
+    // and a replacement lifecycle that cleared the marker (draft conversion)
+    // and re-reserved PR #7 at the identical timestamp
+    const replacement = await loadStore()
+    await replacement.clear(REPO, 700)
+    const routedByReplacement: InboundMessage[] = []
+    await reconcileOpenPrs(
+      baseOptions({
+        routed: routedByReplacement,
+        cooldownStore: replacement,
+        now: () => 1_000,
+        fetchImpl: fakeGithub([{ number: 7, id: 700 }]),
+      }),
+    )
+    expect(routedByReplacement.map((m) => m.chat)).toEqual(['pr:7'])
+
+    // when the old attempt's route finally rejects
+    oldRoute.reject(new Error('superseded live session creation discarded'))
+    await oldPass
+
+    // then the replacement's cooldown survives the old attempt's rollback
+    expect(await coolingAfterReload(700, 1_000)).toBe(true)
+    const routedLater: InboundMessage[] = []
+    await reconcileOpenPrs(
+      baseOptions({
+        routed: routedLater,
+        cooldownStore: await loadStore(),
+        now: () => 1_000,
+        fetchImpl: fakeGithub([{ number: 7, id: 700 }]),
+      }),
+    )
+    expect(routedLater).toHaveLength(0)
+  })
+
+  test("a replacement's very next pass retries a PR whose older attempt was released after the replacement loaded", async () => {
+    // given an old lifecycle whose replay of PR #7 is still being routed
+    let oldCancelled = false
+    const oldDispatched = Promise.withResolvers<void>()
+    const oldRoute = Promise.withResolvers<RouteReceipt>()
+    const oldPass = reconcileOpenPrs(
+      baseOptions({
+        routed: [],
+        route: () => {
+          oldDispatched.resolve()
+          return oldRoute.promise
+        },
+        cooldownStore: await loadStore(),
+        now: () => 1_000,
+        isCancelled: () => oldCancelled,
+        fetchImpl: fakeGithub([{ number: 7, id: 700 }]),
+      }),
+    )
+    await oldDispatched.promise
+    oldCancelled = true
+
+    // and a replacement store loaded while that reservation is genuinely current
+    const replacement = await loadStore()
+    const replacementPass = async (): Promise<string[]> => {
+      const routed: InboundMessage[] = []
+      await reconcileOpenPrs(
+        baseOptions({
+          routed,
+          cooldownStore: replacement,
+          now: () => 1_000,
+          fetchImpl: fakeGithub([{ number: 7, id: 700 }]),
+        }),
+      )
+      return routed.map((m) => m.chat)
+    }
+
+    // then the replacement does not launch PR #7 a second time meanwhile
+    expect(await replacementPass()).toEqual([])
+
+    // when the old attempt's route rejects and it releases its own reservation
+    oldRoute.reject(new Error('router stopped'))
+    await oldPass
+
+    // then the replacement's very next pass, on the same clock reading, retries it
+    expect(await replacementPass()).toEqual(['pr:7'])
+    expect(await coolingAfterReload(700, 1_000)).toBe(true)
+  })
+
+  test('concurrent passes from stale store snapshots launch each PR only once', async () => {
+    const stores = [await loadStore(), await loadStore()]
+    const routed: InboundMessage[] = []
+
+    await Promise.all(
+      stores.map((store) =>
+        reconcileOpenPrs(
+          baseOptions({
+            routed,
+            cooldownStore: store,
+            now: () => 1_000,
+            fetchImpl: fakeGithub([
+              { number: 7, id: 700 },
+              { number: 8, id: 800 },
+            ]),
+          }),
+        ),
+      ),
+    )
+
+    expect(routed.map((m) => m.chat).sort()).toEqual(['pr:7', 'pr:8'])
+  })
+
+  test('a rollback that cannot persist is reported, keeps the cooldown, and does not stop the remaining PRs', async () => {
+    const real = await loadStore()
+    const store: ReconcileCooldownStore = {
+      ...real,
+      rollbackReplay: async () => {
+        throw new Error('ENOSPC: disk full')
+      },
+    }
+    const attempts: string[] = []
+    const warnings: string[] = []
+
+    const outcomes = await reconcileOpenPrs(
+      baseOptions({
+        routed: [],
+        route: async (m) => {
+          attempts.push(m.chat)
+          if (m.chat === 'pr:7') throw new Error('route failed')
+          return ACCEPTED
+        },
+        cooldownStore: store,
+        now: () => 1_000,
+        logger: { info: () => {}, warn: (w) => warnings.push(w) },
+        fetchImpl: fakeGithub([
+          { number: 7, id: 700 },
+          { number: 8, id: 800 },
+        ]),
+      }),
+    )
+
+    expect(attempts).toEqual(['pr:7', 'pr:8'])
+    expect(outcomes).toEqual([{ repo: REPO, scanned: 2, replayed: 1 }])
+    expect(warnings.some((w) => w.includes('PR #7') && w.includes('NOT released') && w.includes('ENOSPC'))).toBe(true)
+    expect(await coolingAfterReload(700)).toBe(true)
   })
 })

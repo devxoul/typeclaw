@@ -943,19 +943,16 @@ async function startAgentRuntime(
   })
   registerBootCleanup(() => recoveryDispatcher?.stop())
   try {
-    // Mixed source decisions are repaired before any child or notice can progress.
-    await inboundJournal.initialize()
-    await inboundJournal.repair()
-    await inboundJournal.importOldEpoch(recoveryOutbox)
+    // Attempted before adapters start or the dispatcher wakes; failure does not block either.
     await bootBackgroundObligations({
+      inboundJournal,
       obligations: backgroundObligations,
       outbox: recoveryOutbox,
       inventory: legacyBackgroundHandoffs,
     })
   } catch (error) {
-    // Keep the operator/adapter surface and verified inventory-only notices alive.
-    // Journal failure freezes dependent work; valid-looking child JSON is not proof of independence.
-    backgroundObligations.setFrozen(error)
+    // Keep the operator/adapter surface and verified inventory-only notices alive;
+    // the helper has already frozen dependent background progress.
     console.warn(`[run] continuity blocked pending operator repair: ${error}`)
   }
   await bootChannelRestartGreeting({

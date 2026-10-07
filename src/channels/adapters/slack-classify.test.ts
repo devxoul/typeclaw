@@ -39,7 +39,7 @@ describe('classifyInbound (slack user)', () => {
   test('drops unrouteable RTM messages', () => {
     expect(classifyInbound(event({ user: 'USELF' }), config, context)).toEqual({ kind: 'drop', reason: 'self_author' })
     expect(classifyInbound(event({ user: undefined }), config, context)).toEqual({ kind: 'drop', reason: 'no_user' })
-    expect(classifyInbound(event({ subtype: 'message_changed' }), config, context)).toEqual({
+    expect(classifyInbound(event({ subtype: 'channel_join' }), config, context)).toEqual({
       kind: 'drop',
       reason: 'slack_system_message',
     })
@@ -131,5 +131,105 @@ describe('classifyInbound (slack user)', () => {
 
     expect(english.kind === 'route' && english.payload.thread).toBe('1770000000.000100')
     expect(korean.kind === 'route' && korean.payload.thread).toBe('1770000000.000100')
+  })
+})
+
+const EDIT_TS = '1770000060.000200'
+
+// RTM `message_changed` envelope as Slack delivers it: the nested message keeps
+// its original ts and gains `edited`; `previous_message` holds the prior body.
+function edit(
+  previousText: string,
+  text: string,
+  over: {
+    message?: Record<string, unknown>
+    previous?: Record<string, unknown>
+  } & Partial<SlackInboundMessageEvent> = {},
+): SlackInboundMessageEvent {
+  const { message, previous, ...envelope } = over
+  const original = event()
+  return {
+    type: 'message',
+    subtype: 'message_changed',
+    channel: original.channel,
+    hidden: true,
+    ts: '1770000060.000300',
+    message: { ...original, text, edited: { user: original.user, ts: EDIT_TS }, ...message },
+    previous_message: { ...original, text: previousText, ...previous },
+    ...envelope,
+  }
+}
+
+describe('classifyInbound (slack user) edits', () => {
+  test('a freshly added English or Korean self mention routes as the original message', () => {
+    for (const [before, after] of [
+      ['can you check', '<@USELF> can you check'],
+      ['확인 부탁드려요', '<@USELF> 확인 부탁드려요'],
+      ['배포 공지', '<!channel> 배포 공지'],
+    ] as const) {
+      const verdict = classifyInbound(edit(before, after), config, context)
+
+      expect(verdict.kind).toBe('route')
+      if (verdict.kind !== 'route') return
+      expect(verdict.payload).toMatchObject({
+        text: after,
+        externalMessageId: '1770000000.000100',
+        revision: 'original',
+        accountIdentity: 'slack:T0123456789:USELF',
+        authorId: 'UUSER',
+        isBotMention: true,
+      })
+    }
+  })
+
+  test('edits that do not newly address this account are not new inbounds', () => {
+    const cases: Array<[string, SlackInboundMessageEvent]> = [
+      ['DM typo fix', edit('helo', 'hello', { channel: 'D0123456789' })],
+      ['Korean DM typo fix', edit('고마워여', '고마워요', { channel: 'D0123456789' })],
+      ['typo fix keeping the mention', edit('<@USELF> chek', '<@USELF> check')],
+      ['mention removed', edit('<@USELF> 확인', '확인')],
+      ['alias added without a mention', edit('확인해 주세요', 'typeclaw 확인해 주세요')],
+      ['metadata-only edit', edit('<@USELF> link', '<@USELF> link')],
+    ]
+    for (const [label, input] of cases) {
+      expect([label, classifyInbound(input, config, context)]).toEqual([
+        label,
+        { kind: 'drop', reason: 'edit_without_new_mention' },
+      ])
+    }
+  })
+
+  test('edits without provable previous body or a valid edit revision drop', () => {
+    const cases: Array<[string, SlackInboundMessageEvent]> = [
+      ['missing previous_message', edit('q', '<@USELF> q', { previous_message: undefined })],
+      ['previous body without text', edit('q', '<@USELF> q', { previous: { text: undefined } })],
+      ['unfurl update without edited', edit('q', '<@USELF> q', { message: { edited: undefined } })],
+      ['malformed edit revision', edit('q', '<@USELF> q', { message: { edited: { ts: 42 } } })],
+      ['flattened edited copy', event({ text: '<@USELF> 확인', edited: { user: 'UUSER', ts: EDIT_TS } })],
+    ]
+    for (const [label, input] of cases) {
+      expect([label, classifyInbound(input, config, context)]).toEqual([
+        label,
+        { kind: 'drop', reason: 'unverified_edit' },
+      ])
+    }
+  })
+
+  test('self-authored edits keep the self floor', () => {
+    expect(classifyInbound(edit('memo', '<@USELF> memo', { message: { user: 'USELF' } }), config, context)).toEqual({
+      kind: 'drop',
+      reason: 'self_author',
+    })
+  })
+
+  test('edit-derived slash commands and claim codes drop as control; originals still reach the router', () => {
+    for (const text of ['/help <@USELF>', '/reload <@USELF>', '<@USELF> claim-AB12-CD34']) {
+      expect([text, classifyInbound(edit(text.replace('<@USELF>', '').trim(), text), config, context)]).toEqual([
+        text,
+        { kind: 'drop', reason: 'edited_control' },
+      ])
+      expect(classifyInbound(event({ text }), config, context).kind).toBe('route')
+    }
+    expect(classifyInbound(edit('//help', '//help <@USELF>'), config, context).kind).toBe('route')
   })
 })
