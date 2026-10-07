@@ -10,7 +10,7 @@ import type { BackgroundObligation, BackgroundObligationRef, BackgroundObligatio
 import { parseBackgroundObligation } from './background-obligations'
 import { parseRecoveryRecord, recoveryPayload } from './continuity-types'
 import type { RecoveryRecord } from './continuity-types'
-import { createRecoveryNotice } from './recovery-notice'
+import { createRecoveryNotice, recoveryNoticePartitionKey } from './recovery-notice'
 import type { RecoveryOutbox } from './recovery-outbox'
 import { channelKeyId } from './types'
 import type { ChannelKey } from './types'
@@ -261,6 +261,72 @@ function validateRow(row: InboundRecord) {
       throw new Error('Invalid inbound transfer coverage')
   }
 }
+// Boot has no live owner: the captured claim owner supersedes the immutable admission/launch parent.
+const inboundPartition = (row: InboundRecord) =>
+  recoveryNoticePartitionKey({
+    target: row.target,
+    accountIdentity: row.accountIdentity,
+    principal: row.principal,
+    parentSessionId: row.claim?.ownerSessionId ?? row.sourceParentSessionId,
+  })
+const backgroundPartition = (row: BackgroundObligation) =>
+  recoveryNoticePartitionKey({
+    target: row.target,
+    accountIdentity: row.accountIdentity,
+    principal: row.principal,
+    parentSessionId: row.claim?.ownerSessionId ?? row.parentSessionId,
+  })
+/**
+ * A Slack message is its ts within the authenticated account's workspace/chat. Routing thread and
+ * edit revision are delivery shapes of that one message, so a single admission answers all of them.
+ */
+const slackMessageKey = (input: {
+  root: string
+  accountIdentity: string
+  target: ChannelKey
+  messageId?: string
+  eventKind: string
+}) =>
+  (input.target.adapter === 'slack' || input.target.adapter === 'slack-bot') && input.messageId
+    ? canonical([
+        input.root,
+        input.accountIdentity,
+        input.target.adapter,
+        input.target.workspace,
+        input.target.chat,
+        input.messageId,
+        input.eventKind,
+      ])
+    : undefined
+/** Derived from the stored identity tuple; rows that cannot be decoded keep exact-identity dedupe only. */
+function storedSlackMessageKey(row: InboundRecord) {
+  const messageId = row.reference?.messageId
+  if (!messageId || (row.target.adapter !== 'slack' && row.target.adapter !== 'slack-bot')) return undefined
+  let tuple: unknown
+  try {
+    tuple = JSON.parse(row.identity)
+  } catch {
+    return undefined
+  }
+  if (
+    !Array.isArray(tuple) ||
+    tuple.length !== 6 ||
+    typeof tuple[0] !== 'string' ||
+    typeof tuple[4] !== 'string' ||
+    !tuple[4] ||
+    tuple[1] !== row.accountIdentity ||
+    tuple[2] !== channelKeyId(row.target) ||
+    tuple[3] !== messageId
+  )
+    return undefined
+  return slackMessageKey({
+    root: tuple[0],
+    accountIdentity: row.accountIdentity,
+    target: row.target,
+    messageId,
+    eventKind: tuple[4],
+  })
+}
 
 /** Single-runtime writer. Callers hold the background target lane through coverage reads and cache publication. */
 export class InboundJournal {
@@ -269,6 +335,8 @@ export class InboundJournal {
   private fd?: FileHandle
   private sequence = 0
   private rows = new Map<string, InboundRecord>()
+  /** Derived Slack message key → representative inputId; rebuilt from durable rows, never persisted. */
+  private slackMessages = new Map<string, string>()
   private decisions = new Map<string, Decision>()
   private receipts = new Map<string, DecisionReceipt>()
   private applied = new Set<string>()
@@ -420,6 +488,7 @@ export class InboundJournal {
         validateRow(row)
         if (this.rows.has(row.inputId)) throw new Error('Duplicate snapshot input')
         this.rows.set(row.inputId, row)
+        this.indexSlackMessage(row)
       }
       const sequences = new Set<number>()
       for (const receipt of snap.receipts) {
@@ -474,12 +543,29 @@ export class InboundJournal {
           if (canonical(previous) !== canonical(decision)) throw new Error('Conflicting duplicate journal transition')
         } else if (!compacted) {
           for (const change of decision.changes) this.validateChange(change, decision.type)
-          for (const change of decision.changes) this.rows.set(change.row.inputId, change.row)
+          for (const change of decision.changes) {
+            this.rows.set(change.row.inputId, change.row)
+            // Only admission creates a row; later transitions keep its immutable identity.
+            if (decision.type === 'admitted') this.indexSlackMessage(change.row)
+          }
           this.decisions.set(decision.transitionId, decision)
         }
       }
     }
     this.sequence = line.seq
+  }
+  private indexSlackMessage(row: InboundRecord) {
+    const key = storedSlackMessageKey(row)
+    if (!key) return
+    const current = this.rows.get(this.slackMessages.get(key) ?? '')
+    // Historical per-revision rows all stay; the earliest admission deterministically represents the message.
+    if (
+      current &&
+      current.inputId !== row.inputId &&
+      (current.acceptedAt < row.acceptedAt || (current.acceptedAt === row.acceptedAt && current.inputId < row.inputId))
+    )
+      return
+    this.slackMessages.set(key, row.inputId)
   }
   private validateDecision(decision: Decision) {
     decisionSchema.parse(decision)
@@ -724,6 +810,12 @@ export class InboundJournal {
     }
     this.validateDecision(decision)
     for (const change of changes) this.validateChange(change, type)
+    if (backgroundChanges.length) {
+      // A known background freeze rejects a mixed decision before it is durable; once written, only
+      // journal repair may apply it, so a write the store cannot follow would poison every admission.
+      if (!this.background) throw new Error('Mixed decision requires background store')
+      this.background.assertAvailable()
+    }
     await this.append(decision)
     try {
       await this.applyBackground(decision)
@@ -732,6 +824,31 @@ export class InboundJournal {
       throw error
     }
     return decision
+  }
+  /**
+   * The one duplicate authority for admission and pre-routing lookup. A Slack message resolves to its
+   * representative row whatever revision or thread shape arrives; only identities outside the message
+   * index (other adapters, receipt-only, undecodable rows) use exact identity. A duplicate returns the
+   * existing row untouched (its debt never follows a new routing thread), and a different author is a
+   * conflict, never a fresh slot.
+   */
+  private existingAdmission(input: InboundAdmission) {
+    const root = dirname(dirname(this.path))
+    const identity = canonical([
+      root,
+      input.accountIdentity,
+      channelKeyId(input.target),
+      input.messageId ?? input.receiptId,
+      input.eventKind,
+      input.revision,
+    ])
+    const inputId = digest(['inbound', identity])
+    const message = slackMessageKey({ root, ...input })
+    const representative = message ? this.slackMessages.get(message) : undefined
+    const existing = this.rows.get(representative ?? inputId)
+    if (existing && canonical(existing.principal) !== canonical(input.principal))
+      throw new Error('Conflicting duplicate admission principal')
+    return { identity, inputId, existing }
   }
   async admit(
     input: InboundAdmission,
@@ -749,21 +866,13 @@ export class InboundJournal {
         !(input.messageId || input.receiptId)
       )
         throw new Error('Missing inbound continuity identity')
-      const identity = canonical([
-        dirname(dirname(this.path)),
-        input.accountIdentity,
-        channelKeyId(input.target),
-        input.messageId ?? input.receiptId,
-        input.eventKind,
-        input.revision,
-      ])
-      const inputId = digest(['inbound', identity])
-      const existing = this.rows.get(inputId)
-      if (existing) {
-        if (canonical(existing.principal) !== canonical(input.principal))
-          throw new Error('Conflicting duplicate admission principal')
-        return { kind: 'duplicate' as const, inputId, outcome: copy(existing.outcome ?? null) ?? undefined }
-      }
+      const { identity, inputId, existing } = this.existingAdmission(input)
+      if (existing)
+        return {
+          kind: 'duplicate' as const,
+          inputId: existing.inputId,
+          outcome: copy(existing.outcome ?? null) ?? undefined,
+        }
       const row: InboundRecord = {
         schemaVersion: 1,
         inputId,
@@ -1004,7 +1113,10 @@ export class InboundJournal {
       if ([...rows, ...bg].some((row) => row.transfer)) throw new Error('Already transferred coverage')
       const transferId = digest(['inbound-transfer', refs, brefs])
       const parents = rows.map((row) => row.claim?.ownerSessionId ?? ownerSessionId ?? row.sourceParentSessionId)
-      if (new Set(parents).size !== 1) throw new Error('Notice coverage must be partitioned by owner')
+      // A covered child must share the notice's stop authority, not only its destination.
+      const backgroundParents = bg.map((row) => row.claim?.ownerSessionId ?? ownerSessionId ?? row.parentSessionId)
+      if (new Set([...parents, ...backgroundParents]).size !== 1)
+        throw new Error('Notice coverage must be partitioned by owner')
       const transfer = createRecoveryNotice({
         target,
         accountIdentity: rows[0]!.accountIdentity,
@@ -1084,32 +1196,74 @@ export class InboundJournal {
     await this.acknowledgeNotice(imported)
     return imported
   }
-  lookupAdmission(input: Omit<InboundAdmission, 'principal'> & { principal?: MatchableOrigin }) {
+  /** Pre-routing duplicate check; the same resolver and author fence as admission. */
+  lookupAdmission(input: InboundAdmission) {
     this.assertAvailable()
-    const identity = canonical([
-      dirname(dirname(this.path)),
-      input.accountIdentity,
-      channelKeyId(input.target),
-      input.messageId ?? input.receiptId,
-      input.eventKind,
-      input.revision,
-    ])
-    return this.get(digest(['inbound', identity]))
+    const { existing } = this.existingAdmission(input)
+    return existing ? copy(existing) : undefined
   }
+  /**
+   * Boot transfer of inbound authority no live turn can still answer. Issued transfers re-import
+   * unchanged first, so a late matching row forms its own notice instead of mutating one. Remaining
+   * old-epoch rows become one mixed notice per recovery partition, joined by compatible old-epoch
+   * children; unmatched children keep the background store's singleton fallback.
+   */
   async importOldEpoch(outbox: RecoveryOutbox) {
     await this.initialize()
-    for (const source of this.list()) {
-      if (source.phase === 'closed' || (source.epoch === this.epoch && !source.transfer)) continue
-      const action = async () => {
-        const current = this.get(source.inputId)!
-        if (current.phase === 'closed') return
-        const transfer =
-          current.transfer ??
-          (await this.prepareNotice([{ inputId: current.inputId, generation: current.generation }], current.target))
-        await this.importPrepared(outbox, transfer)
+    this.assertAvailable()
+    const background = this.background
+    const issued = new Map<string, { target: ChannelKey; inputIds: string[] }>()
+    for (const row of this.rows.values()) {
+      if (row.phase === 'closed' || !row.transfer) continue
+      const transfer = issued.get(row.transfer.deliveryId)
+      if (transfer) transfer.inputIds.push(row.inputId)
+      else issued.set(row.transfer.deliveryId, { target: row.target, inputIds: [row.inputId] })
+    }
+    for (const { target, inputIds } of issued.values()) {
+      const reimport = async () => {
+        const current = inputIds.map((id) => this.get(id)).find((row) => row?.phase !== 'closed' && row?.transfer)
+        if (current?.transfer) await this.importPrepared(outbox, current.transfer)
       }
-      if (this.background) await this.background.withTargetLane(source.target, action)
-      else await action()
+      await (background ? background.withTargetLane(target, reimport) : reimport())
+    }
+    const transferable = (row: InboundRecord | BackgroundObligation) =>
+      row.phase !== 'closed' && !row.transfer && row.epoch !== this.epoch
+    const partitions = new Map<string, { target: ChannelKey; inputIds: string[]; backgroundIds: string[] }>()
+    for (const row of this.rows.values()) {
+      if (!transferable(row)) continue
+      const key = inboundPartition(row)
+      const partition = partitions.get(key) ?? { target: row.target, inputIds: [], backgroundIds: [] }
+      partitions.set(key, partition)
+      partition.inputIds.push(row.inputId)
+    }
+    if (background && partitions.size) {
+      for (const row of await background.list())
+        if (transferable(row)) partitions.get(backgroundPartition(row))?.backgroundIds.push(row.obligationId)
+    }
+    for (const [key, partition] of partitions) {
+      const transfer = async () => {
+        // The boot snapshot is not authority: cover only rows still open in this exact partition.
+        const rows = partition.inputIds
+          .map((id) => this.get(id))
+          .filter((row): row is InboundRecord => !!row && transferable(row) && inboundPartition(row) === key)
+        if (!rows.length) return
+        const children: BackgroundObligation[] = []
+        for (const id of partition.backgroundIds) {
+          const row = await background!.get(id)
+          if (row && transferable(row) && backgroundPartition(row) === key) children.push(row)
+        }
+        const prepared = await this.prepareNotice(
+          rows
+            .sort((a, b) => a.acceptedAt - b.acceptedAt || a.inputId.localeCompare(b.inputId))
+            .map((row) => ({ inputId: row.inputId, generation: row.generation })),
+          partition.target,
+          children
+            .sort((a, b) => a.acceptedAt - b.acceptedAt || a.obligationId.localeCompare(b.obligationId))
+            .map((row) => ({ obligationId: row.obligationId, generation: row.generation })),
+        )
+        await this.importPrepared(outbox, prepared)
+      }
+      await (background ? background.withTargetLane(partition.target, transfer) : transfer())
     }
   }
   async validateNotice(record: RecoveryRecord): Promise<'open' | 'resolved'> {

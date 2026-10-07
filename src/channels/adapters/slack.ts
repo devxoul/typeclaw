@@ -529,6 +529,9 @@ function dropHint(reason: InboundDropReason): string {
     case 'self_author':
     case 'no_user':
     case 'slack_system_message':
+    case 'unverified_edit':
+    case 'edit_without_new_mention':
+    case 'edited_control':
       return ''
   }
 }

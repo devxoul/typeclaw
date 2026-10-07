@@ -18,7 +18,9 @@ import { createSessionWithDispose } from ${moduleUrl('../agent/index.ts')};
 import { createChannelReplyTool } from ${moduleUrl('../agent/tools/channel-reply.ts')};
 import { reloadConfig } from ${moduleUrl('../config/config.ts')};
 import { InboundJournal } from ${moduleUrl('./inbound-journal.ts')};
+import { LegacyBackgroundHandoffReader } from ${moduleUrl('./background-handoff.ts')};
 import { BackgroundObligationStore } from ${moduleUrl('./background-obligations.ts')};
+import { bootBackgroundObligations } from ${moduleUrl('../run/background-handoff-boot.ts')};
 import { createRecoveryNotice } from ${moduleUrl('./recovery-notice.ts')};
 import { RecoveryOutbox } from ${moduleUrl('./recovery-outbox.ts')};
 import { RecoveryDispatcher } from ${moduleUrl('./recovery-dispatcher.ts')};
@@ -104,7 +106,7 @@ globalThis.fetch=async(input,options)=>{
   const outbox=new RecoveryOutbox(dir,{epoch:mode});const principal=journal.list()[0].principal;
   const target={...key,chat:'other-target'};
   const child=await background.accept({parentSessionId:'other-parent',taskId:'other-child',target,accountIdentity:'proof-account',principal});
-  const admitted=await journal.admit({target,accountIdentity:'proof-account',principal,messageId:'other-input',eventKind:'message',revision:'0'});
+  const admitted=await journal.admit({target,accountIdentity:'proof-account',principal,messageId:'other-input',eventKind:'message',revision:'0',ownerSessionId:'other-parent'});
   const transfer=await journal.prepareNotice(journal.resolve([admitted.inputId]),target,[{obligationId:child.obligationId,generation:child.generation}]);await journal.importPrepared(outbox,transfer);
   const independent=await background.accept({parentSessionId:'background-parent',taskId:'background-only',target:{...key,chat:'background-target'},accountIdentity:'proof-account',principal});
   const prepared=await background.prepareNotice(independent.obligationId,independent.generation);await outbox.import(prepared.transfer);await background.ownNotice(prepared.obligationId,prepared.generation,prepared.transfer.deliveryId);
@@ -130,13 +132,13 @@ if(initial){
 }
 else{
  const outbox=new RecoveryOutbox(dir,{epoch:mode});
+ const importing=outbox.import.bind(outbox);outbox.import=async(...args)=>{if(mode==='transfer-before-import')await boundary();const r=await importing(...args);if(mode==='transfer-after-import')await boundary();return r};
+ try{await bootBackgroundObligations({inboundJournal:journal,obligations:background,outbox,inventory:new LegacyBackgroundHandoffReader(dir,{processEpoch:mode})})}catch(error){if(mode!=='frozen')throw error;await appendFile(dir+'/recovery-errors',String(error)+'\\n')}
  if(mode==='frozen'){
   const receipt=Promise.withResolvers();const delivered=outbox.delivered.bind(outbox);outbox.delivered=async(...args)=>{const r=await delivered(...args);if(r)receipt.resolve();return r};
   const dispatcher=new RecoveryDispatcher(outbox,router,{backgroundObligations:background,inboundJournal:journal,onError:async(error)=>{await appendFile(dir+'/recovery-errors',String(error)+'\\n')}});
   await dispatcher.wake();await receipt.promise;await dispatcher.stop();await journal.close();console.log('recovered');process.exit(0);
  }
- const importing=outbox.import.bind(outbox);outbox.import=async(...args)=>{if(mode==='transfer-before-import')await boundary();const r=await importing(...args);if(mode==='transfer-after-import')await boundary();return r};
- await journal.repair();await journal.importOldEpoch(outbox);
  if(mode==='rotate-blocked'){
   const blocked=Promise.withResolvers();const fail=outbox.fail.bind(outbox);outbox.fail=async(...args)=>{const r=await fail(...args);blocked.resolve();return r};
   const dispatcher=new RecoveryDispatcher(outbox,router,{backgroundObligations:background,inboundJournal:journal,onError:blocked.reject});
@@ -310,7 +312,8 @@ for (const mode of [
       const records = await new RecoveryOutbox(dir).list()
       if (terminal) expect(records).toEqual([])
       else {
-        expect(records).toHaveLength(acceptedIds.length)
+        // Inputs from one author, account and captured parent recover under a single notice.
+        expect(records).toHaveLength(1)
         for (const record of records)
           expect(record).toMatchObject({
             state: 'delivered',

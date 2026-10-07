@@ -1,9 +1,11 @@
 import { Type } from '@earendil-works/pi-ai'
 import { defineTool } from '@earendil-works/pi-coding-agent'
 
+import type { BackgroundObligationRef } from '@/channels/background-obligations'
 import { checkFalseReceipt } from '@/channels/github-false-receipt'
 import { evaluateRereviewGuard } from '@/channels/github-rereview-guard'
 import { recordResolvedThread } from '@/channels/github-review-turn-ledger'
+import type { InboundRef } from '@/channels/inbound-journal'
 import {
   containsKimiToolDelimiter,
   isNoReplySignal,
@@ -311,6 +313,24 @@ export function createChannelSendTool({
         }
       }
 
+      // An answer posted to this session's exact origin conversation fulfills the
+      // same debt channel_reply would, so capture the invoking session's owned
+      // coverage before the send (mirrors channel_reply). Any other destination —
+      // a different thread, the root instead of the origin thread, another chat,
+      // workspace or adapter — and sessions without a channel origin capture
+      // nothing: posting elsewhere must never settle, or borrow, an inbound's debt.
+      const thread = params.thread ?? null
+      const settlesOrigin =
+        origin !== undefined &&
+        sessionId !== '' &&
+        origin.adapter === adapter &&
+        origin.workspace === params.workspace &&
+        origin.chat === params.chat &&
+        origin.thread === thread
+      const backgroundCoverage = settlesOrigin
+        ? ((await router.captureBackgroundResultCoverage?.(sessionId)) ?? [])
+        : []
+      const inboundCoverage = settlesOrigin ? ((await router.captureInboundResultCoverage?.(sessionId)) ?? []) : []
       const result = await router.send({
         adapter,
         workspace: params.workspace,
@@ -344,9 +364,20 @@ export function createChannelSendTool({
           decision: 'left-open',
         })
       }
-      const details: { ok: boolean; error?: string; messageId?: string; messageIds?: readonly string[] } = result.ok
+      // Captured refs travel only with an actual landed send; the router's
+      // after-tool hook settles exactly these generations. A status/progress body
+      // is still returned here and left owed by that hook.
+      const details: {
+        ok: boolean
+        error?: string
+        messageId?: string
+        messageIds?: readonly string[]
+        backgroundCoverage?: BackgroundObligationRef[]
+        inboundCoverage?: InboundRef[]
+      } = result.ok
         ? {
             ok: true,
+            ...(settlesOrigin ? { backgroundCoverage, inboundCoverage } : {}),
             ...(result.messageId !== undefined ? { messageId: result.messageId } : {}),
             ...(result.messageIds !== undefined ? { messageIds: result.messageIds } : {}),
           }

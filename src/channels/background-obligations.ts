@@ -9,7 +9,7 @@ import { createLegacyRecoveryNotice } from './background-handoff'
 import type { LegacyBackgroundHandoffReader } from './background-handoff'
 import { parseRecoveryRecord } from './continuity-types'
 import type { RecoveryRecord } from './continuity-types'
-import { createRecoveryNotice } from './recovery-notice'
+import { createRecoveryNotice, sameRecoveryPrincipal } from './recovery-notice'
 import type { RecoveryOutbox } from './recovery-outbox'
 import { channelKeyId, type ChannelKey } from './types'
 
@@ -155,7 +155,7 @@ function parse(value: unknown): BackgroundObligation {
     if (
       channelKeyId(row.transfer.target) !== channelKeyId(row.target) ||
       row.transfer.accountIdentity !== row.accountIdentity ||
-      JSON.stringify(row.transfer.principal) !== JSON.stringify(row.principal) ||
+      !sameRecoveryPrincipal(row.transfer.principal, row.principal) ||
       !row.transfer.covers.some(
         (cover) =>
           (cover.store === 'background' && cover.id === row.obligationId && cover.generation <= row.generation) ||
@@ -662,7 +662,7 @@ export class BackgroundObligationStore {
         !row ||
         channelKeyId(row.target) !== channelKeyId(record.target) ||
         row.accountIdentity !== record.accountIdentity ||
-        JSON.stringify(row.principal) !== JSON.stringify(record.principal) ||
+        !sameRecoveryPrincipal(row.principal, record.principal) ||
         row.transfer?.deliveryId !== record.deliveryId
       )
         throw new Error('Recovery coverage conflicts with background authority')

@@ -156,6 +156,10 @@ When a standing block also has to clear, one thread is designated the round's ca
 
 Requires `pull_request.synchronize` in `eventAllowlist`. It is in the shipped defaults, but a pinned `eventAllowlist` that omits it silently disables push re-review — `doctor` warns when that happens.
 
+### Missed review catch-up
+
+Each adapter start, including tunnel-driven restarts, scans open PRs in `repos[]` in the background and replays those that still need the bot's review through the normal router path. It does not block adapter start. A PR is replayed at most once per cooldown: the adapter reserves a durable cooldown marker before routing and keeps it only when the router returns `accepted` or `duplicate`. An `observed`, `denied` or `control` receipt, or a routing failure, releases that attempt's marker so a later pass retries the PR; the failure is logged and the remaining PRs in the repository still run. A release removes only the marker this attempt created, never a newer attempt's. Stopping the adapter before a route is dispatched releases the reservation; stopping it afterward leaves the decision to that route's receipt and does not delay a replacement adapter. If the release itself cannot be persisted, the log says so and the PR stays in cooldown.
+
 ## Webhook lifecycle
 
 - Hooks auto-register for each entry in `repos[]` on start.

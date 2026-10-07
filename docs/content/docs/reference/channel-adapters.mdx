@@ -99,7 +99,7 @@ When a message arrives:
 1. The adapter routes the exact `(adapter, workspace, chat, thread)` coordinate with its authenticated account identity, external message identity, event kind and revision.
 2. The channel router gates response permission and engagement ([/concepts/permissions-model](/docs/concepts/permissions-model)); denied, observed and control traffic creates no response obligation.
 3. An engaged input is synced to the inbound journal before an `accepted {inputId, generation}` receipt, publication or queueing. A replay returns `duplicate {inputId, outcome}`; non-engaged classification returns `observed`, `denied` or `control`.
-4. The router claims stable queued IDs before prompting. Outgoing tool calls (`channel_send`, `channel_reply`, `channel_edit`) flow back through the adapter.
+4. The router claims stable queued IDs before prompting. Outgoing tool calls (`channel_send`, `channel_reply`, `channel_edit`) flow back through the adapter. A delivered substantive `channel_send` to the turn's exact origin (same adapter, workspace, chat and thread) settles that turn's owed response without ending the turn; progress/status sends and sends elsewhere do not.
 
 The router never blocks on a slow adapter. Each adapter owns its own outbound queue.
 
@@ -108,11 +108,17 @@ promise. Ack-first transports, including GitHub webhooks, can acknowledge before
 durable routing; events the runtime never received while down depend on each
 platform's replay. Instagram advances its local checkpoint only after durable
 acceptance/duplicate or completed non-engaged classification, never after a
-routing write failure. A Slack mention-adding edit carries its own revision, and
-GitHub synthetic review rounds carry distinct round/commit identities.
+routing write failure. Slack engages at most once per message: an observed
+message can engage once through an edit that adds a mention, and later
+deliveries of an admitted message are duplicates whatever their revision or
+thread. GitHub synthetic review rounds carry distinct round/commit identities,
+and the open-PR catch-up retries a PR whose replay was not `accepted` or
+`duplicate`.
 
-Interrupted accepted work transfers to a fixed runtime-notice outbox on boot;
-it is never automatically replayed. Notices are at least once, with a possible
+Interrupted accepted work transfers to a fixed runtime-notice outbox on boot.
+Inbound requests and background work that share the exact target, account,
+permission principal and captured parent are grouped into one notice. The work
+is never automatically replayed. Notices are at least once, with a possible
 duplicate after remote success but before local receipt commit. Corrupt journal
 bytes are preserved and dependent background/inbound recovery is frozen pending
 operator repair. See [durable admission and recovery](/docs/internals/engagement#durable-inbound-admission-and-turn-ownership).

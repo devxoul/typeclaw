@@ -1,19 +1,36 @@
 import { consumeRestartHandoff } from '@/agent/restart-handoff'
 import type { LegacyBackgroundHandoffReader } from '@/channels/background-handoff'
 import type { BackgroundObligationStore } from '@/channels/background-obligations'
+import type { InboundJournal } from '@/channels/inbound-journal'
 import { loadChannelSessions } from '@/channels/persistence'
 import type { RecoveryOutbox } from '@/channels/recovery-outbox'
 import type { ChannelRouter, RestartReservation } from '@/channels/router'
 import { channelKeyId, type ChannelKey } from '@/channels/types'
 
-/** Migrate source authority before adapters can dispatch; never replay child work. */
+/**
+ * Transfer interrupted source authority at boot, before adapters or the dispatcher run; never replay work.
+ * Committed mixed decisions are repaired first, issued transfers re-import unchanged, inbound-seeded
+ * partitions absorb their compatible children, and only then do legacy inventory and unmatched
+ * children take their independent notices. A failure freezes dependent background progress
+ * (apparently valid child JSON is not proof of independence from an unreadable journal) and is
+ * rethrown; the caller keeps adapters running and dependent notices fail closed at dispatch.
+ */
 export async function bootBackgroundObligations(options: {
+  inboundJournal: InboundJournal
   obligations: BackgroundObligationStore
   outbox: RecoveryOutbox
   inventory: LegacyBackgroundHandoffReader
 }): Promise<void> {
-  await options.obligations.migrateLegacy(options.inventory, options.outbox)
-  await options.obligations.importOldEpoch(options.outbox)
+  try {
+    await options.inboundJournal.initialize()
+    await options.inboundJournal.repair()
+    await options.inboundJournal.importOldEpoch(options.outbox)
+    await options.obligations.migrateLegacy(options.inventory, options.outbox)
+    await options.obligations.importOldEpoch(options.outbox)
+  } catch (error) {
+    options.obligations.setFrozen(error)
+    throw error
+  }
 }
 
 /** Ordinary #291 restart greetings retain their reservation/TTL behavior. */

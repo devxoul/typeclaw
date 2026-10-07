@@ -7,17 +7,20 @@ import type { InboundAttachment, InboundMessage } from '@/channels/types'
 import { encodeSlackReactionRef } from './slack-bot-reactions'
 import { hasSlackMessageShareAttachments } from './slack-bot-reference'
 import { slackTsToMillis } from './slack-bot-time'
-import { normalizeSlackInbound, slackInboundRevision } from './slack-inbound-revision'
+import { addressesSlackSelf, admitSlackInbound, type SlackInboundSource } from './slack-inbound-revision'
 
 export type SlackInboundMessageEvent = SlackSocketModeMessageEvent
 export type SlackInboundAppMentionEvent = SlackSocketModeAppMentionEvent
 
 export type InboundDropReason =
   | 'self_author' // event.user === botUserId; we never route our own messages back to ourselves
-  | 'no_user' // event has no `user` field (e.g. system messages: channel_join, message_changed)
+  | 'no_user' // event has no `user` field (e.g. system messages: channel_join)
   | 'slack_system_message' // non-replyable Slack message subtype events (e.g. channel_topic)
   | 'empty_text' // event has neither text nor files — nothing for the agent to act on
   | 'pre_connect' // bot identity is not known yet, so mention/self/reply classification cannot be trusted
+  | 'unverified_edit' // edit without provable previous body / valid edit marker, or a flattened edited copy
+  | 'edit_without_new_mention' // edit that does not newly address the bot (typo fix, unchanged/removed mention)
+  | 'edited_control' // edit-derived command or claim code; edits are never control traffic
 
 export type InboundClassification =
   | { kind: 'drop'; reason: InboundDropReason }
@@ -35,6 +38,9 @@ export type SlackInboundContext = {
   // alias-driven thread anchoring". The router's `computeSelfAliases`
   // is the source of truth; the adapter just forwards it.
   selfAliases?: readonly string[]
+  // Listener that delivered the event. Only an `app_mention` delivery may use
+  // its `edited` marker as a first-engagement fallback; omitted means 'message'.
+  source?: SlackInboundSource
 }
 
 // All decision logic for "should this Socket Mode message event be routed to
@@ -48,7 +54,10 @@ export function classifyInbound(
   _config: ChannelAdapterConfig,
   context: SlackInboundContext,
 ): InboundClassification {
-  event = normalizeSlackInbound(event)
+  // Edits are gated on the raw envelope before normalization drops its subtype.
+  const admission = admitSlackInbound(event, context.botUserId, context.source)
+  if (admission.kind === 'drop') return { kind: 'drop', reason: admission.reason }
+  event = admission.event
   // Self-drop is the hard floor: never route our own messages back to
   // ourselves. The check requires `botUserId` (post-auth.test); before that,
   // fail closed below because mention, reply, and self classification all
@@ -57,7 +66,7 @@ export function classifyInbound(
     return { kind: 'drop', reason: 'self_author' }
   }
   if (event.user === undefined || event.user === '') {
-    // System events (channel_join, message_changed, …) have no `user`;
+    // System events (channel_join, …) have no `user`;
     // they were also the ONLY way previously to flag bot_message subtype
     // events with no user. Now that we accept peer bots, a `bot_message`
     // subtype WITH a user (rare, but happens for legacy integrations) is
@@ -91,8 +100,7 @@ export function classifyInbound(
   // both are an invitation to participate. Treating them identically also
   // means the existing 'mention' trigger in typeclaw.json catches both
   // without any new config surface.
-  const hasGroupMention = GROUP_MENTION_PATTERN.test(rawText)
-  const isBotMention = hasGroupMention || rawText.includes(`<@${context.botUserId}>`)
+  const isBotMention = addressesSlackSelf(rawText, context.botUserId)
   // Top-level alias addressing (e.g. "Momo!" / "@Momo" by name) is engagement-equivalent
   // to a `<@bot>` mention (see engagement.ts: alias is unconditional and
   // ranks alongside explicit triggers). Anchor `thread` on the inbound
@@ -152,7 +160,8 @@ export function classifyInbound(
       externalMessageId: event.ts,
       accountIdentity: `slack-bot:${context.teamId}:${context.botUserId}`,
       eventKind: 'message',
-      revision: slackInboundRevision(event),
+      // One engagement per Slack message: edits never mint a new revision.
+      revision: 'original',
       reactionRef: encodeSlackReactionRef({ channel: event.channel, ts: event.ts }),
       authorId: event.user,
       authorName: event.user,
@@ -176,13 +185,6 @@ export function isRouteableSlackMessageSubtype(subtype: string | undefined): boo
 // every distinct id out of the text — duplicates collapse so the caller
 // can do a clean `includes()` check against the bot's own id.
 const MENTION_PATTERN = /<@([UW][A-Z0-9]+)(?:\|[^>]*)?>/g
-
-// Slack's group mention markup uses `!` (not `@`) and may carry an optional
-// `|label` suffix, same as user mentions. We deliberately exclude the
-// `<!subteam^ID>` form — engaging on every user-group ping would require
-// knowing which subteams the bot is a member of, which is outside what
-// Socket Mode events surface to us.
-const GROUP_MENTION_PATTERN = /<!(?:here|channel|everyone)(?:\|[^>]*)?>/
 
 function extractMentionedUserIds(text: string): string[] {
   const seen = new Set<string>()

@@ -1,15 +1,31 @@
 import { describe, expect, test } from 'bun:test'
+import { mkdtemp, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
 import type { SlackListener, SlackRTMMessageEvent } from 'agent-messenger/slack'
 
+import type { AgentSession } from '@/agent'
+import { BackgroundObligationStore } from '@/channels/background-obligations'
+import { InboundJournal } from '@/channels/inbound-journal'
 import type { MembershipResolver } from '@/channels/membership'
-import type { ChannelRouter } from '@/channels/router'
+import { createChannelRouter, type ChannelRouter } from '@/channels/router'
 import { channelsSchema } from '@/channels/schema'
 import type { InboundMessage, OutboundCallback } from '@/channels/types'
+import { noopPermissionService } from '@/permissions'
 import type { SlackAccountRecord } from '@/secrets/schema'
 
 import { createSlackAdapter, createSlackHistoryCallback, type SlackAdapterLogger } from './slack'
 import type { SlackInboundMessageEvent } from './slack-classify'
+
+// Accepts a turn and stays idle so router admission is observable offline.
+class IdleSession {
+  agent = { streamFunction: () => undefined, abort: () => {} }
+  prompt = async (): Promise<void> => {}
+  abort = async (): Promise<void> => {}
+  dispose = (): void => {}
+  subscribe = (): (() => void) => () => {}
+}
 
 const config = channelsSchema.parse({ slack: {} }).slack!
 
@@ -225,6 +241,94 @@ describe('createSlackAdapter', () => {
     expect(listener.stopped).toBe(true)
     expect(r.unregistered).toContain('outbound:slack')
     expect(r.unregistered).toContain('remove-reaction:slack')
+  })
+
+  test('real router and journal engage each RTM message at most once across edits and restarts', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'slack-edit-ingress-'))
+    const changed = (previousText: string, text: string, base: SlackRTMMessageEvent) => ({
+      type: 'message',
+      subtype: 'message_changed',
+      hidden: true,
+      channel: base.channel,
+      ts: '1770000099.000001',
+      message: { ...base, text, edited: { user: base.user, ts: '1770000060.000000' } },
+      previous_message: { ...base, text: previousText },
+    })
+    const open = async () => {
+      const background = new BackgroundObligationStore(dir)
+      const journal = new InboundJournal(dir, { backgroundObligations: background, epoch: background.epoch })
+      await journal.initialize()
+      const live = createChannelRouter({
+        agentDir: dir,
+        inboundJournal: journal,
+        backgroundObligations: background,
+        permissions: { ...noopPermissionService, has: () => true },
+        logger: { info() {}, warn() {}, error() {} },
+        configForAdapter: () => config,
+        createSessionForChannel: async () => ({
+          session: new IdleSession() as unknown as AgentSession,
+          sessionId: `ses_${crypto.randomUUID()}`,
+          dispose: async () => {},
+        }),
+      })
+      const receipts: string[] = []
+      const route = live.route.bind(live)
+      live.route = async (message) => {
+        const receipt = await route(message)
+        receipts.push(`${message.externalMessageId}=${receipt.kind}`)
+        return receipt
+      }
+      const listener = new FakeListener()
+      const adapter = createSlackAdapter({
+        router: live,
+        configRef: () => config,
+        logger: logger(),
+        credentialsStore: { getAccount: async () => account() },
+        createClient: () => fakeClient(),
+        createListener: () => listener as unknown as SlackListener,
+      })
+      await adapter.start()
+      return {
+        receipts,
+        emit: (event: unknown) => listener.emit('message', event),
+        close: async () => {
+          await adapter.stop()
+          const rows = journal.list().flatMap((row) => row.reference?.messageId ?? [])
+          await live.stop()
+          await journal.close()
+          return rows.sort()
+        },
+      }
+    }
+    const base = { type: 'message', channel: 'C0123456789', user: 'UUSER' } as const
+    const engaged = { ...base, ts: '1770000000.000100', text: '<@USELF> please chek' }
+    const dm = { ...base, channel: 'D0123456789', ts: '1770000001.000100', text: '고마워여' }
+    const observed = { ...base, ts: '1770000002.000100', text: '<@UOTHER> 확인 부탁' }
+    try {
+      const first = await open()
+      first.emit(engaged)
+      first.emit(dm)
+      first.emit(observed)
+      expect(await first.close()).toEqual([engaged.ts, dm.ts])
+
+      const restarted = await open()
+      restarted.emit(changed('<@USELF> please chek', 'please check', engaged))
+      restarted.emit(changed('please check', '<@USELF> please check', engaged))
+      restarted.emit(changed(dm.text, '고마워요', dm))
+      restarted.emit(changed(dm.text, '<@USELF> 고마워요', dm))
+      restarted.emit({ ...dm, text: '<@USELF> 고마워요', edited: { user: 'UUSER', ts: '1770000060.000000' } })
+      restarted.emit(changed(observed.text, '/help <@USELF>', observed))
+      restarted.emit(changed(observed.text, '<@UOTHER> <@USELF> 확인 부탁', observed))
+      const rows = await restarted.close()
+      expect(restarted.receipts.sort()).toEqual([
+        `${engaged.ts}=duplicate`,
+        `${dm.ts}=duplicate`,
+        `${observed.ts}=accepted`,
+      ])
+      expect(rows).toEqual([engaged.ts, dm.ts, observed.ts])
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
   })
 
   test('subtype-less RTM file messages reach the router with the same attachment descriptors as history', async () => {

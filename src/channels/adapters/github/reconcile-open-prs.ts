@@ -4,7 +4,11 @@ import type { InboundMessage, RouteReceipt } from '@/channels/types'
 import { describeError } from '../../describe-error'
 import type { GithubAuthContext } from './auth'
 import { GITHUB_API_BASE, githubJsonHeaders } from './auth-pat'
-import { DEFAULT_RECONCILE_COOLDOWN_MS, type ReconcileCooldownStore } from './reconcile-cooldown-store'
+import {
+  DEFAULT_RECONCILE_COOLDOWN_MS,
+  type ReconcileCooldownStore,
+  type ReconcileReplayReservation,
+} from './reconcile-cooldown-store'
 import type { TeamMembershipChecker } from './team-membership'
 
 // Catches up on review work that a live webhook delivery missed. The github
@@ -36,6 +40,8 @@ export type ReconcileOpenPrsOptions = {
   fetchImpl?: typeof fetch
   // When provided, a PR that still needs review is replayed at most once per
   // `cooldownMs`, keyed durably by `repo#prId` so restarts don't re-trigger it.
+  // Only a replay the router durably admitted keeps that cooldown; a rejected
+  // or non-admitted replay releases it so the next pass retries the PR.
   // Omitted in tests that assert the raw replay decision.
   cooldownStore?: ReconcileCooldownStore
   cooldownMs?: number
@@ -46,6 +52,8 @@ export type ReconcileOpenPrsOptions = {
   isCancelled?: () => boolean
 }
 
+// `replayed` counts only replays the router durably admitted (accepted, or a
+// duplicate of an identity it had already admitted).
 export type ReconcileOutcome = { repo: string; scanned: number; replayed: number } | { repo: string; error: string }
 
 const BOT_LOGIN_SUFFIX = '[bot]'
@@ -101,15 +109,19 @@ async function reconcileRepo(
     const needs = await prNeedsReview({ pr, options, target, token, selfLogin, decoyLogin, fetchImpl })
     if (!needs) continue
     if (options.isCancelled?.() === true) return { repo, scanned: prs.length, replayed }
+    let reservation: ReconcileReplayReservation | null = null
     if (cooldownStore !== undefined) {
-      if (cooldownStore.isCoolingDown(repo, pr.id, now(), cooldownMs)) continue
+      // Decide only from the store's serialized latest state, never from this
+      // instance's cached view: another lifecycle may have released (or taken)
+      // the PR's reservation since that view was read. Persisting the
+      // reservation before routing means a failed write throws, so we skip the
+      // route rather than replay a PR with no durable record.
       try {
-        // Persist the marker before routing: if the write fails the marker is
-        // rolled back and this throws, so we skip the route rather than replay a
-        // PR with no durable record (a restart would otherwise replay it again).
-        if (!(await cooldownStore.markReplayed(repo, pr.id, now(), options.isCancelled))) {
-          return { repo, scanned: prs.length, replayed }
-        }
+        reservation = await cooldownStore.markReplayed(repo, pr.id, {
+          now: now(),
+          cooldownMs,
+          isCancelled: options.isCancelled,
+        })
       } catch (err) {
         options.logger.warn(
           `[github] reconcile ${repo}: skipping PR #${pr.number} replay, cooldown persist failed: ${describeError(
@@ -118,19 +130,72 @@ async function reconcileRepo(
         )
         continue
       }
+      // null: cancelled while reserving, or another attempt's reservation is
+      // still cooling down in the latest persisted state.
+      if (reservation === null) {
+        if (options.isCancelled?.() === true) return { repo, scanned: prs.length, replayed }
+        continue
+      }
     }
     if (options.isCancelled?.() === true) {
-      await cooldownStore?.clear(repo, pr.id)
+      // Stopped between reserving and dispatching: the replay never launches,
+      // so release this attempt's reservation — never a newer one's marker.
+      await releaseReservation(options, repo, pr, reservation)
       return { repo, scanned: prs.length, replayed }
     }
-    await options.route(buildSyntheticInbound(pr, target))
-    replayed += 1
+    if (await replayPr(options, target, pr, reservation)) replayed += 1
   }
 
   if (cooldownStore !== undefined && options.isCancelled?.() !== true) {
     await cooldownStore.prune(repo, new Set(prs.map((pr) => pr.id)), now())
   }
   return { repo, scanned: prs.length, replayed }
+}
+
+// Routes one PR's replay in isolation: a rejected route or a receipt that did
+// not durably admit the replay releases only this PR's reservation, and the pass
+// moves on to the next PR. Once routed, the receipt is awaited even if the
+// adapter stops meanwhile: accepted (or duplicate of an identity the router
+// already admitted) keeps the cooldown durable. A rejected local route may have
+// committed its admission before failing; releasing is still safe because the
+// router dedupes the retry against that admission.
+async function replayPr(
+  options: ReconcileOpenPrsOptions,
+  target: RepoTarget,
+  pr: OpenPr,
+  reservation: ReconcileReplayReservation | null,
+): Promise<boolean> {
+  const repo = `${target.owner}/${target.repo}`
+  let receipt: RouteReceipt
+  try {
+    receipt = await options.route(buildSyntheticInbound(pr, target))
+  } catch (err) {
+    options.logger.warn(`[github] reconcile ${repo}: PR #${pr.number} replay failed: ${describeError(err)}`)
+    await releaseReservation(options, repo, pr, reservation)
+    return false
+  }
+  if (receipt.kind === 'accepted' || receipt.kind === 'duplicate') return true
+  options.logger.info(`[github] reconcile ${repo}: PR #${pr.number} replay not admitted (${receipt.kind})`)
+  await releaseReservation(options, repo, pr, reservation)
+  return false
+}
+
+async function releaseReservation(
+  options: ReconcileOpenPrsOptions,
+  repo: string,
+  pr: OpenPr,
+  reservation: ReconcileReplayReservation | null,
+): Promise<void> {
+  if (options.cooldownStore === undefined || reservation === null) return
+  try {
+    await options.cooldownStore.rollbackReplay(repo, pr.id, reservation.replayId)
+  } catch (err) {
+    options.logger.warn(
+      `[github] reconcile ${repo}: PR #${pr.number} launch cooldown NOT released, so it retries only after the cooldown expires: ${describeError(
+        err,
+      )}`,
+    )
+  }
 }
 
 async function prNeedsReview(input: {

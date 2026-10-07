@@ -1,12 +1,19 @@
-import { describe, expect, spyOn, test } from 'bun:test'
+import { describe, expect, test } from 'bun:test'
+import { mkdtemp, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
 import type { SlackBotClient, SlackBotListener, SlackFile, SlackMessage } from 'agent-messenger/slackbot'
 
+import type { AgentSession } from '@/agent'
+import { BackgroundObligationStore } from '@/channels/background-obligations'
+import { InboundJournal } from '@/channels/inbound-journal'
 import { MEMBERSHIP_CACHE_TRANSIENT_TTL_MS } from '@/channels/membership'
-import type { ChannelRouter } from '@/channels/router'
+import { createChannelRouter, type ChannelRouter } from '@/channels/router'
 import { channelsSchema, defaultHistoryConfig, type ChannelAdapterConfig } from '@/channels/schema'
 import type { ChannelKey, FetchHistoryResult, HistoryCallback, OutboundMessage } from '@/channels/types'
 import { SLACK_APP_MANIFEST } from '@/cli/ui'
+import { noopPermissionService } from '@/permissions'
 
 import {
   createOutboundCallback,
@@ -23,6 +30,7 @@ import {
   promoteAppMentionToMessage,
   SLACK_HISTORY_LIMIT_MAX,
   SLACK_SLASH_COMMAND_NAMES,
+  type SlackBotAdapter,
 } from './slack-bot'
 import { classifyInbound, type SlackInboundAppMentionEvent } from './slack-bot-classify'
 import { createSlackDedupe } from './slack-bot-dedupe'
@@ -42,6 +50,15 @@ class FakeSlackBotListener {
   emit(event: string, value: unknown): void {
     for (const handler of this.handlers.get(event) ?? []) handler(value)
   }
+}
+
+// Accepts a turn and stays idle so router admission is observable offline.
+class IdleSession {
+  agent = { streamFunction: () => undefined, abort: () => {} }
+  prompt = async (): Promise<void> => {}
+  abort = async (): Promise<void> => {}
+  dispose = (): void => {}
+  subscribe = (): (() => void) => () => {}
 }
 
 function lifecycleRouter(): ChannelRouter {
@@ -1011,74 +1028,331 @@ describe('slack-bot promoteAppMentionToMessage', () => {
   })
 })
 
-describe('slack-bot edited mention ingress', () => {
-  test('routes an added mention once across concurrent message/app_mention deliveries', async () => {
-    const listener = new FakeSlackBotListener()
-    const routed: Array<{ text: string; isBotMention: boolean }> = []
-    const errors: string[] = []
-    const firstRoute = Promise.withResolvers<void>()
-    const router = lifecycleRouter()
-    router.route = async (payload) => {
-      routed.push(payload)
-      firstRoute.resolve()
-      return { kind: 'observed' }
-    }
-    const adapter = createSlackBotAdapter({
-      router,
-      configRef: () => channelsSchema.parse({ 'slack-bot': {} })['slack-bot']!,
-      token: 'xoxb-test',
-      appToken: 'xapp-test',
-      logger: {
-        info: () => {},
-        warn: () => {},
-        error: (message) => {
-          errors.push(message)
+// Socket Mode deliveries as Slack sends them for an edit: the raw
+// `message_changed` envelope carries both bodies, while app_mention or
+// flattened copies only carry the new body.
+const EDITED_MESSAGE = {
+  type: 'message',
+  channel: 'C0CHANNEL',
+  channel_type: 'channel',
+  user: 'UALICE',
+  ts: '1700000000.000100',
+  client_msg_id: 'cmid-1',
+  text: '질문입니다',
+}
+// Matches the captured edited app_mention shape (slack-go issue #961): the
+// edit marker is the only edit signal and its ts ends in `.000000`.
+const EDIT_TS = '1700000060.000000'
+
+type SlackMessageFixture = Record<string, unknown> & { channel: string; ts: string; user: string; text: string }
+
+function messageChanged(
+  previousText: string,
+  text: string,
+  base: SlackMessageFixture = EDITED_MESSAGE,
+): Record<string, unknown> {
+  return {
+    type: 'message',
+    subtype: 'message_changed',
+    hidden: true,
+    channel: base.channel,
+    channel_type: base.channel_type,
+    ts: '1700000099.000001',
+    event_ts: '1700000099.000001',
+    message: { ...base, text, edited: { user: base.user, ts: EDIT_TS } },
+    previous_message: { ...base, text: previousText },
+  }
+}
+
+// `marked: false` is a synthetic robustness fixture, not a live capture: Slack
+// does not guarantee `edited` on an edit-triggered app_mention.
+function appMention(base: SlackMessageFixture, text: string, marked: boolean): Record<string, unknown> {
+  const { channel_type: _channelType, ...rest } = base
+  return {
+    ...rest,
+    type: 'app_mention',
+    text,
+    event_ts: base.ts,
+    ...(marked ? { edited: { user: base.user, ts: EDIT_TS } } : {}),
+  }
+}
+
+function editIngressAdapter(
+  router: ChannelRouter,
+  listener: FakeSlackBotListener,
+  posted: string[] = [],
+): SlackBotAdapter {
+  return createSlackBotAdapter({
+    router,
+    configRef: () => channelsSchema.parse({ 'slack-bot': {} })['slack-bot']!,
+    token: 'xoxb-test',
+    appToken: 'xapp-test',
+    logger: { info: () => {}, warn: () => {}, error: () => {} },
+    createClient: () =>
+      ({
+        login: async () => {},
+        testAuth: async () => ({ user_id: 'UBOT', team_id: 'T0ACME' }),
+        postMessage: async (_chat: string, text: string) => {
+          posted.push(text)
+          return { ts: `1700009999.${String(posted.length).padStart(6, '0')}` }
         },
-      },
-      createClient: () =>
-        ({
-          login: async () => {},
-          testAuth: async () => ({ user_id: 'UBOT', team_id: 'T0ACME' }),
-        }) as unknown as SlackBotClient,
-      createListener: () => listener as unknown as SlackBotListener,
-      fetchImpl: (async () =>
-        new Response(JSON.stringify({ ok: false, error: 'missing_scope' }))) as unknown as typeof fetch,
-    })
-    const original = {
-      type: 'message',
-      channel: 'C0CHANNEL',
-      channel_type: 'channel',
-      user: 'UALICE',
-      ts: '1700000000.000100',
-      client_msg_id: 'cmid-1',
-      text: '질문입니다',
-    }
-    const emit = (source: string, event: unknown): void => listener.emit(source, { ack: () => {}, event })
-    const fetchSpy = spyOn(globalThis, 'fetch').mockImplementation(
-      (async () => new Response(JSON.stringify({ ok: false, error: 'missing_scope' }))) as unknown as typeof fetch,
-    )
-    try {
-      await adapter.start()
-      emit('message', original)
-      await firstRoute.promise
-      const edited = { ...original, text: '<@UBOT> 질문입니다' }
-      emit('message', {
-        type: 'message',
-        subtype: 'message_changed',
-        channel: original.channel,
-        ts: '1700000001.000100',
-        message: edited,
-      })
-      emit('app_mention', { ...edited, type: 'app_mention' })
-      emit('message', edited)
-      emit('app_mention', { ...edited, type: 'app_mention' })
+      }) as unknown as SlackBotClient,
+    createListener: () => listener as unknown as SlackBotListener,
+    fetchImpl: (async () =>
+      new Response(JSON.stringify({ ok: false, error: 'missing_scope' }))) as unknown as typeof fetch,
+  })
+}
+
+function emitTo(listener: FakeSlackBotListener): (source: string, event: unknown) => void {
+  return (source, event) => listener.emit(source, { ack: () => {}, event })
+}
+
+type SlackBotRuntime = {
+  // `${externalMessageId}=${receipt kind}` for every delivery that reached the router.
+  receipts: string[]
+  commands: string[]
+  claims: string[]
+  posted: string[]
+  emit: (source: string, event: unknown) => void
+  // Drains ingress, then returns the durable admissions' message ids.
+  close: () => Promise<string[]>
+}
+
+// Real slack-bot adapter -> real router -> real inbound journal in `dir`.
+// Reopening the same dir is a process restart: every in-memory cache is cold.
+async function openSlackBotRuntime(dir: string): Promise<SlackBotRuntime> {
+  const background = new BackgroundObligationStore(dir)
+  const journal = new InboundJournal(dir, { backgroundObligations: background, epoch: background.epoch })
+  await journal.initialize()
+  const claims: string[] = []
+  const router = createChannelRouter({
+    agentDir: dir,
+    inboundJournal: journal,
+    backgroundObligations: background,
+    permissions: { ...noopPermissionService, has: () => true },
+    logger: { info() {}, warn() {}, error() {} },
+    configForAdapter: () => ({
+      enabled: true,
+      engagement: { trigger: ['mention', 'dm'], stickiness: 'off' },
+      history: defaultHistoryConfig(),
+    }),
+    claimHandler: async (input) => {
+      claims.push(input.text)
+      return { kind: 'fallthrough' }
+    },
+    createSessionForChannel: async () => ({
+      session: new IdleSession() as unknown as AgentSession,
+      sessionId: `ses_${crypto.randomUUID()}`,
+      dispose: async () => {},
+    }),
+  })
+  const receipts: string[] = []
+  const route = router.route.bind(router)
+  router.route = async (message) => {
+    const receipt = await route(message)
+    receipts.push(`${message.externalMessageId}=${receipt.kind}`)
+    return receipt
+  }
+  const commands: string[] = []
+  const executeCommand = router.executeCommand.bind(router)
+  router.executeCommand = async (key, name, options) => {
+    commands.push(name)
+    return executeCommand(key, name, options)
+  }
+  const posted: string[] = []
+  const listener = new FakeSlackBotListener()
+  const adapter = editIngressAdapter(router, listener, posted)
+  await adapter.start()
+  return {
+    receipts,
+    commands,
+    claims,
+    posted,
+    emit: emitTo(listener),
+    close: async () => {
       await adapter.stop()
-      expect(errors).toEqual([])
-      expect(routed.map(({ isBotMention }) => isBotMention)).toEqual([false, true])
-      expect(routed[1]?.text).toContain('질문입니다')
-    } finally {
-      fetchSpy.mockRestore()
+      const rows = journal.list().flatMap((row) => row.reference?.messageId ?? [])
+      await router.stop()
+      await journal.close()
+      return rows.sort()
+    },
+  }
+}
+
+async function withRuntimeDir(run: (dir: string) => Promise<void>): Promise<void> {
+  const dir = await mkdtemp(join(tmpdir(), 'slack-bot-edit-ingress-'))
+  try {
+    await run(dir)
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+}
+
+describe('slack-bot edited mention ingress', () => {
+  test('a never-engaged message engages once on a mention-adding edit in every twin order, with or without a restart between twins', async () => {
+    // Mentioning someone else keeps the original observed, not engaged.
+    const original = { ...EDITED_MESSAGE, text: '<@UOTHER> 질문입니다' }
+    const added = '<@UOTHER> <@UBOT> 질문입니다'
+    for (const rawFirst of [true, false]) {
+      for (const marked of [true, false]) {
+        for (const restartBetween of [false, true]) {
+          const label = `rawFirst=${rawFirst} marked=${marked} restart=${restartBetween}`
+          await withRuntimeDir(async (dir) => {
+            const twins: Array<[string, unknown]> = [
+              ['message', messageChanged(original.text, added, original)],
+              ['app_mention', appMention(original, added, marked)],
+            ]
+            if (!rawFirst) twins.reverse()
+            const first = await openSlackBotRuntime(dir)
+            first.emit('message', original)
+            first.emit(...twins[0]!)
+            let receipts = first.receipts
+            let rows: string[]
+            if (restartBetween) {
+              await first.close()
+              const second = await openSlackBotRuntime(dir)
+              second.emit(...twins[1]!)
+              rows = await second.close()
+              receipts = [...first.receipts, ...second.receipts]
+            } else {
+              first.emit(...twins[1]!)
+              rows = await first.close()
+            }
+            expect([label, receipts.filter((r) => r.endsWith('=accepted'))]).toEqual([
+              label,
+              [`${original.ts}=accepted`],
+            ])
+            expect([label, rows]).toEqual([label, [original.ts]])
+          })
+        }
+      }
     }
+  })
+
+  test('an engaged message never re-engages through a later mention edit, even when its routing thread changes', async () => {
+    await withRuntimeDir(async (dir) => {
+      // Solo-human channel root engages at thread=null; the mention edit anchors thread=ts.
+      const root = { ...EDITED_MESSAGE, text: 'please check the deploy' }
+      const dm = {
+        ...EDITED_MESSAGE,
+        channel: 'D0DM',
+        channel_type: 'im',
+        ts: '1700000002.000100',
+        client_msg_id: 'cmid-2',
+        text: '고마워여',
+      }
+      const mentioned = { ...EDITED_MESSAGE, ts: '1700000003.000100', client_msg_id: 'cmid-3', text: '<@UBOT> 확인' }
+      const edits: Array<[string, unknown]> = [
+        ['message', messageChanged(root.text, `<@UBOT> ${root.text}`, root)],
+        ['app_mention', appMention(root, `<@UBOT> ${root.text}`, true)],
+        ['message', messageChanged(dm.text, '<@UBOT> 고마워요', dm)],
+        ['message', messageChanged(dm.text, '<@UBOT> 고마워요', { ...dm, thread_ts: dm.ts })],
+        ['message', messageChanged(mentioned.text, '확인', mentioned)],
+        ['message', messageChanged('확인', '<@UBOT> 확인', mentioned)],
+        ['app_mention', appMention(mentioned, '<@UBOT> 확인!', false)],
+      ]
+      const first = await openSlackBotRuntime(dir)
+      for (const original of [root, dm, mentioned]) first.emit('message', original)
+      const originals = [root.ts, dm.ts, mentioned.ts].sort()
+      expect(await first.close()).toEqual(originals)
+
+      const sameProcess = await openSlackBotRuntime(dir)
+      for (const original of [root, dm, mentioned]) sameProcess.emit('message', original)
+      for (const edit of edits) sameProcess.emit(...edit)
+      expect(await sameProcess.close()).toEqual(originals)
+      expect(sameProcess.receipts.filter((r) => !r.endsWith('=duplicate'))).toEqual([])
+
+      const restarted = await openSlackBotRuntime(dir)
+      for (const edit of edits) restarted.emit(...edit)
+      expect(await restarted.close()).toEqual(originals)
+      expect(restarted.receipts.filter((r) => !r.endsWith('=duplicate'))).toEqual([])
+      expect(restarted.receipts.length).toBeGreaterThan(0)
+    })
+  })
+
+  test('app_mention-only delivery engages once with or without an edit marker, and later re-fires are duplicates', async () => {
+    await withRuntimeDir(async (dir) => {
+      const unmarked = { ...EDITED_MESSAGE, ts: '1700000010.000100', client_msg_id: 'cmid-10', text: 'x' }
+      const marked = { ...EDITED_MESSAGE, ts: '1700000011.000100', client_msg_id: 'cmid-11', text: 'x' }
+      const first = await openSlackBotRuntime(dir)
+      first.emit('app_mention', appMention(unmarked, '<@UBOT> please review', false))
+      first.emit('app_mention', appMention(marked, '<@UBOT> 리뷰 부탁해요', true))
+      expect(await first.close()).toEqual([unmarked.ts, marked.ts])
+      expect(first.receipts.sort()).toEqual([`${unmarked.ts}=accepted`, `${marked.ts}=accepted`])
+
+      const restarted = await openSlackBotRuntime(dir)
+      restarted.emit('app_mention', appMention(unmarked, '<@UBOT> please review it', true))
+      restarted.emit('app_mention', appMention(marked, '<@UBOT> 리뷰 부탁드려요', false))
+      expect(await restarted.close()).toEqual([unmarked.ts, marked.ts])
+      expect(restarted.receipts.sort()).toEqual([`${unmarked.ts}=duplicate`, `${marked.ts}=duplicate`])
+    })
+  })
+
+  test('edits that do not newly address the bot never reach the router; a fresh original still does', async () => {
+    await withRuntimeDir(async (dir) => {
+      const dm = {
+        ...EDITED_MESSAGE,
+        channel: 'D0DM',
+        channel_type: 'im',
+        ts: '1700000020.000100',
+        client_msg_id: 'cmid-20',
+        text: '안녕하세여',
+      }
+      const fresh = { ...dm, ts: '1700000021.000100', client_msg_id: 'cmid-21', text: '새 질문이에요' }
+      const runtime = await openSlackBotRuntime(dir)
+      runtime.emit('message', messageChanged(dm.text, '안녕하세요', dm))
+      runtime.emit('message', messageChanged('<@UBOT> chek', '<@UBOT> check'))
+      runtime.emit('message', messageChanged('<@UBOT> 확인', '확인'))
+      runtime.emit('message', messageChanged('<@UBOT> link', '<@UBOT> link'))
+      runtime.emit('message', { ...EDITED_MESSAGE, text: '<@UBOT> 확인', edited: { user: 'UALICE', ts: EDIT_TS } })
+      runtime.emit('message', fresh)
+      expect(await runtime.close()).toEqual([fresh.ts])
+      expect(runtime.receipts).toEqual([`${fresh.ts}=accepted`])
+    })
+  })
+
+  test('known edited controls never reach command or claim handlers; originals still do', async () => {
+    await withRuntimeDir(async (dir) => {
+      let seq = 30
+      const message = (text: string, over: Record<string, unknown> = {}): SlackMessageFixture => {
+        seq++
+        return { ...EDITED_MESSAGE, ts: `17000000${seq}.000100`, client_msg_id: `cmid-${seq}`, text, ...over }
+      }
+      const thread = { thread_ts: '1699999999.000001' }
+      const edited = await openSlackBotRuntime(dir)
+      for (const [before, after, over] of [
+        ['!stop', '!stop <@UBOT>', thread],
+        ['/help', '/help <@UBOT>', {}],
+        ['/stop', '/stop <@UBOT>', {}],
+        ['claim-AB12-CD34', '<@UBOT> claim-AB12-CD34', {}],
+      ] as const) {
+        const base = message(before, over)
+        edited.emit('message', messageChanged(before, after, base))
+        edited.emit('app_mention', appMention(message(before, over), after, true))
+      }
+      expect(await edited.close()).toEqual([])
+      expect(edited.commands).toEqual([])
+      expect(edited.claims).toEqual([])
+      expect(edited.posted).toEqual([])
+      expect(edited.receipts).toEqual([])
+
+      const originals = await openSlackBotRuntime(dir)
+      originals.emit('message', message('!stop', thread))
+      const help = message('/help <@UBOT>')
+      originals.emit('message', help)
+      const claim = message('<@UBOT> claim-AB12-CD34')
+      originals.emit('message', claim)
+      const escaped = message('//help')
+      originals.emit('message', messageChanged(escaped.text, '//help <@UBOT>', escaped))
+      const unknownBang = message('!deploy now')
+      originals.emit('message', messageChanged(unknownBang.text, '!deploy now <@UBOT>', unknownBang))
+      const rows = await originals.close()
+      expect(originals.commands).toEqual(['stop'])
+      expect(originals.claims).toHaveLength(1)
+      expect(originals.claims[0]).toContain('claim-AB12-CD34')
+      expect(originals.receipts).toContain(`${help.ts}=control`)
+      expect(rows).toEqual([claim.ts, escaped.ts, unknownBang.ts].sort())
+    })
   })
 
   test('failed durable admission allows a suppressed retry alias to route again', async () => {
