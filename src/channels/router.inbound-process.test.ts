@@ -6,6 +6,7 @@ import { join } from 'node:path'
 import type { Subprocess } from 'bun'
 
 import { BackgroundObligationStore } from './background-obligations'
+import { LIVE_TURN_ENDED_NOTICE_TEXT, RECOVERY_NOTICE_TEXT } from './continuity-types'
 import { RecoveryOutbox } from './recovery-outbox'
 
 const moduleUrl = (path: string) => JSON.stringify(new URL(path, import.meta.url).href)
@@ -24,7 +25,7 @@ import { bootBackgroundObligations } from ${moduleUrl('../run/background-handoff
 import { createRecoveryNotice } from ${moduleUrl('./recovery-notice.ts')};
 import { RecoveryOutbox } from ${moduleUrl('./recovery-outbox.ts')};
 import { RecoveryDispatcher } from ${moduleUrl('./recovery-dispatcher.ts')};
-import { createChannelRouter } from ${moduleUrl('./router.ts')};
+import { createChannelRouter, SESSION_GRACE_HARD_TTL_MS, SESSION_IDLE_MS } from ${moduleUrl('./router.ts')};
 import { defaultHistoryConfig } from ${moduleUrl('./schema.ts')};
 import { noopPermissionService } from ${moduleUrl('../permissions/index.ts')};
 const [dir,mode]=process.argv.slice(-2);
@@ -49,8 +50,12 @@ if(initial){
   return r;
  };
 }
-let session;let calls=0;
+let session;let calls=0;let skew=0;let runningChild=null;
+const lifecycle=['idle-gc','stale-rollover'].includes(mode);
+const clock=()=>Date.now()+skew;
 const router=createChannelRouter({agentDir:dir,backgroundObligations:background,inboundJournal:journal,
+ // The LiveSubagentRegistry probe: a running child's own spawn time on the router clock, for its parent session only.
+ now:clock,newestRunningChildSubagentStartedAt:(sessionId)=>runningChild?.parentSessionId===sessionId?runningChild.startedAt:null,
  configForAdapter:()=>({enabled:true,engagement:{trigger:['dm'],stickiness:'off'},history:defaultHistoryConfig()}),
  permissions:{...noopPermissionService,has:()=>true},logger:{info(m){appendFileSync(dir+'/logs',String(m)+'\\n')},warn(m){appendFileSync(dir+'/logs',String(m)+'\\n')},error(m){appendFileSync(dir+'/errors',JSON.stringify(m)+'\\n')}},
  createSessionForChannel:async({origin,originRef})=>{
@@ -84,7 +89,7 @@ const router=createChannelRouter({agentDir:dir,backgroundObligations:background,
   return {session,sessionId:session.sessionId,dispose:result.dispose};
  }});
 router.registerRecoveryAdapter(key.adapter,{accountIdentity:async()=> currentAccount,cachedAccountIdentity:()=> currentAccount,reconcile:async()=>({status:'unreconcilable'})});
-router.registerOutbound(key.adapter,async(message)=>{const accounting=message.sendOptions?.accounting??'live-turn';await appendFile(dir+'/posts',JSON.stringify({text:message.text,accounting})+'\\n');if(mode==='stale-reply'&&accounting!=='recovery'){transportStarted.resolve();await releaseTransport.promise;}if(mode==='output'&&accounting!=='recovery')await boundary();return {ok:true,messageId:'post'}});
+router.registerOutbound(key.adapter,async(message)=>{const accounting=message.sendOptions?.accounting??'live-turn';await appendFile(dir+'/posts',JSON.stringify(accounting==='recovery'?{text:message.text,accounting,deliveryId:message.sendOptions.deliveryId,coveredIds:message.sendOptions.coveredIds}:{text:message.text,accounting})+'\\n');if(mode==='stale-reply'&&accounting!=='recovery'){transportStarted.resolve();await releaseTransport.promise;}if(mode==='output'&&accounting!=='recovery')await boundary();return {ok:true,messageId:'post'}});
 try{await journal.initialize()}catch(error){if(mode!=='frozen')throw error;await appendFile(dir+'/recovery-errors',String(error)+'\\n')}
 const sse=(block,stop)=>new Response([
  'event: message_start','data: '+JSON.stringify({type:'message_start',message:{id:'msg_'+calls,type:'message',role:'assistant',model:'claude-sonnet-4-6',content:[],stop_reason:null,stop_sequence:null,usage:{input_tokens:1,output_tokens:0}}}),'',
@@ -96,6 +101,13 @@ const sse=(block,stop)=>new Response([
 globalThis.fetch=async(input,options)=>{
  calls++;await appendFile(dir+'/provider-calls','call\\n');
  if(mode==='rotation')await appendFile(dir+'/provider-request',typeof options?.body==='string'?options.body:input instanceof Request?await input.clone().text():'');
+ // A promised result deferred on a running background child: neither turn end
+ // nor a fresh turn may close it, and losing the child must not strand it.
+ if(lifecycle&&calls===1){
+  const startedAt=clock();await router.acceptBackgroundResponse({parentSessionId:session.sessionId,key,taskId:'child',subagentName:'proof',startedAt,accountIdentity:'proof-account',triggeringAuthorId:'alice'});runningChild={parentSessionId:session.sessionId,startedAt};
+  return sse({type:'tool_use',name:'channel_reply',input:{text:mode==='idle-gc'?'I started a background check.':'백그라운드에서 확인하고 있어요.',more_work_this_turn:true}},'tool_use');
+ }
+ if(lifecycle)return sse({type:'text',text:'NO_REPLY'},'end_turn');
  if(['reload-move','stale-reply'].includes(mode)&&calls===1){
   oldCoverage=await router.captureInboundResultCoverage(session.sessionId);oldOwner=journal.get(oldCoverage[0].inputId).claim;
   return sse({type:'text',text:'channel_reply({"reason":"missing text"})'},'end_turn');
@@ -122,6 +134,17 @@ globalThis.fetch=async(input,options)=>{
 };
 if(initial){
  const receipt=await router.route(event('A',mode==='rotation'?'ONLY_A':undefined));await appendFile(dir+'/A-receipt',JSON.stringify(receipt));
+ if(lifecycle){
+  await router.__testing.flushDebounce(key);
+  const snapshot=async()=>({rows:journal.list(),outbox:await new RecoveryOutbox(dir,{epoch:mode}).list(),live:router.liveCount()});
+  await appendFile(dir+'/deferred',JSON.stringify(await snapshot()));
+  // The child disappears without a completion (e.g. a wedged runtime lost it).
+  runningChild=null;
+  if(mode==='idle-gc'){skew+=SESSION_IDLE_MS+1000;await router.__testing.runIdleGc();}
+  else{skew+=SESSION_GRACE_HARD_TTL_MS+1000;const c=await router.route(event('C','Thanks!'));await appendFile(dir+'/C-receipt',JSON.stringify(c));await router.__testing.flushDebounce(key);}
+  await appendFile(dir+'/lifecycle',JSON.stringify(await snapshot()));
+  await boundary();
+ }
  if(mode==='rotation'){
   await router.acceptBackgroundResponse({parentSessionId:session.sessionId,key,taskId:'actorA-child',subagentName:'proof',startedAt:1002,accountIdentity:currentAccount,triggeringAuthorId:'alice'});
   currentAccount='actorB';
@@ -146,10 +169,13 @@ else{
  }
  if(mode==='receipt'){const delivered=outbox.delivered.bind(outbox);outbox.delivered=async(...args)=>{const r=await delivered(...args);if(r)await boundary();return r};}
  const acknowledged=Promise.withResolvers();
- const acknowledge=journal.acknowledgeNotice.bind(journal);journal.acknowledgeNotice=async(...args)=>{await acknowledge(...args);if(journal.list().every(row=>row.phase==='closed'))acknowledged.resolve()};
+ // Recovered once every owed source this boot holds, inbound and background alike, is closed.
+ const settle=async()=>{if(journal.list().every(row=>row.phase==='closed')&&(await background.list()).every(row=>row.phase==='closed'))acknowledged.resolve()};
+ const acknowledge=journal.acknowledgeNotice.bind(journal);journal.acknowledgeNotice=async(...args)=>{await acknowledge(...args);await settle()};
+ const acknowledgeChild=background.acknowledgeNotice.bind(background);background.acknowledgeNotice=async(...args)=>{await acknowledgeChild(...args);await settle()};
  const dispatcher=new RecoveryDispatcher(outbox,router,{backgroundObligations:background,inboundJournal:journal,onError:acknowledged.reject});
  await dispatcher.wake();
- if((await journal.list()).some(row=>row.phase!=='closed'))await acknowledged.promise;
+ await settle();await acknowledged.promise;
  await dispatcher.stop();await journal.flush();await journal.close();console.log('recovered');process.exit(0);
 }
 `
@@ -192,6 +218,23 @@ async function reboot(dir: string, mode: string) {
 }
 
 const optionalRead = (dir: string, name: string) => readFile(join(dir, name), 'utf8').catch(() => '')
+
+/** Every notice ever issued, whether still in the live outbox or retired after acknowledgment. */
+async function deliveries(dir: string) {
+  const outbox = new RecoveryOutbox(dir)
+  return [
+    ...(await outbox.list()).map((record) => ({
+      deliveryId: record.deliveryId,
+      state: record.state,
+      attempts: record.attempts,
+    })),
+    ...(await outbox.listRetired()).map((record) => ({
+      deliveryId: record.deliveryId,
+      state: record.dispatch.state,
+      attempts: record.dispatch.attempts,
+    })),
+  ].sort((left, right) => left.deliveryId.localeCompare(right.deliveryId))
+}
 
 for (const mode of [
   'admission',
@@ -309,27 +352,33 @@ for (const mode of [
           children[0]!.applications.filter((receipt) => receipt.transitionId === children[0]!.outcome!.decisionId),
         ).toHaveLength(1)
       }
-      const records = await new RecoveryOutbox(dir).list()
-      if (terminal) expect(records).toEqual([])
-      else {
-        // Inputs from one author, account and captured parent recover under a single notice.
-        expect(records).toHaveLength(1)
-        for (const record of records)
-          expect(record).toMatchObject({
-            state: 'delivered',
-            attempts: 1,
-            target: { adapter: 'discord-bot', chat: 'room' },
-          })
-        expect(records.flatMap((record) => record.covers.map((ref) => ref.id)).sort()).toEqual(acceptedIds)
-        expect(records.every((record) => record.covers.every((ref) => ref.store === 'inbound'))).toBe(true)
-      }
+      const outbox = new RecoveryOutbox(dir)
+      // Resolved notices retire from the live outbox after acknowledgment.
+      expect(await outbox.list()).toEqual([])
+      const retired = await outbox.listRetired()
       const posts = (await optionalRead(dir, 'posts'))
         .trim()
         .split('\n')
         .filter(Boolean)
         .map((line) => JSON.parse(line))
       const notices = posts.filter((post) => post.accounting === 'recovery')
-      expect(notices).toEqual(records.map((record) => ({ accounting: 'recovery', text: record.text })))
+      if (terminal) {
+        expect(retired).toEqual([])
+        expect(notices).toEqual([])
+      } else {
+        // Inputs from one author, account and captured parent recover under a
+        // single notice. Real process death keeps the frozen restart template.
+        expect(retired.map((record) => record.dispatch)).toMatchObject([{ state: 'delivered', attempts: 1 }])
+        expect(notices).toEqual([
+          {
+            accounting: 'recovery',
+            text: RECOVERY_NOTICE_TEXT,
+            deliveryId: retired[0]!.deliveryId,
+            coveredIds: expect.any(Array),
+          },
+        ])
+        expect([...notices[0].coveredIds].sort()).toEqual(acceptedIds)
+      }
       if (mode === 'output')
         expect(posts.filter((post) => post.accounting !== 'recovery')).toEqual([
           { text: 'Answer A.', accounting: 'live-turn' },
@@ -373,24 +422,27 @@ test('mixed stop committed before JSON remains authoritative through corruption;
         ),
       ),
     ).toEqual(backgroundBytes)
-    const records = await new RecoveryOutbox(dir).list()
-    expect(records).toHaveLength(3)
-    expect(records.filter((record) => record.covers.every((ref) => ref.store === 'inventory'))).toMatchObject([
-      { state: 'delivered', attempts: 1 },
-    ])
+    // The verified inventory-only notice may already be retired; dependent ones stay owed.
+    const blocked = await new RecoveryOutbox(dir).list()
     expect(
-      records
+      blocked
         .filter((record) => record.covers.some((ref) => ref.store !== 'inventory'))
         .map((record) => ({ state: record.state, attempts: record.attempts })),
     ).toEqual([
       { state: 'pending', attempts: 0 },
       { state: 'pending', attempts: 0 },
     ])
+    const frozen = await deliveries(dir)
+    expect(frozen).toHaveLength(3)
+    const inventory = frozen.filter((record) => record.state === 'delivered')
+    expect(inventory).toMatchObject([{ attempts: 1 }])
     const posts = (await optionalRead(dir, 'posts'))
       .trim()
       .split('\n')
       .map((line) => JSON.parse(line))
-    expect(posts).toEqual([{ accounting: 'recovery', text: records[0]!.text }])
+    expect(posts.map((post) => [post.accounting, post.deliveryId, post.text])).toEqual([
+      ['recovery', inventory[0]!.deliveryId, RECOVERY_NOTICE_TEXT],
+    ])
     expect(await optionalRead(dir, 'recovery-errors')).toContain('journal')
     const calls = await optionalRead(dir, 'provider-calls')
     await writeFile(path, valid)
@@ -404,13 +456,9 @@ test('mixed stop committed before JSON remains authoritative through corruption;
     )
     expect(await optionalRead(dir, 'provider-calls')).toBe(calls)
     expect(await optionalRead(dir, 'effects')).toBe('')
-    expect(
-      (await new RecoveryOutbox(dir).list()).map((record) => ({ state: record.state, attempts: record.attempts })),
-    ).toEqual([
-      { state: 'delivered', attempts: 1 },
-      { state: 'delivered', attempts: 1 },
-      { state: 'delivered', attempts: 1 },
-    ])
+    expect(await deliveries(dir)).toEqual(
+      frozen.map((record) => ({ deliveryId: record.deliveryId, state: 'delivered', attempts: 1 })),
+    )
   } finally {
     await rm(dir, { recursive: true, force: true })
   }
@@ -437,6 +485,8 @@ test('account rotation transfers queued old-account input and child while compat
     const notices = await new RecoveryOutbox(dir).list()
     expect(notices).toHaveLength(1)
     expect(notices[0]).toMatchObject({ accountIdentity: 'actorA', state: 'pending' })
+    // Same-process account rotation is not a restart.
+    expect(notices[0]!.text).toBe(LIVE_TURN_ENDED_NOTICE_TEXT)
     expect(notices[0]!.covers.map((ref) => ref.store).sort()).toEqual(['background', 'inbound'])
     expect(notices[0]!.covers.filter((ref) => ref.store === 'inbound').map((ref) => ref.id)).toEqual([
       admissions[0].inputId,
@@ -450,8 +500,7 @@ test('account rotation transfers queued old-account input and child while compat
     })
     await reboot(dir, 'rotate-restored')
     await reboot(dir, 'rotate-second')
-    const records = await new RecoveryOutbox(dir).list()
-    expect(records).toMatchObject([{ accountIdentity: 'actorA', state: 'delivered', attempts: 2 }])
+    expect(await deliveries(dir)).toEqual([{ deliveryId: notices[0]!.deliveryId, state: 'delivered', attempts: 2 }])
     expect(await new BackgroundObligationStore(dir).list()).toMatchObject([
       { taskId: 'actorA-child', phase: 'closed', outcome: { kind: 'delivered' } },
     ])
@@ -461,9 +510,94 @@ test('account rotation transfers queued old-account input and child while compat
       (await optionalRead(dir, 'posts'))
         .trim()
         .split('\n')
-        .map((line) => JSON.parse(line)),
-    ).toEqual([{ accounting: 'recovery', text: records[0]!.text }])
+        .map((line) => JSON.parse(line))
+        .map((post) => [post.accounting, post.deliveryId, post.text]),
+    ).toEqual([['recovery', notices[0]!.deliveryId, notices[0]!.text]])
   } finally {
     await rm(dir, { recursive: true, force: true })
   }
 }, 120_000)
+
+type Snapshot = {
+  rows: Array<{ inputId: string; phase: string; claim?: unknown }>
+  outbox: Array<{ deliveryId: string; text: string; state: string; covers: Array<{ store: string; id: string }> }>
+  live: number
+}
+
+for (const mode of ['idle-gc', 'stale-rollover']) {
+  test(`${mode} transfers coverage stranded by a lost background child before teardown, as a live notice`, async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'typeclaw-inbound-lifecycle-'))
+    await writeFile(
+      join(dir, 'typeclaw.json'),
+      JSON.stringify({ models: { default: { model: 'anthropic/claude-sonnet-4-6' } } }),
+    )
+    try {
+      await killAtBoundary(spawnWorker(dir, mode), mode)
+      const a = JSON.parse(await optionalRead(dir, 'A-receipt')).inputId as string
+      const deferred = JSON.parse(await optionalRead(dir, 'deferred')) as Snapshot
+      // While the child runs, the promised result stays owned by its turn.
+      expect(deferred.outbox).toEqual([])
+      expect(deferred.rows.find((row) => row.inputId === a)).toMatchObject({ phase: 'turn-owned' })
+      const lifecycle = JSON.parse(await optionalRead(dir, 'lifecycle')) as Snapshot
+      // The lifecycle decision itself hands the request to a durable non-restart
+      // notice; it is not left to the dead cache for the next boot to find.
+      const coveringA = lifecycle.outbox.filter((record) => record.covers.some((ref) => ref.id === a))
+      expect(coveringA).toHaveLength(1)
+      const [notice] = coveringA
+      expect(notice).toMatchObject({ state: 'pending', text: LIVE_TURN_ENDED_NOTICE_TEXT })
+      expect(notice!.covers.map((ref) => [ref.store, ref.id])).toEqual([['inbound', a]])
+      // The lost child was never consumed: its own response debt is neither covered
+      // nor erased by the parent's lifecycle, and stays owed by its source.
+      const [lost] = (await new BackgroundObligationStore(dir).list()).filter((row) => row.taskId === 'child')
+      expect(lost).toMatchObject({ phase: 'accepted' })
+      expect(lost!.transfer).toBeUndefined()
+      if (mode === 'idle-gc') expect(lifecycle.live).toBe(0)
+      else {
+        // The fresh "Thanks!" is answered on its own and never absorbs the old debt.
+        const c = JSON.parse(await optionalRead(dir, 'C-receipt')).inputId as string
+        expect(lifecycle.rows.find((row) => row.inputId === c)).toMatchObject({ phase: 'closed' })
+        expect(lifecycle.outbox.flatMap((record) => record.covers.map((ref) => ref.id))).not.toContain(c)
+      }
+      const calls = await optionalRead(dir, 'provider-calls')
+
+      await reboot(dir, 'repair')
+      const firstBoot = await optionalRead(dir, 'posts')
+      await reboot(dir, 'second-repair')
+
+      // The second boot finds nothing left to say.
+      expect(await optionalRead(dir, 'posts')).toBe(firstBoot)
+      expect(await optionalRead(dir, 'provider-calls')).toBe(calls)
+      expect(await optionalRead(dir, 'effects')).toBe('')
+      const notices = firstBoot
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line))
+        .filter((post) => post.accounting === 'recovery')
+      // No notice is re-sent: each delivery is posted once and lands on its first attempt.
+      expect(await deliveries(dir)).toEqual(
+        notices
+          .map((post) => ({ deliveryId: post.deliveryId, state: 'delivered' as const, attempts: 1 }))
+          .sort((left, right) => left.deliveryId.localeCompare(right.deliveryId)),
+      )
+      // Each owed fact is answered exactly once, by its own notice, and nothing else is (C included):
+      // the request by its live notice, never a restart; the unconsumed child by its own boot notice.
+      const [child] = (await new BackgroundObligationStore(dir).list()).filter((row) => row.taskId === 'child')
+      expect(notices.flatMap((post) => post.coveredIds).sort()).toEqual([a, child!.obligationId].sort())
+      expect(notices.find((post) => post.coveredIds.includes(a))).toEqual({
+        text: LIVE_TURN_ENDED_NOTICE_TEXT,
+        accounting: 'recovery',
+        deliveryId: notice!.deliveryId,
+        coveredIds: [a],
+      })
+      const childNotice = notices.find((post) => post.coveredIds.includes(child!.obligationId))
+      expect(childNotice).toMatchObject({ text: RECOVERY_NOTICE_TEXT, coveredIds: [child!.obligationId] })
+      expect(child).toMatchObject({
+        phase: 'closed',
+        outcome: { kind: 'delivered', deliveryId: childNotice!.deliveryId },
+      })
+      expect(await optionalRead(dir, 'errors')).toBe('')
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  }, 120_000)
+}

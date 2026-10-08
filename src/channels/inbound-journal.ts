@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { mkdir, open, readFile, rename } from 'node:fs/promises'
+import { mkdir, open, rename, unlink } from 'node:fs/promises'
 import type { FileHandle } from 'node:fs/promises'
 import { dirname, resolve } from 'node:path'
 
@@ -9,7 +9,7 @@ import type { MatchableOrigin } from '../permissions/resolve'
 import type { BackgroundObligation, BackgroundObligationRef, BackgroundObligationStore } from './background-obligations'
 import { parseBackgroundObligation } from './background-obligations'
 import { parseRecoveryRecord, recoveryPayload } from './continuity-types'
-import type { RecoveryRecord } from './continuity-types'
+import type { RecoveryNoticeCause, RecoveryRecord } from './continuity-types'
 import { createRecoveryNotice, recoveryNoticePartitionKey } from './recovery-notice'
 import type { RecoveryOutbox } from './recovery-outbox'
 import { channelKeyId } from './types'
@@ -22,7 +22,9 @@ export type InboundOutcome = {
   reason?: string
   deliveryId?: string
 }
-export type InboundRecord = InboundRef & {
+type InboundReference = { messageId?: string; receiptId?: string }
+/** An input that still owes a response or a notice keeps its full admission provenance. */
+export type OpenInboundRecord = InboundRef & {
   schemaVersion: 1
   identity: string
   accountIdentity: string
@@ -30,13 +32,29 @@ export type InboundRecord = InboundRef & {
   principal: MatchableOrigin
   epoch: string
   acceptedAt: number
-  reference?: { messageId?: string; receiptId?: string }
+  reference?: InboundReference
   sourceParentSessionId?: string
-  phase: 'admitted' | 'turn-owned' | 'notice-prepared' | 'notice-owned' | 'closed'
+  phase: 'admitted' | 'turn-owned' | 'notice-prepared' | 'notice-owned'
   claim?: { turnId: string; ownerSessionId?: string; epoch: string; generation: number }
   transfer?: RecoveryRecord
-  outcome?: InboundOutcome
 }
+/**
+ * Closed authority, kept indefinitely because no adapter replay floor is proven. It holds only what a
+ * later delivery or stale callback is judged against: the exact identity (`inputId`), the terminal
+ * generation and outcome, the frozen author fence, the Slack message representative (`messageKey`,
+ * ordered by `acceptedAt`), the platform reference, and the delivery of the frozen notice that
+ * covered it (whose payload the journal keeps once per delivery).
+ */
+export type ClosedInboundRecord = InboundRef & {
+  phase: 'closed'
+  acceptedAt: number
+  reference?: InboundReference
+  principalDigest: string
+  messageKey?: string
+  outcome: InboundOutcome
+  noticeDeliveryId?: string
+}
+export type InboundRecord = OpenInboundRecord | ClosedInboundRecord
 export type InboundAdmission = {
   accountIdentity: string
   target: ChannelKey
@@ -48,8 +66,10 @@ export type InboundAdmission = {
   reference?: { messageId?: string; receiptId?: string }
   ownerSessionId?: string
 }
+/** The schema-1 row every decision line carries in full, closed rows included. */
+type JournalRow = Omit<OpenInboundRecord, 'phase'> & { phase: InboundRecord['phase']; outcome?: InboundOutcome }
 type Owner = { turnId: string; ownerSessionId?: string; target: ChannelKey; fromTurnId?: string }
-type Change = { expected: InboundRef; row: InboundRecord }
+type Change = { expected: InboundRef; row: JournalRow }
 type BackgroundChange = { expected: BackgroundObligationRef; row: BackgroundObligation }
 type Decision = {
   schemaVersion: 1
@@ -73,6 +93,8 @@ type Applied = {
 type DecisionReceipt = {
   transitionId: string
   seq: number
+  /** Absent only on receipts carried over from a schema-1 snapshot. */
+  epoch?: string
   type: string
   decisionDigest: string
   payloadDigest: string
@@ -80,15 +102,29 @@ type DecisionReceipt = {
   inboundRefs: InboundRef[]
   backgroundRefs: BackgroundObligationRef[]
 }
-type Snapshot = {
+/** Snapshot written before tombstones: every row in full. Read-only compatibility. */
+type LegacySnapshot = {
   schemaVersion: 1
   seq: number
   type: 'snapshot'
-  rows: InboundRecord[]
+  rows: JournalRow[]
   decisions: Decision[]
   receipts: DecisionReceipt[]
 }
-type Line = Decision | Applied | Snapshot
+type SnapshotOpenRow = Omit<OpenInboundRecord, 'transfer'> & { notice?: string }
+type Snapshot = {
+  schemaVersion: 2
+  seq: number
+  type: 'snapshot'
+  /** Frozen transfer payloads, once per delivery; rows refer to them by deliveryId. */
+  notices: RecoveryRecord[]
+  open: SnapshotOpenRow[]
+  closed: ClosedInboundRecord[]
+  /** Mixed decisions whose background application is not yet recorded, in full. */
+  decisions: Decision[]
+  receipts: DecisionReceipt[]
+}
+type Line = Decision | Applied | LegacySnapshot | Snapshot
 const canonical = (value: unknown): string => {
   if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`
   if (value && typeof value === 'object')
@@ -103,6 +139,11 @@ const digest = (value: unknown) => createHash('sha256').update(canonical(value))
 const copy = <T>(value: T): T => JSON.parse(JSON.stringify(value))
 const integer = (n: unknown) => Number.isSafeInteger(n) && Number(n) > 0
 const id = (value: unknown) => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value)
+const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+const principalDigest = (principal: MatchableOrigin) => digest(['principal', principal])
+/** Below this much growth the journal is never rewritten; above it, once growth reaches the last snapshot's size. */
+const COMPACTION_FLOOR_BYTES = 1024 * 1024
+const READ_CHUNK_BYTES = 64 * 1024
 const activeWriters = new Map<string, InboundJournal>()
 async function syncDirectory(path: string) {
   let fd: FileHandle
@@ -130,10 +171,20 @@ async function syncDirectory(path: string) {
 }
 const positive = z.number().int().positive().max(Number.MAX_SAFE_INTEGER)
 const nonempty = z.string().min(1)
+const hex = z.string().regex(/^[a-f0-9]{64}$/)
+const referenceSchema = z.object({ messageId: nonempty.optional(), receiptId: nonempty.optional() }).strict()
+const outcomeSchema = z
+  .object({
+    kind: z.enum(['delivered', 'intentionally-suppressed']),
+    decisionId: nonempty,
+    reason: z.string().optional(),
+    deliveryId: nonempty.optional(),
+  })
+  .strict()
 const rowSchema = z
   .object({
     schemaVersion: z.literal(1),
-    inputId: z.string().regex(/^[a-f0-9]{64}$/),
+    inputId: hex,
     generation: positive,
     identity: nonempty,
     accountIdentity: nonempty,
@@ -141,7 +192,7 @@ const rowSchema = z
     acceptedAt: z.number().finite().nonnegative(),
     target: z.unknown(),
     principal: z.unknown(),
-    reference: z.object({ messageId: nonempty.optional(), receiptId: nonempty.optional() }).strict().optional(),
+    reference: referenceSchema.optional(),
     sourceParentSessionId: nonempty.optional(),
     phase: z.enum(['admitted', 'turn-owned', 'notice-prepared', 'notice-owned', 'closed']),
     claim: z
@@ -149,26 +200,29 @@ const rowSchema = z
       .strict()
       .optional(),
     transfer: z.unknown().optional(),
-    outcome: z
-      .object({
-        kind: z.enum(['delivered', 'intentionally-suppressed']),
-        decisionId: nonempty,
-        reason: z.string().optional(),
-        deliveryId: nonempty.optional(),
-      })
-      .strict()
-      .optional(),
+    outcome: outcomeSchema.optional(),
+  })
+  .strict()
+const closedSchema = z
+  .object({
+    inputId: hex,
+    generation: positive,
+    phase: z.literal('closed'),
+    acceptedAt: z.number().finite().nonnegative(),
+    reference: referenceSchema.optional(),
+    principalDigest: hex,
+    messageKey: hex.optional(),
+    outcome: outcomeSchema,
+    noticeDeliveryId: hex.optional(),
   })
   .strict()
 const inboundExpectedSchema = z
   .object({
-    inputId: z.string().regex(/^[a-f0-9]{64}$/),
+    inputId: hex,
     generation: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
   })
   .strict()
-const backgroundExpectedSchema = z
-  .object({ obligationId: z.string().regex(/^[a-f0-9]{64}$/), generation: positive })
-  .strict()
+const backgroundExpectedSchema = z.object({ obligationId: hex, generation: positive }).strict()
 const decisionSchema = z
   .object({
     schemaVersion: z.literal(1),
@@ -178,33 +232,40 @@ const decisionSchema = z
     type: z.enum(['admitted', 'turn-claimed', 'ownership-moved', 'outcome-decided', 'notice-prepared', 'notice-owned']),
     changes: z.array(z.object({ expected: inboundExpectedSchema, row: z.unknown() }).strict()),
     backgroundChanges: z.array(z.object({ expected: backgroundExpectedSchema, row: z.unknown() }).strict()),
-    requestDigest: z
-      .string()
-      .regex(/^[a-f0-9]{64}$/)
-      .optional(),
+    requestDigest: hex.optional(),
   })
   .strict()
-const receiptSchema = z
+const legacyReceiptSchema = z
   .object({
     transitionId: nonempty,
     seq: positive,
     type: decisionSchema.shape.type,
-    decisionDigest: z.string().regex(/^[a-f0-9]{64}$/),
-    payloadDigest: z.string().regex(/^[a-f0-9]{64}$/),
-    requestDigest: z
-      .string()
-      .regex(/^[a-f0-9]{64}$/)
-      .optional(),
+    decisionDigest: hex,
+    payloadDigest: hex,
+    requestDigest: hex.optional(),
     inboundRefs: z.array(inboundExpectedSchema),
     backgroundRefs: z.array(backgroundExpectedSchema),
   })
   .strict()
-const snapshotSchema = z
+const receiptSchema = legacyReceiptSchema.extend({ epoch: nonempty.optional() }).strict()
+const legacySnapshotSchema = z
   .object({
     schemaVersion: z.literal(1),
     seq: positive,
     type: z.literal('snapshot'),
     rows: z.array(z.unknown()),
+    decisions: z.array(z.unknown()),
+    receipts: z.array(legacyReceiptSchema),
+  })
+  .strict()
+const snapshotSchema = z
+  .object({
+    schemaVersion: z.literal(2),
+    seq: positive,
+    type: z.literal('snapshot'),
+    notices: z.array(z.unknown()),
+    open: z.array(z.unknown()),
+    closed: z.array(closedSchema),
     decisions: z.array(z.unknown()),
     receipts: z.array(receiptSchema),
   })
@@ -217,10 +278,10 @@ const appliedSchema = z
     epoch: nonempty,
     type: z.literal('mixed-applied'),
     decisionId: nonempty,
-    decisionDigest: z.string().regex(/^[a-f0-9]{64}$/),
+    decisionDigest: hex,
   })
   .strict()
-function validateRow(row: InboundRecord) {
+function validateRow(row: JournalRow) {
   rowSchema.parse(row)
   if (digest(['inbound', row.identity]) !== row.inputId) throw new Error('Invalid inbound journal identity')
   createRecoveryNotice({
@@ -262,7 +323,7 @@ function validateRow(row: InboundRecord) {
   }
 }
 // Boot has no live owner: the captured claim owner supersedes the immutable admission/launch parent.
-const inboundPartition = (row: InboundRecord) =>
+const inboundPartition = (row: OpenInboundRecord) =>
   recoveryNoticePartitionKey({
     target: row.target,
     accountIdentity: row.accountIdentity,
@@ -279,6 +340,7 @@ const backgroundPartition = (row: BackgroundObligation) =>
 /**
  * A Slack message is its ts within the authenticated account's workspace/chat. Routing thread and
  * edit revision are delivery shapes of that one message, so a single admission answers all of them.
+ * The key is a digest so a closed tombstone can keep it without the identity it was derived from.
  */
 const slackMessageKey = (input: {
   root: string
@@ -288,7 +350,8 @@ const slackMessageKey = (input: {
   eventKind: string
 }) =>
   (input.target.adapter === 'slack' || input.target.adapter === 'slack-bot') && input.messageId
-    ? canonical([
+    ? digest([
+        'slack-message',
         input.root,
         input.accountIdentity,
         input.target.adapter,
@@ -299,7 +362,7 @@ const slackMessageKey = (input: {
       ])
     : undefined
 /** Derived from the stored identity tuple; rows that cannot be decoded keep exact-identity dedupe only. */
-function storedSlackMessageKey(row: InboundRecord) {
+function storedSlackMessageKey(row: JournalRow) {
   const messageId = row.reference?.messageId
   if (!messageId || (row.target.adapter !== 'slack' && row.target.adapter !== 'slack-bot')) return undefined
   let tuple: unknown
@@ -327,6 +390,21 @@ function storedSlackMessageKey(row: InboundRecord) {
     eventKind: tuple[4],
   })
 }
+/** The closed form of a full row: identity, terminal state and fences only. */
+function tombstone(row: JournalRow): ClosedInboundRecord {
+  const messageKey = storedSlackMessageKey(row)
+  return {
+    inputId: row.inputId,
+    generation: row.generation,
+    phase: 'closed',
+    acceptedAt: row.acceptedAt,
+    ...(row.reference ? { reference: row.reference } : {}),
+    principalDigest: principalDigest(row.principal),
+    ...(messageKey ? { messageKey } : {}),
+    outcome: row.outcome!,
+    ...(row.transfer ? { noticeDeliveryId: row.transfer.deliveryId } : {}),
+  }
+}
 
 /** Single-runtime writer. Callers hold the background target lane through coverage reads and cache publication. */
 export class InboundJournal {
@@ -334,12 +412,28 @@ export class InboundJournal {
   readonly path: string
   private fd?: FileHandle
   private sequence = 0
+  /** Open rows in full, closed rows as tombstones. Never pruned: no replay floor is proven. */
   private rows = new Map<string, InboundRecord>()
-  /** Derived Slack message key → representative inputId; rebuilt from durable rows, never persisted. */
+  /** Slack message key → representative inputId; rebuilt from durable rows, never persisted. */
   private slackMessages = new Map<string, string>()
+  /** Frozen transfer payload, once per delivery; rows refer to it by deliveryId. */
+  private notices = new Map<string, RecoveryRecord>()
+  /** Mixed decisions not yet recorded as applied: the only decision bodies kept. */
   private decisions = new Map<string, Decision>()
+  /** Idempotency fences a caller can still present; see `retainsReceipt`. */
   private receipts = new Map<string, DecisionReceipt>()
-  private applied = new Set<string>()
+  /** Transition IDs this writer minted itself and never handed to any caller. */
+  private minted = new Set<string>()
+  private snapshotBytes = 0
+  private growthBytes = 0
+  private maintaining = false
+  private compactionQueued = false
+  /**
+   * True only while a healthy compaction swaps the closed handle for the installed file's reopened
+   * one. The writer queue is held for the whole swap, so in-memory state stays authoritative and
+   * readable; no write can run until the replacement handle exists.
+   */
+  private swapping = false
   private queue: Promise<void> = Promise.resolve()
   private initializing?: Promise<void>
   private initialized = false
@@ -362,6 +456,7 @@ export class InboundJournal {
           | 'append-written'
           | 'append-synced'
           | 'mixed-json-applied'
+          | 'compaction-started'
           | 'temp-synced'
           | 'handle-closed'
           | 'replaced'
@@ -370,6 +465,8 @@ export class InboundJournal {
         record?: unknown,
       ) => void | Promise<void>
       onSync?: (milliseconds: number) => void
+      /** Internal: growth below which maintenance never rewrites. Not operator configuration. */
+      compactionFloorBytes?: number
     } = {},
   ) {
     this.path = resolve(agentDir, 'channels', 'inbound-continuity.jsonl')
@@ -393,13 +490,14 @@ export class InboundJournal {
       this.failureListeners.delete(listener)
     }
   }
+  /** Operational: initialized writer, not cancelled, frozen or closed, holding a handle or mid-swap. */
   assertAvailable() {
-    if (this.initializationCancelled || this.frozen !== undefined || !this.fd)
+    if (this.initializationCancelled || this.frozen !== undefined || !(this.fd || this.swapping))
       throw new Error('Inbound continuity frozen pending repair', { cause: this.frozen })
   }
   health() {
     return {
-      available: !this.initializationCancelled && this.frozen === undefined && !!this.fd,
+      available: !this.initializationCancelled && this.frozen === undefined && !!(this.fd || this.swapping),
       error: this.frozen,
       sequence: this.sequence,
     }
@@ -428,19 +526,10 @@ export class InboundJournal {
         if (this.initializationCancelled) return
         await syncDirectory(dirname(dirname(this.path)))
         if (this.initializationCancelled) return
-        let bytes: Buffer
-        try {
-          bytes = await readFile(this.path)
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
-          bytes = Buffer.alloc(0)
-        }
+        const { end, size } = await this.load()
         await this.options.onDurability?.('initialization-read')
         if (this.initializationCancelled) return
-        const end = bytes.lastIndexOf(10) + 1
-        const text = new TextDecoder('utf-8', { fatal: true }).decode(bytes.subarray(0, end))
-        for (const line of text.split('\n').slice(0, -1)) this.fold(JSON.parse(line))
-        if (end !== bytes.length) {
+        if (end !== size) {
           // Windows append handles cannot truncate; repair durably before opening the writer.
           const repair = await open(this.path, 'r+')
           if (this.initializationCancelled) {
@@ -478,84 +567,232 @@ export class InboundJournal {
       }
     }))
   }
-  private fold(line: Line) {
-    if (!line || line.schemaVersion !== 1 || !integer(line.seq)) throw new Error('Invalid journal version or sequence')
+  /**
+   * One strict pass over the durable journal: each LF-terminated line is decoded as fatal UTF-8,
+   * parsed and folded as it is read, so only normalized state is retained. Bytes after the last LF
+   * are a torn append and are reported for truncation; any complete line that fails throws and
+   * leaves the file untouched.
+   */
+  private async load(): Promise<{ end: number; size: number }> {
+    let handle: FileHandle
+    try {
+      handle = await open(this.path, 'r')
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+      return { end: 0, size: 0 }
+    }
+    try {
+      const decoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true })
+      const chunk = Buffer.allocUnsafe(READ_CHUNK_BYTES)
+      let partial: Buffer[] = []
+      let size = 0
+      let end = 0
+      for (;;) {
+        const { bytesRead } = await handle.read(chunk, 0, chunk.length, null)
+        if (!bytesRead) break
+        const view = chunk.subarray(0, bytesRead)
+        let start = 0
+        for (let lf = view.indexOf(10); lf !== -1; lf = view.indexOf(10, start)) {
+          const line = partial.length ? Buffer.concat([...partial, view.subarray(start, lf)]) : view.subarray(start, lf)
+          partial = []
+          let text = decoder.decode(line)
+          // A whole-file decode skipped one leading byte-order mark; per-line decoding keeps that rule.
+          if (end === 0 && text.charCodeAt(0) === 0xfeff) text = text.slice(1)
+          this.fold(JSON.parse(text) as Line, line.length + 1)
+          start = lf + 1
+          end = size + start
+        }
+        if (start < bytesRead) partial.push(Buffer.from(view.subarray(start)))
+        size += bytesRead
+      }
+      return { end, size }
+    } finally {
+      await handle.close()
+    }
+  }
+  private fold(line: Line, bytes: number) {
+    if (!line || !integer(line.seq)) throw new Error('Invalid journal version or sequence')
     if (line.type === 'snapshot') {
-      const snap = line as Snapshot
-      snapshotSchema.parse(snap)
+      if (line.schemaVersion !== 1 && line.schemaVersion !== 2) throw new Error('Invalid journal version or sequence')
       if (this.sequence) throw new Error('Invalid journal snapshot position')
-      for (const row of snap.rows) {
-        validateRow(row)
-        if (this.rows.has(row.inputId)) throw new Error('Duplicate snapshot input')
-        this.rows.set(row.inputId, row)
-        this.indexSlackMessage(row)
-      }
-      const sequences = new Set<number>()
-      for (const receipt of snap.receipts) {
-        if (receipt.seq > snap.seq || sequences.has(receipt.seq) || this.receipts.has(receipt.transitionId))
-          throw new Error('Invalid snapshot receipt sequence')
-        sequences.add(receipt.seq)
-        for (const ref of receipt.inboundRefs) {
-          const row = this.rows.get(ref.inputId)
-          if (!row || ref.generation < 1 || ref.generation > row.generation)
-            throw new Error('Snapshot receipt has invalid generation')
-        }
-        this.receipts.set(receipt.transitionId, receipt)
-      }
-      for (const decision of snap.decisions) {
-        this.validateDecision(decision)
-        if (
-          decision.seq > snap.seq ||
-          sequences.has(decision.seq) ||
-          this.receipts.has(decision.transitionId) ||
-          this.decisions.has(decision.transitionId) ||
-          !decision.backgroundChanges.length
-        )
-          throw new Error('Invalid pending snapshot decision')
-        sequences.add(decision.seq)
-        for (const change of decision.changes) {
-          if (canonical(this.rows.get(change.row.inputId)) !== canonical(change.row))
-            throw new Error('Snapshot pending decision conflicts with source')
-        }
-        this.decisions.set(decision.transitionId, decision)
-      }
+      if (line.schemaVersion === 2) this.foldSnapshot(line)
+      else this.foldLegacySnapshot(line as LegacySnapshot)
+      this.snapshotBytes = bytes
+      this.growthBytes = 0
     } else {
+      if (line.schemaVersion !== 1) throw new Error('Invalid journal version or sequence')
       if (line.seq !== this.sequence + 1) throw new Error('Noncontiguous journal sequence')
-      if (line.type === 'mixed-applied') {
-        const receipt = line as Applied
-        appliedSchema.parse(receipt)
-        const decision = this.decisions.get(receipt.decisionId)
-        if (
-          !decision ||
-          digest(decision) !== receipt.decisionDigest ||
-          receipt.transitionId !== `applied:${receipt.decisionId}`
-        )
-          throw new Error('Invalid mixed application receipt')
-        this.applied.add(receipt.decisionId)
-      } else {
-        const decision = line as Decision
-        this.validateDecision(decision)
-        const previous = this.decisions.get(decision.transitionId)
-        const compacted = this.receipts.get(decision.transitionId)
-        if (compacted && compacted.decisionDigest !== digest(decision))
-          throw new Error('Conflicting compacted transition identity')
-        if (previous) {
-          if (canonical(previous) !== canonical(decision)) throw new Error('Conflicting duplicate journal transition')
-        } else if (!compacted) {
-          for (const change of decision.changes) this.validateChange(change, decision.type)
-          for (const change of decision.changes) {
-            this.rows.set(change.row.inputId, change.row)
-            // Only admission creates a row; later transitions keep its immutable identity.
-            if (decision.type === 'admitted') this.indexSlackMessage(change.row)
-          }
-          this.decisions.set(decision.transitionId, decision)
-        }
-      }
+      if (line.type === 'mixed-applied') this.foldApplied(line as Applied)
+      else this.foldDecision(line as Decision)
+      this.growthBytes += bytes
     }
     this.sequence = line.seq
   }
+  private foldLegacySnapshot(snap: LegacySnapshot) {
+    legacySnapshotSchema.parse(snap)
+    for (const row of snap.rows) {
+      validateRow(row)
+      if (this.rows.has(row.inputId)) throw new Error('Duplicate snapshot input')
+      this.install(row)
+      this.indexSlackMessage(this.rows.get(row.inputId)!)
+    }
+    this.foldSnapshotHistory(snap.seq, snap.receipts, snap.decisions)
+  }
+  private foldSnapshot(snap: Snapshot) {
+    snapshotSchema.parse(snap)
+    for (const value of snap.notices) {
+      const notice = parseRecoveryRecord(value)
+      if (this.notices.has(notice.deliveryId)) throw new Error('Duplicate snapshot notice')
+      this.notices.set(notice.deliveryId, notice)
+    }
+    const referenced = new Set<string>()
+    for (const value of snap.open) {
+      const { notice, ...fields } = value as SnapshotOpenRow & { transfer?: unknown }
+      if (fields.transfer !== undefined) throw new Error('Inline transfer in compact snapshot')
+      const transfer = notice === undefined ? undefined : this.notices.get(notice)
+      if (notice !== undefined && !transfer) throw new Error('Unknown snapshot notice')
+      const row = (transfer ? { ...fields, transfer } : fields) as JournalRow
+      validateRow(row)
+      if (row.phase === 'closed') throw new Error('Closed row in open snapshot section')
+      if (this.rows.has(row.inputId)) throw new Error('Duplicate snapshot input')
+      this.rows.set(row.inputId, row as OpenInboundRecord)
+      this.indexSlackMessage(row as OpenInboundRecord)
+      if (transfer) referenced.add(transfer.deliveryId)
+    }
+    for (const row of snap.closed) {
+      if (this.rows.has(row.inputId)) throw new Error('Duplicate snapshot input')
+      if (row.noticeDeliveryId !== undefined) {
+        const transfer = this.notices.get(row.noticeDeliveryId)
+        if (
+          !transfer ||
+          principalDigest(transfer.principal) !== row.principalDigest ||
+          !transfer.covers.some((c) => c.store === 'inbound' && c.id === row.inputId && c.generation <= row.generation)
+        )
+          throw new Error('Invalid closed notice coverage')
+        referenced.add(transfer.deliveryId)
+      }
+      this.rows.set(row.inputId, row)
+      this.indexSlackMessage(row)
+    }
+    if (referenced.size !== this.notices.size) throw new Error('Unreferenced snapshot notice')
+    this.foldSnapshotHistory(snap.seq, snap.receipts, snap.decisions)
+  }
+  private foldSnapshotHistory(seq: number, receipts: DecisionReceipt[], decisions: Decision[]) {
+    const sequences = new Set<number>()
+    const transitions = new Set<string>()
+    for (const receipt of receipts) {
+      if (receipt.seq > seq || sequences.has(receipt.seq) || transitions.has(receipt.transitionId))
+        throw new Error('Invalid snapshot receipt sequence')
+      sequences.add(receipt.seq)
+      transitions.add(receipt.transitionId)
+      for (const ref of receipt.inboundRefs) {
+        const row = this.rows.get(ref.inputId)
+        if (!row || ref.generation < 1 || ref.generation > row.generation)
+          throw new Error('Snapshot receipt has invalid generation')
+      }
+      if (this.retainsReceipt(receipt.transitionId, receipt.epoch)) this.receipts.set(receipt.transitionId, receipt)
+    }
+    for (const decision of decisions) {
+      this.validateDecision(decision)
+      if (
+        decision.seq > seq ||
+        sequences.has(decision.seq) ||
+        transitions.has(decision.transitionId) ||
+        !decision.backgroundChanges.length
+      )
+        throw new Error('Invalid pending snapshot decision')
+      sequences.add(decision.seq)
+      transitions.add(decision.transitionId)
+      for (const change of decision.changes) {
+        const current = this.rows.get(change.row.inputId)
+        const expected = change.row.phase === 'closed' ? tombstone(change.row) : change.row
+        if (canonical(current) !== canonical(expected))
+          throw new Error('Snapshot pending decision conflicts with source')
+      }
+      this.decisions.set(decision.transitionId, decision)
+    }
+  }
+  private foldDecision(decision: Decision) {
+    this.validateDecision(decision)
+    const pending = this.decisions.get(decision.transitionId)
+    const receipt = this.receipts.get(decision.transitionId)
+    if (receipt && receipt.decisionDigest !== digest(decision))
+      throw new Error('Conflicting compacted transition identity')
+    if (pending) {
+      if (canonical(pending) !== canonical(decision)) throw new Error('Conflicting duplicate journal transition')
+      return
+    }
+    if (receipt) return
+    for (const change of decision.changes) this.validateChange(change, decision.type)
+    for (const change of decision.changes) {
+      this.install(change.row)
+      // Only admission creates a row; later transitions keep its immutable identity.
+      if (decision.type === 'admitted') this.indexSlackMessage(this.rows.get(change.row.inputId)!)
+    }
+    // A mixed decision stays in full until its background application is recorded.
+    if (decision.backgroundChanges.length) this.decisions.set(decision.transitionId, decision)
+    else this.remember(decision)
+  }
+  private foldApplied(receipt: Applied) {
+    appliedSchema.parse(receipt)
+    const decision = this.decisions.get(receipt.decisionId)
+    if (
+      !decision ||
+      digest(decision) !== receipt.decisionDigest ||
+      receipt.transitionId !== `applied:${receipt.decisionId}`
+    )
+      throw new Error('Invalid mixed application receipt')
+    this.decisions.delete(receipt.decisionId)
+    this.remember(decision)
+  }
+  /** Applied history is normalized at once: a full decision body never outlives its application. */
+  private remember(decision: Decision) {
+    if (this.minted.delete(decision.transitionId) || !this.retainsReceipt(decision.transitionId, decision.epoch)) return
+    this.receipts.set(decision.transitionId, {
+      transitionId: decision.transitionId,
+      seq: decision.seq,
+      epoch: decision.epoch,
+      type: decision.type,
+      decisionDigest: digest(decision),
+      payloadDigest: digest([decision.type, decision.changes, decision.backgroundChanges]),
+      ...(decision.requestDigest !== undefined ? { requestDigest: decision.requestDigest } : {}),
+      ...this.result(
+        decision.changes.map((c) => c.row),
+        decision.backgroundChanges.map((c) => c.row),
+      ),
+    })
+  }
+  /**
+   * A receipt only matters to a caller that can still present its transition ID. Admission IDs are
+   * answered by the permanent row itself. A bare UUID is a runtime-local handle: once the epoch that
+   * minted or received it has ended, no live caller holds it and no durable record re-issues one.
+   * Derived and caller-named IDs (`prepare:`, `owned:`, `recovery:`, stop IDs, …) stay indefinitely.
+   */
+  private retainsReceipt(transitionId: string, epoch: string | undefined) {
+    if (transitionId.startsWith('admit:')) return false
+    return !(uuid.test(transitionId) && epoch !== this.epoch)
+  }
+  /** Keeps open rows in full and closed rows as tombstones; the frozen transfer is stored once per delivery. */
+  private install(row: JournalRow) {
+    let transfer = row.transfer
+    if (transfer) {
+      const frozen = this.notices.get(transfer.deliveryId)
+      if (frozen && canonical(frozen) !== canonical(transfer)) throw new Error('Conflicting frozen transfer payload')
+      if (frozen) transfer = frozen
+      else this.notices.set(transfer.deliveryId, transfer)
+    }
+    this.rows.set(
+      row.inputId,
+      row.phase === 'closed' ? tombstone(row) : ((transfer ? { ...row, transfer } : row) as OpenInboundRecord),
+    )
+  }
+  private frozenNotice(row: InboundRecord | undefined): RecoveryRecord | undefined {
+    if (!row) return undefined
+    if (row.phase !== 'closed') return row.transfer
+    return row.noticeDeliveryId === undefined ? undefined : this.notices.get(row.noticeDeliveryId)
+  }
   private indexSlackMessage(row: InboundRecord) {
-    const key = storedSlackMessageKey(row)
+    const key = row.phase === 'closed' ? row.messageKey : storedSlackMessageKey(row)
     if (!key) return
     const current = this.rows.get(this.slackMessages.get(key) ?? '')
     // Historical per-revision rows all stay; the earliest admission deterministically represents the message.
@@ -662,24 +899,27 @@ export class InboundJournal {
       throw new Error('Invalid notice ownership')
   }
   private async append(line: Line, repair = false) {
-    if (repair) {
-      if (!this.fd) throw new Error('Journal repair has no file handle')
-    } else this.assertAvailable()
+    if (!repair) this.assertAvailable()
+    // Appends run on the writer queue, never inside a compaction swap: only a real open handle is written.
+    const fd = this.fd
+    if (!fd) throw new Error('Journal append has no open handle')
     try {
       const start = performance.now()
-      await this.fd!.writeFile(`${JSON.stringify(line)}\n`)
+      const text = `${JSON.stringify(line)}\n`
+      await fd.writeFile(text)
       await this.options.onDurability?.('append-written', line)
-      await this.fd!.sync()
+      await fd.sync()
       this.options.onSync?.(performance.now() - start)
       await this.options.onDurability?.('append-synced', line)
-      this.fold(line)
+      this.fold(line, Buffer.byteLength(text))
     } catch (error) {
       this.fail(error)
       throw error
     }
+    this.scheduleCompaction()
   }
   private async applyBackground(decision: Decision, repair = false) {
-    if (!decision.backgroundChanges.length || this.applied.has(decision.transitionId)) return
+    if (!decision.backgroundChanges.length || !this.decisions.has(decision.transitionId)) return
     if (!this.background) throw new Error('Mixed decision requires background store')
     const identity = { transitionId: decision.transitionId, decisionDigest: digest(decision) }
     for (const change of decision.backgroundChanges) {
@@ -756,7 +996,6 @@ export class InboundJournal {
     try {
       for (const decision of [...this.decisions.values()].sort((a, b) => a.seq - b.seq)) {
         if (this.initializationCancelled) return
-        if (!decision.backgroundChanges.length || this.applied.has(decision.transitionId)) continue
         const target = decision.backgroundChanges[0]!.row.target
         await this.background!.withTargetLane(target, () => this.applyBackground(decision, true))
       }
@@ -778,10 +1017,11 @@ export class InboundJournal {
     type: string,
     changes: Change[],
     backgroundChanges: BackgroundChange[],
-    transitionId: string = randomUUID(),
+    requestedTransitionId?: string,
     requestDigest?: string,
   ) {
     this.assertAvailable()
+    const transitionId = requestedTransitionId ?? randomUUID()
     const receipt = this.receipts.get(transitionId)
     if (receipt) {
       if (receipt.payloadDigest !== digest([type, changes, backgroundChanges]))
@@ -816,7 +1056,13 @@ export class InboundJournal {
       if (!this.background) throw new Error('Mixed decision requires background store')
       this.background.assertAvailable()
     }
-    await this.append(decision)
+    if (requestedTransitionId === undefined) this.minted.add(transitionId)
+    try {
+      await this.append(decision)
+    } catch (error) {
+      this.minted.delete(transitionId)
+      throw error
+    }
     try {
       await this.applyBackground(decision)
     } catch (error) {
@@ -830,7 +1076,7 @@ export class InboundJournal {
    * representative row whatever revision or thread shape arrives; only identities outside the message
    * index (other adapters, receipt-only, undecodable rows) use exact identity. A duplicate returns the
    * existing row untouched (its debt never follows a new routing thread), and a different author is a
-   * conflict, never a fresh slot.
+   * conflict, never a fresh slot — closed or open.
    */
   private existingAdmission(input: InboundAdmission) {
     const root = dirname(dirname(this.path))
@@ -846,7 +1092,11 @@ export class InboundJournal {
     const message = slackMessageKey({ root, ...input })
     const representative = message ? this.slackMessages.get(message) : undefined
     const existing = this.rows.get(representative ?? inputId)
-    if (existing && canonical(existing.principal) !== canonical(input.principal))
+    if (
+      existing &&
+      (existing.phase === 'closed' ? existing.principalDigest : principalDigest(existing.principal)) !==
+        principalDigest(input.principal)
+    )
       throw new Error('Conflicting duplicate admission principal')
     return { identity, inputId, existing }
   }
@@ -871,9 +1121,9 @@ export class InboundJournal {
         return {
           kind: 'duplicate' as const,
           inputId: existing.inputId,
-          outcome: copy(existing.outcome ?? null) ?? undefined,
+          outcome: existing.phase === 'closed' ? copy(existing.outcome) : undefined,
         }
-      const row: InboundRecord = {
+      const row: OpenInboundRecord = {
         schemaVersion: 1,
         inputId,
         identity,
@@ -891,26 +1141,27 @@ export class InboundJournal {
       return { kind: 'accepted' as const, inputId, generation: 1 }
     })
   }
-  get(inputId: string) {
+  get(inputId: string): InboundRecord | undefined {
     this.assertAvailable()
     const row = this.rows.get(inputId)
     return row ? copy(row) : undefined
   }
-  list() {
+  list(): InboundRecord[] {
     this.assertAvailable()
     return [...this.rows.values()].map(copy)
   }
   resolve(ids: readonly string[]): InboundRef[] {
+    this.assertAvailable()
     return ids.map((inputId) => {
-      const row = this.get(inputId)
+      const row = this.rows.get(inputId)
       if (!row) throw new Error('Unknown inbound ID')
       return { inputId, generation: row.generation }
     })
   }
-  private coverage(refs: InboundRef[], target: ChannelKey) {
+  private coverage(refs: InboundRef[], target: ChannelKey): OpenInboundRecord[] {
     const seen = new Set<string>()
     return refs.map((ref) => {
-      const row = this.get(ref.inputId)
+      const row = this.rows.get(ref.inputId)
       if (
         !row ||
         seen.has(ref.inputId) ||
@@ -923,7 +1174,7 @@ export class InboundJournal {
       return row
     })
   }
-  private async backgroundCoverage(refs: BackgroundObligationRef[], target: ChannelKey, inbound: InboundRecord[]) {
+  private async backgroundCoverage(refs: BackgroundObligationRef[], target: ChannelKey, inbound: OpenInboundRecord[]) {
     if (refs.length && !this.background) throw new Error('Missing background store')
     const seen = new Set<string>()
     const rows: BackgroundObligation[] = []
@@ -943,7 +1194,10 @@ export class InboundJournal {
     }
     return rows
   }
-  private result(rows: InboundRecord[], background: BackgroundObligation[]) {
+  private result(
+    rows: ReadonlyArray<{ inputId: string; generation: number }>,
+    background: ReadonlyArray<{ obligationId: string; generation: number }>,
+  ) {
     return {
       inboundRefs: rows.map((r) => ({ inputId: r.inputId, generation: r.generation })),
       backgroundRefs: background.map((r) => ({ obligationId: r.obligationId, generation: r.generation })),
@@ -976,7 +1230,7 @@ export class InboundJournal {
         )
     if (identity.type === 'turn-claimed' || identity.type === 'ownership-moved') {
       for (const ref of result.inboundRefs) {
-        const row = this.get(ref.inputId)
+        const row = this.rows.get(ref.inputId)
         if (!row || row.generation !== ref.generation || row.phase !== 'turn-owned' || row.claim?.epoch !== this.epoch)
           throw new Error('Journal ownership decision superseded')
       }
@@ -1051,10 +1305,10 @@ export class InboundJournal {
       const requestDigest = digest(['outcome-decided', refs, outcome, brefs, target])
       const repeated = await this.repeated(outcome.decisionId, requestDigest)
       if (repeated) return repeated
+      const first = this.rows.get(refs[0]?.inputId ?? '')
+      if (first?.phase === 'closed') throw new Error('Invalid inbound coverage')
       const destination =
-        target ??
-        this.get(refs[0]?.inputId ?? '')?.target ??
-        (brefs[0] ? (await this.background?.get(brefs[0].obligationId))?.target : undefined)
+        target ?? first?.target ?? (brefs[0] ? (await this.background?.get(brefs[0].obligationId))?.target : undefined)
       if (!destination) {
         if (!refs.length && !brefs.length) return this.result([], [])
         throw new Error('Missing outcome target')
@@ -1085,22 +1339,34 @@ export class InboundJournal {
       return this.result(next, nextBg)
     })
   }
+  /**
+   * Freezes a notice over owed coverage. `cause` picks the template: `restart` (the default) is the
+   * RFC boot-recovery notice with its original request digest; `live-turn-ended` is a same-process
+   * turn that ended unanswered and is frozen as its own distinct record.
+   */
   prepareNotice(
     refs: InboundRef[],
     target: ChannelKey,
     brefs: BackgroundObligationRef[] = [],
     ownerSessionId?: string,
+    cause: RecoveryNoticeCause = 'restart',
   ) {
     return this.serialized(async () => {
       this.assertAvailable()
-      const requestDigest = digest(['notice-prepared', refs, target, brefs, ownerSessionId])
+      // Restart keeps the pre-cause request digest so earlier preparation receipts still match.
+      const requestDigest = digest(
+        cause === 'restart'
+          ? ['notice-prepared', refs, target, brefs, ownerSessionId]
+          : ['notice-prepared', refs, target, brefs, ownerSessionId, cause],
+      )
       const transitionId = `prepare:${digest(['inbound-transfer', refs, brefs])}`
       const prior = this.decisions.get(transitionId)
       const receipt = this.receipts.get(transitionId)
       if (prior || receipt) {
         if ((prior ?? receipt)!.requestDigest !== requestDigest)
           throw new Error('Conflicting duplicate notice preparation')
-        const transfer = prior?.changes[0]?.row.transfer ?? this.get(receipt!.inboundRefs[0]!.inputId)?.transfer
+        const transfer =
+          prior?.changes[0]?.row.transfer ?? this.frozenNotice(this.rows.get(receipt!.inboundRefs[0]!.inputId))
         if (!transfer || channelKeyId(transfer.target) !== channelKeyId(target))
           throw new Error('Conflicting duplicate notice preparation')
         return copy(transfer)
@@ -1124,6 +1390,7 @@ export class InboundJournal {
         transferId,
         recoveryGeneration: transferId,
         sourceParentSessionId: parents[0],
+        cause,
         covers: [
           ...refs.map((r, i) => ({
             store: 'inbound' as const,
@@ -1167,21 +1434,22 @@ export class InboundJournal {
     this.assertAvailable()
     parseRecoveryRecord(transfer)
     for (const cover of transfer.covers.filter((c) => c.store === 'inbound')) {
-      const row = this.get(cover.id)
-      if (!row?.transfer || recoveryPayload(row.transfer) !== recoveryPayload(transfer))
+      const frozen = this.frozenNotice(this.rows.get(cover.id))
+      if (!frozen || recoveryPayload(frozen) !== recoveryPayload(transfer))
         throw new Error('Prepared frozen payload mismatch')
     }
     const imported = await outbox.import(transfer)
     await this.serialized(async () => {
-      const rows = transfer.covers.filter((c) => c.store === 'inbound').map((c) => this.get(c.id))
-      if (rows.some((row) => !row || row.transfer?.deliveryId !== transfer.deliveryId))
+      this.assertAvailable()
+      const rows = transfer.covers.filter((c) => c.store === 'inbound').map((c) => this.rows.get(c.id))
+      if (rows.some((row) => this.frozenNotice(row)?.deliveryId !== transfer.deliveryId))
         throw new Error('Prepared transfer mismatch')
       for (const c of transfer.covers.filter((c) => c.store === 'background')) {
         const row = await this.background?.ownNotice(c.id, c.generation, transfer.deliveryId)
         if (!row && imported.state !== 'delivered' && imported.state !== 'suppressed')
           throw new Error('Background notice ownership conflict')
       }
-      const pending = rows.filter((row): row is InboundRecord => !!row && row.phase === 'notice-prepared')
+      const pending = rows.filter((row): row is OpenInboundRecord => !!row && row.phase === 'notice-prepared')
       if (pending.length)
         await this.commit(
           'notice-owned',
@@ -1197,7 +1465,7 @@ export class InboundJournal {
     return imported
   }
   /** Pre-routing duplicate check; the same resolver and author fence as admission. */
-  lookupAdmission(input: InboundAdmission) {
+  lookupAdmission(input: InboundAdmission): InboundRecord | undefined {
     this.assertAvailable()
     const { existing } = this.existingAdmission(input)
     return existing ? copy(existing) : undefined
@@ -1221,16 +1489,23 @@ export class InboundJournal {
     }
     for (const { target, inputIds } of issued.values()) {
       const reimport = async () => {
-        const current = inputIds.map((id) => this.get(id)).find((row) => row?.phase !== 'closed' && row?.transfer)
-        if (current?.transfer) await this.importPrepared(outbox, current.transfer)
+        this.assertAvailable()
+        for (const inputId of inputIds) {
+          const row = this.rows.get(inputId)
+          if (row?.phase === 'closed' || !row?.transfer) continue
+          await this.importPrepared(outbox, row.transfer)
+          return
+        }
       }
       await (background ? background.withTargetLane(target, reimport) : reimport())
     }
-    const transferable = (row: InboundRecord | BackgroundObligation) =>
-      row.phase !== 'closed' && !row.transfer && row.epoch !== this.epoch
+    const owedInbound = (row: InboundRecord | undefined): row is OpenInboundRecord =>
+      !!row && row.phase !== 'closed' && !row.transfer && row.epoch !== this.epoch
+    const owedBackground = (row: BackgroundObligation | undefined): row is BackgroundObligation =>
+      !!row && row.phase !== 'closed' && !row.transfer && row.epoch !== this.epoch
     const partitions = new Map<string, { target: ChannelKey; inputIds: string[]; backgroundIds: string[] }>()
     for (const row of this.rows.values()) {
-      if (!transferable(row)) continue
+      if (!owedInbound(row)) continue
       const key = inboundPartition(row)
       const partition = partitions.get(key) ?? { target: row.target, inputIds: [], backgroundIds: [] }
       partitions.set(key, partition)
@@ -1238,19 +1513,20 @@ export class InboundJournal {
     }
     if (background && partitions.size) {
       for (const row of await background.list())
-        if (transferable(row)) partitions.get(backgroundPartition(row))?.backgroundIds.push(row.obligationId)
+        if (owedBackground(row)) partitions.get(backgroundPartition(row))?.backgroundIds.push(row.obligationId)
     }
     for (const [key, partition] of partitions) {
       const transfer = async () => {
+        this.assertAvailable()
         // The boot snapshot is not authority: cover only rows still open in this exact partition.
         const rows = partition.inputIds
-          .map((id) => this.get(id))
-          .filter((row): row is InboundRecord => !!row && transferable(row) && inboundPartition(row) === key)
+          .map((id) => this.rows.get(id))
+          .filter((row): row is OpenInboundRecord => owedInbound(row) && inboundPartition(row) === key)
         if (!rows.length) return
         const children: BackgroundObligation[] = []
         for (const id of partition.backgroundIds) {
           const row = await background!.get(id)
-          if (row && transferable(row) && backgroundPartition(row) === key) children.push(row)
+          if (owedBackground(row) && backgroundPartition(row) === key) children.push(row)
         }
         const prepared = await this.prepareNotice(
           rows
@@ -1271,8 +1547,9 @@ export class InboundJournal {
     let open = false
     parseRecoveryRecord(record)
     for (const cover of record.covers.filter((c) => c.store === 'inbound')) {
-      const row = this.get(cover.id)
-      if (!row?.transfer || recoveryPayload(row.transfer) !== recoveryPayload(record))
+      const row = this.rows.get(cover.id)
+      const frozen = this.frozenNotice(row)
+      if (!row || !frozen || recoveryPayload(frozen) !== recoveryPayload(record))
         throw new Error('Invalid inbound notice authority')
       if (row.phase === 'closed') continue
       if (row.phase !== 'notice-owned' || row.generation !== cover.generation)
@@ -1298,13 +1575,15 @@ export class InboundJournal {
     return this.closeNotice(record, { kind: 'intentionally-suppressed', ...decision, deliveryId: record.deliveryId })
   }
   private async closeNotice(record: RecoveryRecord, outcome: InboundOutcome) {
+    this.assertAvailable()
     parseRecoveryRecord(record)
     const refs: InboundRef[] = []
     const bg: BackgroundObligationRef[] = []
     for (const c of record.covers) {
       if (c.store === 'inbound') {
-        const row = this.get(c.id)
-        if (!row?.transfer || recoveryPayload(row.transfer) !== recoveryPayload(record))
+        const row = this.rows.get(c.id)
+        const frozen = this.frozenNotice(row)
+        if (!row || !frozen || recoveryPayload(frozen) !== recoveryPayload(record))
           throw new Error('Inbound receipt mismatch')
         if (row.phase !== 'closed') refs.push({ inputId: c.id, generation: c.generation })
       }
@@ -1317,72 +1596,115 @@ export class InboundJournal {
     }
     if (refs.length || bg.length) await this.settle(refs, outcome, bg, record.target)
   }
-  compact() {
-    return this.serialized(async () => {
-      this.assertAvailable()
-      const receipts = new Map(this.receipts)
-      const pending: Decision[] = []
-      for (const decision of this.decisions.values()) {
-        if (decision.backgroundChanges.length && !this.applied.has(decision.transitionId)) {
-          pending.push(decision)
-          continue
-        }
-        const result = this.result(
-          decision.changes.map((c) => c.row),
-          decision.backgroundChanges.map((c) => c.row),
-        )
-        receipts.set(decision.transitionId, {
-          transitionId: decision.transitionId,
-          seq: decision.seq,
-          type: decision.type,
-          decisionDigest: digest(decision),
-          payloadDigest: digest([decision.type, decision.changes, decision.backgroundChanges]),
-          requestDigest: decision.requestDigest,
-          ...result,
-        })
-      }
-      const snapshot: Snapshot = {
-        schemaVersion: 1,
-        seq: Math.max(1, this.sequence),
-        type: 'snapshot',
-        rows: [...this.rows.values()],
-        decisions: pending,
-        receipts: [...receipts.values()],
-      }
-      const temp = `${this.path}.${randomUUID()}.tmp`
-      try {
-        const fd = await open(temp, 'wx', 0o600)
-        try {
-          await fd.writeFile(`${JSON.stringify(snapshot)}\n`)
-          await fd.sync()
-        } finally {
-          await fd.close()
-        }
-        await this.options.onDurability?.('temp-synced', snapshot)
-        await this.fd!.close()
-        this.fd = undefined
-        await this.options.onDurability?.('handle-closed', snapshot)
-        await rename(temp, this.path)
-        await this.options.onDurability?.('replaced', snapshot)
-        await syncDirectory(dirname(this.path))
-        await this.options.onDurability?.('directory-synced', snapshot)
-        this.fd = await open(this.path, 'a+', 0o600)
-        this.sequence = snapshot.seq
-        this.receipts = receipts
-        this.decisions = new Map(pending.map((d) => [d.transitionId, d]))
-        this.applied.clear()
-        await this.options.onDurability?.('reopened', snapshot)
-      } catch (error) {
-        this.fail(error)
-        throw error
-      }
+  /**
+   * Starts growth-driven compaction once boot recovery has finished. A compaction is queued on the
+   * writer's own queue when the bytes appended since the last snapshot reach the larger of a fixed
+   * floor and that snapshot's size, so rewrite work stays proportional to new growth (tombstones kept
+   * forever never cause repeated rewrites) and a journal that is not growing is never rewritten.
+   * Checked here and after each append; `close()` stops it.
+   */
+  startMaintenance() {
+    if (this.closing || this.initializationCancelled) return
+    this.maintaining = true
+    this.scheduleCompaction()
+  }
+  private scheduleCompaction() {
+    if (
+      !this.maintaining ||
+      this.compactionQueued ||
+      this.growthBytes < Math.max(this.options.compactionFloorBytes ?? COMPACTION_FLOOR_BYTES, this.snapshotBytes)
+    )
+      return
+    this.compactionQueued = true
+    void this.serialized(async () => {
+      this.compactionQueued = false
+      // Shutdown or a freeze after scheduling leaves the growth for the next boot to compact.
+      if (!this.maintaining || this.frozen !== undefined || !this.fd) return
+      await this.compactInternal()
+    }).catch(() => {
+      // compactInternal froze the journal and reported the failure through fail().
     })
+  }
+  compact() {
+    return this.serialized(() => this.compactInternal())
+  }
+  /**
+   * Rewrites the journal as one compact snapshot of the already-normalized state: temp sync, close the
+   * old handle, replace, directory sync, reopen. Any failure freezes the writer; it never appends
+   * through a handle to an unlinked file.
+   */
+  private async compactInternal() {
+    this.assertAvailable()
+    // The writer stall starts here, before the snapshot is materialized and written.
+    await this.options.onDurability?.('compaction-started')
+    const snapshot = this.snapshot()
+    const text = `${JSON.stringify(snapshot)}\n`
+    const temp = `${this.path}.${randomUUID()}.tmp`
+    let ownsTemp = false
+    try {
+      const fd = await open(temp, 'wx', 0o600)
+      ownsTemp = true
+      try {
+        await fd.writeFile(text)
+        await fd.sync()
+      } finally {
+        await fd.close()
+      }
+      await this.options.onDurability?.('temp-synced', snapshot)
+      const previous = this.fd!
+      this.swapping = true
+      this.fd = undefined
+      await previous.close()
+      await this.options.onDurability?.('handle-closed', snapshot)
+      await rename(temp, this.path)
+      ownsTemp = false
+      await this.options.onDurability?.('replaced', snapshot)
+      await syncDirectory(dirname(this.path))
+      await this.options.onDurability?.('directory-synced', snapshot)
+      this.fd = await open(this.path, 'a+', 0o600)
+      this.swapping = false
+      this.sequence = snapshot.seq
+      this.snapshotBytes = Buffer.byteLength(text)
+      this.growthBytes = 0
+      await this.options.onDurability?.('reopened', snapshot)
+    } catch (error) {
+      // A failed swap freezes before the swap flag clears, so no instant reports a healthy journal.
+      this.fail(error)
+      this.swapping = false
+      // Only this compaction's own never-installed temp file is removed.
+      if (ownsTemp) await unlink(temp).catch(() => {})
+      throw error
+    }
+  }
+  private snapshot(): Snapshot {
+    const open: SnapshotOpenRow[] = []
+    const closed: ClosedInboundRecord[] = []
+    for (const row of this.rows.values()) {
+      if (row.phase === 'closed') {
+        closed.push(row)
+        continue
+      }
+      const { transfer, ...fields } = row
+      open.push(transfer ? { ...fields, notice: transfer.deliveryId } : fields)
+    }
+    return {
+      schemaVersion: 2,
+      seq: Math.max(1, this.sequence),
+      type: 'snapshot',
+      notices: [...this.notices.values()],
+      open,
+      closed,
+      decisions: [...this.decisions.values()],
+      receipts: [...this.receipts.values()],
+    }
   }
   async flush() {
     await this.queue
   }
   close() {
     this.cancelInitialization()
+    // A queued compaction that has not started is skipped; one in progress finishes before the handle closes.
+    this.maintaining = false
     return (this.closing ??= this.serialized(async () => {
       try {
         await this.fd?.close()

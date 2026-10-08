@@ -6,8 +6,14 @@ import { join } from 'node:path'
 import { noopPermissionService } from '@/permissions'
 
 import { createBotRecoveryCallbacks } from './adapters/recovery-correlation'
-import { RECOVERY_NOTICE_TEXT, recoveryDeliveryId, type RecoveryRecord } from './continuity-types'
+import {
+  LIVE_TURN_ENDED_NOTICE_TEXT,
+  RECOVERY_NOTICE_TEXT,
+  recoveryDeliveryId,
+  type RecoveryRecord,
+} from './continuity-types'
 import { RecoveryDispatcher } from './recovery-dispatcher'
+import { createRecoveryNotice } from './recovery-notice'
 import { RecoveryOutbox } from './recovery-outbox'
 import { createChannelRouter, type ChannelRouter } from './router'
 import { defaultHistoryConfig } from './schema'
@@ -146,6 +152,47 @@ test('old ambiguous lease reconciles its own post and persists receipt without r
     await dispatcher.stop()
     expect((await new RecoveryOutbox(dir).get(notice.deliveryId))?.receipt?.messageId).toBe('remote-confirmed')
     expect(sends).toBe(0)
+  } finally {
+    await dispatcher.stop()
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('live-turn-ended notice reconciles an ambiguous old lease by its delivery marker without reposting', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'recovery-live-reconcile-'))
+  const dead = new RecoveryOutbox(dir, { epoch: 'dead', now: () => 1 })
+  const notice = createRecoveryNotice({ ...record('live'), cause: 'live-turn-ended' })
+  expect(notice.deliveryId).not.toBe(record('live').deliveryId)
+  await dead.import(notice)
+  await dead.lease(notice.deliveryId, 1)
+  const recovered = new RecoveryOutbox(dir, { epoch: 'new', now: () => 10_000 })
+  const reconciled: string[] = []
+  let sends = 0
+  const router = {
+    setRecoveryStopHandler() {},
+    validateRecovery: async () => undefined,
+    reconcileRecovery: async (value: RecoveryRecord) => {
+      reconciled.push(value.deliveryId)
+      return { status: 'found', messageId: 'remote-live' }
+    },
+    send: async () => {
+      sends++
+      return { ok: true }
+    },
+  } as unknown as ChannelRouter
+  const dispatcher = new RecoveryDispatcher(recovered, router, { now: () => 10_000 })
+  try {
+    await dispatcher.wake()
+    await until(async () => (await recovered.get(notice.deliveryId))?.state === 'delivered')
+    await dispatcher.stop()
+    expect(reconciled).toEqual([notice.deliveryId])
+    expect(sends).toBe(0)
+    expect(await new RecoveryOutbox(dir).get(notice.deliveryId)).toMatchObject({
+      schemaVersion: 2,
+      cause: 'live-turn-ended',
+      text: LIVE_TURN_ENDED_NOTICE_TEXT,
+      receipt: { messageId: 'remote-live' },
+    })
   } finally {
     await dispatcher.stop()
     await rm(dir, { recursive: true, force: true })

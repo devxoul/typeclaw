@@ -1,6 +1,11 @@
 import type { MatchableOrigin } from '../permissions/resolve'
-import { parseRecoveryRecord, RECOVERY_NOTICE_TEXT, recoveryDeliveryId } from './continuity-types'
-import type { RecoveryRecord } from './continuity-types'
+import {
+  LIVE_TURN_ENDED_NOTICE_TEXT,
+  parseRecoveryRecord,
+  RECOVERY_NOTICE_TEXT,
+  recoveryDeliveryId,
+} from './continuity-types'
+import type { RecoveryNoticeCause, RecoveryRecord } from './continuity-types'
 import { channelKeyId } from './types'
 import type { ChannelKey } from './types'
 
@@ -33,6 +38,11 @@ export function recoveryNoticePartitionKey(input: {
   ])
 }
 
+/**
+ * Freezes a transfer at preparation. `restart` (the default) is the RFC en/v1 boot-recovery
+ * notice, byte- and ID-identical to every record written before causes existed. Same-process
+ * abandonment passes `live-turn-ended`, which never asserts a restart.
+ */
 export function createRecoveryNotice(
   input: Pick<
     RecoveryRecord,
@@ -43,9 +53,9 @@ export function createRecoveryNotice(
     | 'covers'
     | 'recoveryGeneration'
     | 'transferId'
-  > & { createdAt?: number; sourceParentSessionId?: string },
+  > & { createdAt?: number; sourceParentSessionId?: string; cause?: RecoveryNoticeCause },
 ): RecoveryRecord {
-  const record = {
+  const source = {
     target: input.target,
     accountIdentity: input.accountIdentity,
     ...(input.accountIdentityConflict !== undefined ? { accountIdentityConflict: input.accountIdentityConflict } : {}),
@@ -54,11 +64,27 @@ export function createRecoveryNotice(
     recoveryGeneration: input.recoveryGeneration,
     transferId: input.transferId,
     ...(input.sourceParentSessionId !== undefined ? { sourceParentSessionId: input.sourceParentSessionId } : {}),
-    schemaVersion: 1 as const,
-    purpose: 'interruption-notice' as const,
-    templateVersion: 1 as const,
-    locale: 'en' as const,
-    text: RECOVERY_NOTICE_TEXT,
+  }
+  const template =
+    input.cause === 'live-turn-ended'
+      ? {
+          schemaVersion: 2 as const,
+          purpose: 'interruption-notice' as const,
+          cause: 'live-turn-ended' as const,
+          templateVersion: 1 as const,
+          locale: 'en' as const,
+          text: LIVE_TURN_ENDED_NOTICE_TEXT,
+        }
+      : {
+          schemaVersion: 1 as const,
+          purpose: 'interruption-notice' as const,
+          templateVersion: 1 as const,
+          locale: 'en' as const,
+          text: RECOVERY_NOTICE_TEXT,
+        }
+  const record = {
+    ...source,
+    ...template,
     createdAt: input.createdAt ?? Date.now(),
     generation: 1,
     state: 'pending' as const,

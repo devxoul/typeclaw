@@ -1309,6 +1309,19 @@ type LiveSession = {
   // also fulfills it, while a continuation-willingness/status send preserves
   // it. A real user batch resets it beside `toolExecutionThisLogicalTurn`.
   promisedWorkOutstandingThisLogicalTurn: boolean
+  // True while the latest landed output accounted to this logical turn was a
+  // continuation-willingness/status message ("I'll check and get back to you"):
+  // the turn told the user more was coming without the machine-readable
+  // `more_work_this_turn` flag. A substantive send clears it; meta notices
+  // (provider error, fallbacks) leave it. Together with
+  // `promisedWorkOutstandingThisLogicalTurn` it marks promised unfinished work,
+  // which explicit silence can never settle. Reset with the logical turn.
+  statusOutputOutstandingThisLogicalTurn: boolean
+  // Backing turn id whose owed coverage a documented guard deferred to the next
+  // inbound (the GitHub recovery review guard: "the next inbound re-prompts the
+  // model"). That fresh batch carries the coverage instead of transferring it as
+  // abandoned; any other turn id is stale. Cleared when a fresh batch consumes it.
+  nextInboundContinuationTurnId: string | null
   // Captured by drain() at batch dequeue; read+cleared by send() on the
   // first tool-source send of the turn. The anchor decision (delay
   // threshold + intervening-observed check) is evaluated at SEND time
@@ -2099,6 +2112,10 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   // when it evaluates; a write appended afterward would still race a caller that
   // deletes the agent dir right after stop() resolves.
   let closing = false
+  // Set once a graceful restart aborts every live turn. Those turns end because
+  // the process is restarting, so their owed coverage stays for boot recovery's
+  // restart notice instead of being transferred as a live-turn-ended one.
+  let restartShutdownPending = false
 
   const ensureLoaded = async (): Promise<void> => {
     if (mappings !== null) return
@@ -2404,7 +2421,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   }
 
   // Every durable identity a handoff owns, for the transfer that ends it
-  // without a successor (capacity, expiry, router stop).
+  // without a successor (capacity or expiry) and for /stop withdrawal.
   const pendingReloadHandoffInputIds = (pending: PendingReloadHandoff): string[] => [
     ...(pending.coverage?.inboundIds ?? []),
     ...pending.inbounds.flatMap((input) => (input.inputId ? [input.inputId] : [])),
@@ -2425,6 +2442,11 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     return total
   }
 
+  // Every transfer the router prepares ends live work in THIS process: a turn
+  // that ended without answering, an account replaced under it, a reload or
+  // lifecycle bound that refused its handoff. None of them is a restart, so the
+  // frozen notice says the live turn ended. Restart notices are prepared only by
+  // boot recovery of an older epoch; router stop() leaves its debt for that.
   const transferLostCoverageInLane = async (
     target: ChannelKey,
     inputIds: readonly string[],
@@ -2469,11 +2491,17 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       else backgroundOnly.push(ref)
     }
     for (const group of groups.values()) {
-      const record = await inboundJournal.prepareNotice(group.inboundRefs, target, group.backgroundRefs, ownerSessionId)
+      const record = await inboundJournal.prepareNotice(
+        group.inboundRefs,
+        target,
+        group.backgroundRefs,
+        ownerSessionId,
+        'live-turn-ended',
+      )
       await inboundJournal.importPrepared(recoveryOutbox, record)
     }
     for (const ref of backgroundOnly) {
-      const prepared = await backgroundObligations.prepareNotice(ref.obligationId, ref.generation)
+      const prepared = await backgroundObligations.prepareNotice(ref.obligationId, ref.generation, 'live-turn-ended')
       if (!prepared?.transfer) continue
       const imported = await recoveryOutbox.import(prepared.transfer)
       await backgroundObligations.ownNotice(prepared.obligationId, prepared.generation, imported.deliveryId)
@@ -2491,7 +2519,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     const mismatchedInputs = new Set<string>()
     for (const id of inputIds) {
       const row = inboundJournal.get(id)
-      if (row && row.accountIdentity !== currentAccount) mismatchedInputs.add(id)
+      if (row && row.phase !== 'closed' && row.accountIdentity !== currentAccount) mismatchedInputs.add(id)
     }
     const backgroundIds = new Set([
       ...live.backgroundCoverage,
@@ -2530,54 +2558,89 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     return currentAccount
   }
 
+  // Children of the session the coverage was deferred from and of its current
+  // claim owner; the two differ once a reload successor under another session ID
+  // carried it. True while one of them still runs inside the stuck backstop.
+  const awaitsDeferredChild = (live: LiveSession, label: string): boolean => {
+    const deferredSince = live.coverageDeferredSince ?? live.logicalTurnStartedAt
+    return [
+      ...new Set([
+        live.coverageDeferredParentSessionId ?? live.backgroundTurnOwnerSessionId,
+        live.backgroundTurnOwnerSessionId,
+      ]),
+    ].some((parent) => isAwaitingBackgroundChild(live, label, deferredSince, parent))
+  }
+
+  // Cached coverage IDs are hints. A row belongs to this cache's turn only while
+  // the recorded backing turn and owner hold its current-epoch claim at the
+  // current generation; one closed, transferred or re-owned elsewhere does not.
+  const isHeldByLiveTurn = (live: LiveSession, row: InboundRecord | BackgroundObligation | undefined): boolean =>
+    row?.phase === 'turn-owned' &&
+    !row.transfer &&
+    row.claim?.turnId === live.backgroundTurnId &&
+    row.claim.ownerSessionId === live.backgroundTurnOwnerSessionId &&
+    row.claim.epoch === inboundJournal.epoch &&
+    row.claim.generation === row.generation &&
+    channelKeyId(row.target) === live.keyId
+
+  // Ends a live cache's ownership of its turn's coverage: whatever the turn still
+  // holds becomes a durable live-turn-ended notice. Call only in the target lane.
+  // A failed transfer throws before the caches clear, so the owner keeps them and
+  // can retry at its next decision instead of silently dropping the debt.
+  const transferHeldCoverageInLane = async (live: LiveSession): Promise<void> => {
+    if (live.inboundCoverage.length > 0 || live.backgroundCoverage.length > 0) {
+      const inputIds = live.inboundCoverage.filter((id) => isHeldByLiveTurn(live, inboundJournal.get(id)))
+      const backgroundIds: string[] = []
+      for (const id of new Set(live.backgroundCoverage)) {
+        if (isHeldByLiveTurn(live, await backgroundObligations.get(id))) backgroundIds.push(id)
+      }
+      if (inputIds.length > 0 || backgroundIds.length > 0) {
+        await transferLostCoverageInLane(live.key, inputIds, backgroundIds, live.backgroundTurnOwnerSessionId)
+      }
+    }
+    live.inboundCoverage = []
+    live.backgroundCoverage = []
+    live.coverageDeferredSince = null
+    live.coverageDeferredParentSessionId = null
+  }
+
+  // The identity caches and turn lineage a successor adopts with deferred coverage.
+  const reloadCoverageSnapshot = (live: LiveSession): PendingReloadCoverage => ({
+    inboundIds: [...live.inboundCoverage],
+    backgroundIds: [...live.backgroundCoverage],
+    turnId: live.backgroundTurnId,
+    ownerSessionId: live.backgroundTurnOwnerSessionId,
+    logicalTurnStartedAt: live.logicalTurnStartedAt,
+    coverageDeferredSince: live.coverageDeferredSince,
+    coverageDeferredParentSessionId: live.coverageDeferredParentSessionId,
+    ...(live.turnAccountIdentity !== undefined ? { turnAccountIdentity: live.turnAccountIdentity } : {}),
+    lastTurnAuthorId: live.lastTurnAuthorId,
+    lastTurnAuthorIds: [...live.lastTurnAuthorIds],
+  })
+
   // Shared by the idle (immediate) and mid-drain (deferred tail) reload paths.
   // Queued work and the identities of coverage still deferred to background work
   // (a running child of the deferring turn, or its completion wake already queued)
   // move together into one bounded handoff, so a reload never turns that wait
-  // into an interruption notice. Debt the session was not waiting on is an
-  // interruption exactly as before. Coverage bound to a replaced account is
-  // transferred under that original account first, so a fresh-account successor
-  // never inherits it. Whatever the bounds refuse is transferred as lost under
-  // its original principal.
+  // into an interruption notice. Debt the session was not waiting on ended with
+  // its live turn and is transferred as a live-turn-ended notice. Coverage bound
+  // to a replaced account is transferred under that original account first, so a
+  // fresh-account successor never inherits it. Whatever the bounds refuse is
+  // transferred the same way under its original principal.
   const retainLiveWorkInLane = async (live: LiveSession): Promise<boolean> => {
     await ready
     inboundJournal.assertAvailable()
     await transferMismatchedAccountCoverageInLane(live)
     const hasCoverage = live.inboundCoverage.length > 0 || live.backgroundCoverage.length > 0
-    // Children of the session the coverage was deferred from and of its current claim owner.
-    const deferredParents = [
-      ...new Set([
-        live.coverageDeferredParentSessionId ?? live.backgroundTurnOwnerSessionId,
-        live.backgroundTurnOwnerSessionId,
-      ]),
-    ]
-    const deferredSince = live.coverageDeferredSince ?? live.logicalTurnStartedAt
     const deferredToBackground =
       hasCoverage &&
       (live.pendingSystemReminders.some((reminder) => reminder.backgroundObligationId !== undefined) ||
-        deferredParents.some((parent) => isAwaitingBackgroundChild(live, 'reload-handoff', deferredSince, parent)))
-    if (hasCoverage && !deferredToBackground) {
-      await transferLostCoverageInLane(live.key, live.inboundCoverage, live.backgroundCoverage, live.sessionId)
-      live.inboundCoverage = []
-      live.backgroundCoverage = []
-    }
+        awaitsDeferredChild(live, 'reload-handoff'))
+    if (hasCoverage && !deferredToBackground) await transferHeldCoverageInLane(live)
     const inbounds = live.promptQueue.slice()
     const observed = live.contextBuffer.slice()
     const reminders = live.pendingSystemReminders.slice()
-    const coverage: PendingReloadCoverage | null = deferredToBackground
-      ? {
-          inboundIds: [...live.inboundCoverage],
-          backgroundIds: [...live.backgroundCoverage],
-          turnId: live.backgroundTurnId,
-          ownerSessionId: live.backgroundTurnOwnerSessionId,
-          logicalTurnStartedAt: live.logicalTurnStartedAt,
-          coverageDeferredSince: live.coverageDeferredSince,
-          coverageDeferredParentSessionId: live.coverageDeferredParentSessionId,
-          ...(live.turnAccountIdentity !== undefined ? { turnAccountIdentity: live.turnAccountIdentity } : {}),
-          lastTurnAuthorId: live.lastTurnAuthorId,
-          lastTurnAuthorIds: [...live.lastTurnAuthorIds],
-        }
-      : null
+    const coverage = deferredToBackground ? reloadCoverageSnapshot(live) : null
     const incoming: PendingReloadHandoff = {
       key: live.key,
       sessionId: live.sessionId,
@@ -2604,6 +2667,29 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     live.inboundCoverage = []
     live.backgroundCoverage = []
     return retained
+  }
+
+  // Stale rollover runs inside ensureLive, which can already hold this target's
+  // lane, so it performs no durable transition itself. The stale session's owed
+  // coverage moves into the bounded reload handoff its fresh successor adopts;
+  // that successor's first in-lane consume carries whatever is still deferred to
+  // a running child and transfers the rest as a live-turn-ended notice. A refused
+  // handoff is transferred the same way by its discard report.
+  const handOffRolloverCoverage = (live: LiveSession): void => {
+    if (live.inboundCoverage.length === 0 && live.backgroundCoverage.length === 0) return
+    const coverage = reloadCoverageSnapshot(live)
+    retainReloadHandoff({
+      key: live.key,
+      sessionId: live.sessionId,
+      inbounds: [],
+      observed: [],
+      reminders: [],
+      coverage,
+      retainedAt: now(),
+      estimatedBytes: estimateReloadHandoffBytes([], [], [], coverage),
+    })
+    live.inboundCoverage = []
+    live.backgroundCoverage = []
   }
 
   // Resolves false when the transfer failed: the rows stay owed and the caller
@@ -2796,6 +2882,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       // turn is never aborted by a follow-up's idle check (PR #359 incident).
       const idleMs = now() - existing.lastInboundAt
       if (shouldRolloverLive(existing, idleMs)) {
+        handOffRolloverCoverage(existing)
         await tearDownLive(existing)
         liveSessions.delete(keyId)
         if (mappings) {
@@ -3136,6 +3223,8 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         toolExecutionThisLogicalTurn: false,
         qualifyingWorkThisLogicalTurn: false,
         promisedWorkOutstandingThisLogicalTurn: false,
+        statusOutputOutstandingThisLogicalTurn: false,
+        nextInboundContinuationTurnId: null,
         pendingQuoteCandidate: null,
         recentEngagedPeerBotTurns: [],
         consecutiveEngagedPeerBotTurns: 0,
@@ -3591,6 +3680,15 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     }
   }
 
+  // An inbound row the session's CURRENT turn owns: the claim this session took
+  // for its backing turn in this epoch. Settlement that captured nothing uses this
+  // rather than the cached ID list, which a later turn can have refilled.
+  const isClaimedByCurrentTurn = (live: LiveSession, row: InboundRecord | undefined): boolean =>
+    row?.phase === 'turn-owned' &&
+    row.claim?.turnId === live.backgroundTurnId &&
+    row.claim.ownerSessionId === live.sessionId &&
+    row.claim.epoch === inboundJournal.epoch
+
   const settleBackgroundCoverageInLane = async (
     live: LiveSession,
     kind: 'delivered' | 'intentionally-suppressed',
@@ -3599,7 +3697,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     capturedInbound?: readonly InboundRef[],
     capturedBackground?: readonly BackgroundObligationRef[],
   ): Promise<void> => {
-    const currentBackground = await resolveBackgroundCoverage(live, ids)
+    const currentBackground = await resolveBackgroundCoverage(live, ids, capturedBackground === undefined)
     const refs = capturedBackground
       ? currentBackground.filter((ref) =>
           capturedBackground.some(
@@ -3607,7 +3705,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           ),
         )
       : currentBackground
-    const currentInbound = await inboundJournal.resolve(
+    const currentInbound = inboundJournal.resolve(
       capturedInbound ? capturedInbound.map((ref) => ref.inputId) : live.inboundCoverage,
     )
     const inboundRefs = capturedInbound
@@ -3616,7 +3714,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
             (captured) => captured.inputId === ref.inputId && captured.generation === ref.generation,
           ),
         )
-      : currentInbound
+      : currentInbound.filter((ref) => isClaimedByCurrentTurn(live, inboundJournal.get(ref.inputId)))
     if (inboundRefs.length > 0) {
       await inboundJournal.settle(inboundRefs, { kind, decisionId: randomUUID(), reason }, refs, live.key)
     } else if (refs.length > 0) {
@@ -3954,18 +4052,30 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     logger.warn(
       `[channels] ${live.keyId} github_thread_closeout_fallback pr=${obligation.prNumber} root=${obligation.rootCommentId}`,
     )
+    const destination: ChannelKey = {
+      adapter: 'github',
+      workspace: obligation.workspace,
+      chat: `pr:${obligation.prNumber}`,
+      thread: obligation.rootCommentId,
+    }
+    // Like the empty-turn fallback, a close-out landed on this session's own
+    // thread is the terminal answer to the requests the turn owns there.
+    let inboundCoverage: InboundRef[] = []
+    if (channelKeyId(destination) === live.keyId) {
+      try {
+        inboundCoverage = await captureInboundResultCoverage(live.sessionId)
+      } catch (error) {
+        logger.error(`[channels] ${live.keyId}: close-out fallback coverage capture failed: ${describeError(error)}`)
+      }
+    }
     const result = await send(
-      {
-        adapter: 'github',
-        workspace: obligation.workspace,
-        chat: `pr:${obligation.prNumber}`,
-        thread: obligation.rootCommentId,
-        text: GITHUB_REVIEW_THREAD_CLOSEOUT_FALLBACK_TEXT,
-      },
+      { ...destination, text: GITHUB_REVIEW_THREAD_CLOSEOUT_FALLBACK_TEXT },
       { source: 'system', outputKind: 'meta' },
     )
     if (!result.ok) {
       logger.warn(`[channels] ${live.keyId}: github review-thread closeout fallback send failed: ${result.error}`)
+    } else if (inboundCoverage.length > 0) {
+      await recordLandedBackgroundResponse(live, 'github-thread-closeout-fallback', [], inboundCoverage)
     }
   }
 
@@ -4573,6 +4683,12 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     )
   }
 
+  // The logical turn told the user more was coming and has not delivered it: a
+  // `more_work_this_turn: true` reply, or a landed status/continuation message
+  // that no substantive output followed. Silence cannot answer such a promise.
+  const owesPromisedWork = (live: LiveSession): boolean =>
+    live.promisedWorkOutstandingThisLogicalTurn || live.statusOutputOutstandingThisLogicalTurn
+
   const maybePostDeferredProviderError = async (
     live: LiveSession,
     completedReplyThisTurn: boolean,
@@ -4594,11 +4710,12 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     // fail over once `startedToolExecution` is set) also means a side effect
     // may already be public. Surfacing the notice here strands a "connection
     // dropped" warning above the agent's own successful work. A logical turn
-    // holding an outstanding continue-reply promise is the opposite case: it
-    // explicitly told the user more was coming, so dying silently WOULD leave
-    // them waiting and the notice must still fire. Operators still get the
-    // failure from the `LLM call failed` line plus this suppression record.
-    if (live.toolExecutionThisLogicalTurn && !live.promisedWorkOutstandingThisLogicalTurn) {
+    // holding an outstanding promise (a continue-reply or a status message) is
+    // the opposite case: it explicitly told the user more was coming, so dying
+    // silently WOULD leave them waiting and the notice must still fire. Operators
+    // still get the failure from the `LLM call failed` line plus this suppression
+    // record.
+    if (live.toolExecutionThisLogicalTurn && !owesPromisedWork(live)) {
       live.pendingProviderError = null
       logger.warn(
         `[channels] ${live.keyId}: provider_error_notice_suppressed reason=tool_activity_this_turn notice="${pending.safeMessage}"`,
@@ -4621,6 +4738,15 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     // `safeMessage` (never raw provider text, which can carry response bodies /
     // URLs / tokens) via a 'system' send — the one-shot bypass path that lands
     // regardless of per-turn send caps — so the human doesn't just see silence.
+    // The notice is this turn's terminal answer to the requests it owns, captured
+    // before the send so a newer claim can never be closed by it. Consumed child
+    // results are not answered by a provider failure and stay owed.
+    let inboundCoverage: InboundRef[] = []
+    try {
+      inboundCoverage = await captureInboundResultCoverage(live.sessionId)
+    } catch (error) {
+      logger.error(`[channels] ${live.keyId}: provider-error notice coverage capture failed: ${describeError(error)}`)
+    }
     const result = await send(
       {
         adapter: live.key.adapter,
@@ -4636,6 +4762,42 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     })
     if (result !== null && !result.ok) {
       logger.warn(`[channels] ${live.keyId}: provider-error notice send failed: ${result.error}`)
+    } else if (result !== null && inboundCoverage.length > 0) {
+      await recordLandedBackgroundResponse(live, 'provider-error-notice', [], inboundCoverage)
+    }
+  }
+
+  // The owning terminal decision for a logical turn that ended still holding
+  // owed coverage. Runs after todo continuation and staged-fallback resolution
+  // had their chance to queue a continuation. Work that provably continues keeps
+  // its coverage: queued input or reminders (the next iteration decides), a
+  // staged fallback, a running deferred child, an outstanding GitHub thread
+  // close-out, or a recovery the review guard deferred to the next inbound.
+  // Anything else ended here, in this process: it is transferred now as a
+  // durable live-turn-ended notice — never a restart notice, and never debt
+  // grafted onto a later unrelated request. A graceful restart's aborted turns
+  // are the exception: the process is restarting, so boot recovery owns them.
+  // A failed transfer keeps the caches, so the next lifecycle decision retries;
+  // the journal rows stay owed meanwhile.
+  const transferAbandonedTurnCoverage = async (live: LiveSession): Promise<void> => {
+    const keepsCoverage = (): boolean =>
+      restartShutdownPending ||
+      live.destroyed ||
+      live.pendingTeardown ||
+      live.promptQueue.length > 0 ||
+      live.pendingSystemReminders.length > 0 ||
+      live.stagedFallbackCause !== null ||
+      live.githubReviewThreadCloseout !== null ||
+      live.nextInboundContinuationTurnId === live.backgroundTurnId ||
+      (live.inboundCoverage.length === 0 && live.backgroundCoverage.length === 0)
+    if (keepsCoverage()) return
+    try {
+      await backgroundObligations.withTargetLane(live.key, async () => {
+        if (keepsCoverage() || awaitsDeferredChild(live, 'turn-end-coverage')) return
+        await transferHeldCoverageInLane(live)
+      })
+    } catch (error) {
+      logger.error(`[channels] ${live.keyId}: live-turn-ended transfer failed: ${describeError(error)}`)
     }
   }
 
@@ -4756,11 +4918,11 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           }
           if (fresh && (live.inboundCoverage.length > 0 || live.backgroundCoverage.length > 0)) {
             // Coverage left open by a turn deferred to background work is owed, not
-            // lost: carry it forward like a wakeup instead of posting a restart
-            // notice. That covers deferred inputs and child results the deferring
-            // turn already consumed, together or alone. Cached IDs are hints (a reload
-            // successor adopts them), so only rows the recorded source turn and owner
-            // still hold at their current generation, target and account are carried.
+            // abandoned: carry it forward like a wakeup instead of ending it. That
+            // covers deferred inputs and child results the deferring turn already
+            // consumed, together or alone. Cached IDs are hints (a reload successor
+            // adopts them), so only rows the recorded source turn and owner still hold
+            // at their current generation, target and account are carried.
             const sourceOwner = live.backgroundTurnOwnerSessionId
             const sourceAccount = live.turnAccountIdentity ?? currentAccountIdentityFor(live.key)
             const cached: Array<InboundRecord | BackgroundObligation | undefined> = live.inboundCoverage.map((id) =>
@@ -4803,18 +4965,34 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
               parents.some((parent) =>
                 isAwaitingBackgroundChild(live, 'fresh-deferred-coverage', deferredSince, parent),
               )
+            // A documented guard deferred the source turn's recovery to the next
+            // inbound (see `nextInboundContinuationTurnId`): this batch continues it.
+            const continuesSourceTurn =
+              awaitingDeferredWork || live.nextInboundContinuationTurnId === live.backgroundTurnId
             if (held.length === 0) {
               live.coverageDeferredSince = null
               live.coverageDeferredParentSessionId = null
-            } else if (batchCount > 0 && !awaitingDeferredWork) {
+            } else if (batchCount > 0 && !continuesSourceTurn) {
+              // Nothing continues the source turn, so its debt ended with it. A new
+              // human batch is independent work that never answers it: the remainder
+              // becomes a durable live-turn-ended notice, not debt on the new request.
               await transferLostCoverageInLane(live.key, live.inboundCoverage, live.backgroundCoverage, sourceOwner)
               live.coverageDeferredSince = null
               live.coverageDeferredParentSessionId = null
             } else {
               // A wake-only batch still carries deferred inputs, but a consumed child
-              // result moves only on evidence that its deferred work is pending; an
-              // abandoned one stays with its source turn for durable recovery.
-              const background = awaitingDeferredWork
+              // result moves only on evidence that the source turn continues here. An
+              // abandoned one ended with its turn: it is transferred as a live-turn-ended
+              // notice rather than dropped from every live cache while still owed.
+              if (!continuesSourceTurn && deferredBackground.length > 0) {
+                await transferLostCoverageInLane(
+                  live.key,
+                  [],
+                  deferredBackground.map((row) => row.obligationId),
+                  sourceOwner,
+                )
+              }
+              const background = continuesSourceTurn
                 ? deferredBackground.map((row) => ({ obligationId: row.obligationId, generation: row.generation }))
                 : []
               if (batchCount > 0) live.coverageDeferredSince = deferredSince
@@ -4831,6 +5009,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
               }
             }
           }
+          if (fresh) live.nextInboundContinuationTurnId = null
           const owner = { turnId, ownerSessionId: live.sessionId, target: live.key }
           const claimedCoverage =
             inboundRefs.length > 0
@@ -4887,7 +5066,8 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
             live.willingnessNudges = carried.willingnessNudges
             live.nextPromptMaxTokens = carried.nextPromptMaxTokens
           }
-          const ownedInput = live.inboundCoverage[0] ? inboundJournal.get(live.inboundCoverage[0]) : undefined
+          const ownedRow = live.inboundCoverage[0] ? inboundJournal.get(live.inboundCoverage[0]) : undefined
+          const ownedInput = ownedRow?.phase === 'closed' ? undefined : ownedRow
           const ownedBackground = live.backgroundCoverage[0]
             ? await backgroundObligations.get(live.backgroundCoverage[0])
             : undefined
@@ -5017,6 +5197,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           live.toolExecutionThisLogicalTurn = false
           live.qualifyingWorkThisLogicalTurn = false
           live.promisedWorkOutstandingThisLogicalTurn = false
+          live.statusOutputOutstandingThisLogicalTurn = false
         } else if (live.lastTurnAuthorId !== null) {
           live.currentTurnEngageReactions = []
           // Reminder-only turn (batch.length === 0, reminders.length > 0):
@@ -5237,11 +5418,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
             live.emptyTurnRetries > emptyTurnRetriesBeforePrompt ||
             live.toolLeakRetries > toolLeakRetriesBeforePrompt ||
             live.willingnessNudges > willingnessNudgesBeforePrompt
-          await maybePostDeferredProviderError(
-            live,
-            sentReplyThisTurn && !live.promisedWorkOutstandingThisLogicalTurn,
-            retryQueuedThisTurn,
-          )
+          await maybePostDeferredProviderError(live, sentReplyThisTurn && !owesPromisedWork(live), retryQueuedThisTurn)
           // Provider notices own the first terminal output opportunity. A notice
           // that lands on the owed thread clears the obligation through send();
           // a suppressed or failed notice leaves it intact for this bounded net.
@@ -5278,6 +5455,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           live.promisedWorkOutstandingThisLogicalTurn ||
           isPinnedByRunningChild(live.sessionId, live.keyId, 'github-review-failover')
         if (!logicalTurnStillOpen) await failoverGithubReviewRound(live)
+        await transferAbandonedTurnCoverage(live)
         live.lastTurnAuthorIds = new Set(live.currentTurnAuthorIds)
         if (live.currentTurnAuthorId !== null) {
           live.lastTurnAuthorId = live.currentTurnAuthorId
@@ -5647,7 +5825,11 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         ? await backgroundObligations.withTargetLane(key, async () => inboundJournal.lookupAdmission(identity))
         : undefined
     if (existingAdmission)
-      return { kind: 'duplicate', inputId: existingAdmission.inputId, outcome: existingAdmission.outcome?.kind }
+      return {
+        kind: 'duplicate',
+        inputId: existingAdmission.inputId,
+        outcome: existingAdmission.phase === 'closed' ? existingAdmission.outcome.kind : undefined,
+      }
 
     // If a boot restart-resume reservation is pending for this key, mark that a
     // real inbound arrived: ensureLive below will coalesce onto the reservation
@@ -6856,14 +7038,20 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       live.successfulChannelSends++
       // Promise fulfillment follows OUTPUT KIND, never source:
       //   (a) ordinary substantive tool output clears;
-      //   (b) multilingual continuation-willingness/status output preserves;
+      //   (b) multilingual continuation-willingness/status output preserves, and
+      //       itself promises more (`statusOutputOutstandingThisLogicalTurn`);
       //   (c) recovery prose explicitly marked substantive clears even though
       //       it uses the system bypass;
       //   (d) provider-error, empty-turn-fallback, and control notices are
       //       explicitly meta and preserve, so a warning can never self-clear.
       // The channel_reply afterToolCall hook above remains authoritative for its
       // machine-readable more_work_this_turn flag.
-      if (outputKind === 'substantive') live.promisedWorkOutstandingThisLogicalTurn = false
+      if (outputKind === 'substantive') {
+        live.promisedWorkOutstandingThisLogicalTurn = false
+        live.statusOutputOutstandingThisLogicalTurn = false
+      } else if (outputKind === 'status') {
+        live.statusOutputOutstandingThisLogicalTurn = true
+      }
       live.lastSendLeafId = live.session.sessionManager.getLeafEntry()?.id ?? null
       live.policyDeniedToolSendsThisTurn.delete(sendKey)
       // Don't stop the heartbeat here: the agent may still be mid-turn and
@@ -7437,11 +7625,15 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         return
       }
       const leakedReasoning = !isNoReplySignal(assistantText)
+      // Explicit silence answers only an inbound-only turn that promised nothing.
+      // After a status/continue-reply promise the user is still waiting, so the
+      // debt stays owed for the turn-end decision instead of closing silently.
       if (
         assistantText.trim() !== '' &&
         live.backgroundCoverage.length === 0 &&
         live.inboundCoverage.length > 0 &&
-        !live.willingnessReminderIteration
+        !live.willingnessReminderIteration &&
+        !owesPromisedWork(live)
       ) {
         await settleBackgroundCoverage(live, 'intentionally-suppressed', 'explicit-no-reply')
       }
@@ -7551,6 +7743,8 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       logger.warn(
         `[channels] ${live.keyId}: suppressed recovery (github review guard) reason=${JSON.stringify(recoveryBlock)} text_len=${assistantText.length}`,
       )
+      // The documented continuation: the next inbound re-prompts this turn's work.
+      live.nextInboundContinuationTurnId = live.backgroundTurnId
       return
     }
 
@@ -7750,10 +7944,42 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       if (live.pendingSystemReminders.length > 0) continue
       if (t - live.lastInboundAt <= SESSION_IDLE_MS) continue
       if (isPinnedByRunningChild(live.sessionId, live.keyId, 'idle_gc evicting')) continue
+      // Coverage deferred to another session's running child (a reload successor
+      // carried it) waits on that child exactly like the session's own.
+      if (
+        (live.inboundCoverage.length > 0 || live.backgroundCoverage.length > 0) &&
+        awaitsDeferredChild(live, 'idle_gc evicting')
+      )
+        continue
       victims.push(live)
     }
     for (const live of victims) {
-      liveSessions.delete(live.keyId)
+      // Owed coverage never outlives its cache unowned: what the session still
+      // holds is transferred as a live-turn-ended notice, in the target lane,
+      // before eviction. A failed transfer keeps the session and its ownership for
+      // the next tick; the journal rows stay owed meanwhile.
+      const evicted = await backgroundObligations
+        .withTargetLane(live.key, async () => {
+          if (
+            live.destroyed ||
+            liveSessions.get(live.keyId) !== live ||
+            live.draining ||
+            live.promptQueue.length > 0 ||
+            live.pendingSystemReminders.length > 0 ||
+            now() - live.lastInboundAt <= SESSION_IDLE_MS
+          )
+            return false
+          await transferHeldCoverageInLane(live)
+          liveSessions.delete(live.keyId)
+          return true
+        })
+        .catch((error: unknown) => {
+          logger.error(
+            `[channels] ${live.keyId} idle_gc kept session: owed coverage transfer failed: ${describeError(error)}`,
+          )
+          return false
+        })
+      if (!evicted) continue
       logger.info(`[channels] ${live.keyId} idle_gc evicting after ${t - live.lastInboundAt}ms idle`)
       await tearDownLive(live)
     }
@@ -7773,11 +7999,12 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     if (gcTimer) clearInterval(gcTimer)
     gcTimer = null
     liveGeneration++
+    // Process shutdown is a real restart: owed rows, including those a reload
+    // handoff holds, stay in this epoch's journal for boot recovery to transfer.
+    // Nothing is prepared here, so a restart notice never comes from a live epoch.
     const pendingHandoffs = Array.from(pendingReloadHandoffs.values())
     pendingReloadHandoffs.clear()
-    for (const pending of pendingHandoffs) {
-      await reportDiscardedReloadHandoff(pending, 'router stopped before replay could complete')
-    }
+    for (const pending of pendingHandoffs) void dropPendingReloadHandoffEngageReactions(pending)
     const all = Array.from(liveSessions.values())
     liveSessions.clear()
     for (const live of all) {
@@ -7847,6 +8074,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   // continues its incomplete todos instead of waiting for a human. Best-effort
   // and bounded by the caller's shutdown deadline.
   const markRestartAbortForAllLive = async (): Promise<void> => {
+    restartShutdownPending = true
     for (const live of Array.from(liveSessions.values())) {
       const origin = buildLiveOrigin(live)
       await markRestartAbortPendingForOrigin(options.agentDir, origin).catch((err) =>
@@ -8128,9 +8356,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       if (live.destroyed) return
       const source =
         (await backgroundObligations.lookup(args.parentSessionId, args.taskId)) ??
-        (await backgroundObligations.list()).find(
-          (row) => row.taskId === args.taskId && channelKeyId(row.target) === live.keyId,
-        )
+        (await backgroundObligations.lookupTask(args.taskId, live.key))
       if (!source || channelKeyId(source.target) !== live.keyId) return
       const row = await backgroundObligations.resultReady(source.obligationId)
       if (!row || row.phase === 'closed' || row.transfer) {
@@ -8188,15 +8414,8 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     return backgroundObligations.withTargetLane(live.key, async () => {
       await ready
       if (live.destroyed) return []
-      return inboundJournal.resolve(live.inboundCoverage).filter((ref) => {
-        const row = inboundJournal.get(ref.inputId)
-        return (
-          row?.phase === 'turn-owned' &&
-          row.claim?.turnId === live.backgroundTurnId &&
-          row.claim.ownerSessionId === live.sessionId &&
-          row.claim.epoch === inboundJournal.epoch
-        )
-      })
+      const refs = inboundJournal.resolve(live.inboundCoverage)
+      return refs.filter((ref) => isClaimedByCurrentTurn(live, inboundJournal.get(ref.inputId)))
     })
   }
 

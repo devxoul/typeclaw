@@ -246,9 +246,12 @@ test('two admitted inputs and a compatible child recover as one notice, one send
     phase: 'closed',
     outcome: { kind: 'delivered', deliveryId: notice.deliveryId },
   })
-  // Closed sources are never reintroduced by a later boot.
+  // Closed sources are never reintroduced by a later boot: the finished delivery stays fenced, so
+  // re-importing its frozen transfer resolves to the terminal record instead of a new send intent.
   const later = await boot(dir, 'later')
-  expect((await later.outbox.list()).map((r) => [r.deliveryId, r.state])).toEqual([[notice.deliveryId, 'delivered']])
+  expect(await later.outbox.list()).toEqual([])
+  expect(await later.outbox.retired(notice.deliveryId)).toMatchObject({ dispatch: { state: 'delivered' } })
+  expect(await later.outbox.import(notice)).toMatchObject({ deliveryId: notice.deliveryId, state: 'delivered' })
 })
 
 test('authors, accounts, threads and captured parents partition notices; reordered principal keys do not', async () => {
@@ -361,7 +364,7 @@ test('multi-child partitions leave current-epoch work and closed sources untouch
   })
   expect(groups(await booted.outbox.list())).toEqual(normalize([[ids.input!, ids.ready!, ids.running!]]))
   expect(booted.inboundJournal.get(current)).toMatchObject({ phase: 'admitted', generation: 1 })
-  expect(booted.inboundJournal.get(current)?.transfer).toBeUndefined()
+  expect(booted.inboundJournal.get(current)).not.toHaveProperty('transfer')
   expect(await booted.obligations.get(currentChild)).toMatchObject({ phase: 'accepted', generation: 1 })
   expect(booted.inboundJournal.get(ids.answered!)).toEqual(answeredBefore)
   expect(await booted.obligations.get(ids.done!)).toMatchObject({ phase: 'closed', outcome: { decisionId: 'done' } })
@@ -421,7 +424,7 @@ test('grouped stop suppresses every covered source while a different-parent part
     beforeWake: (dispatcher) => dispatcher.suppressParent(room, 'parent'),
   })
   expect(sent.map((s) => s.deliveryId)).toEqual([surviving.deliveryId])
-  expect(await booted.outbox.get(stopped.deliveryId)).toMatchObject({ state: 'suppressed' })
+  expect(await booted.outbox.retired(stopped.deliveryId)).toMatchObject({ dispatch: { state: 'suppressed' } })
   expect(booted.inboundJournal.get(input)).toMatchObject({
     phase: 'closed',
     outcome: { kind: 'intentionally-suppressed', reason: 'user-stop' },
@@ -500,7 +503,7 @@ test('stop during a known background freeze appends nothing and keeps admission;
     beforeWake: (dispatcher) => dispatcher.suppressParent(room, 'parent'),
   })
   expect(sent.map((s) => s.chat).sort()).toEqual(['legacy-room', 'room'])
-  expect(await repaired.outbox.get(mixed.deliveryId)).toMatchObject({ state: 'suppressed' })
+  expect(await repaired.outbox.retired(mixed.deliveryId)).toMatchObject({ dispatch: { state: 'suppressed' } })
   expect(repaired.inboundJournal.get(input)).toMatchObject({ phase: 'closed', outcome: { reason: 'user-stop' } })
   const stopped = (await repaired.obligations.get(child))!
   expect(stopped).toMatchObject({ phase: 'closed', outcome: { reason: 'user-stop' } })
@@ -508,7 +511,7 @@ test('stop during a known background freeze appends nothing and keeps admission;
   expect(repaired.inboundJournal.get(unrelated)).toMatchObject({ phase: 'closed', outcome: { kind: 'delivered' } })
 })
 
-const corruptions: Record<string, (row: Record<string, unknown> & { transfer: RecoveryRecord }) => void> = {
+const corruptions: Record<string, (row: Record<string, unknown>, transfer: RecoveryRecord) => void> = {
   principal: (row) => {
     row.principal = { ...alice, lastInboundAuthorId: 'mallory' }
   },
@@ -518,8 +521,8 @@ const corruptions: Record<string, (row: Record<string, unknown> & { transfer: Re
   generation: (row) => {
     row.generation = 1
   },
-  'frozen payload': (row) => {
-    row.transfer.covers[0]!.generation += 1
+  'frozen payload': (_row, transfer) => {
+    transfer.covers[0]!.generation += 1
   },
 }
 for (const [field, corrupt] of Object.entries(corruptions)) {
@@ -536,7 +539,12 @@ for (const [field, corrupt] of Object.entries(corruptions)) {
     })
     const path = join(dir, 'channels/inbound-continuity.jsonl')
     const snapshot = JSON.parse(await readFile(path, 'utf8'))
-    corrupt(snapshot.rows.find((row: { inputId: string }) => row.inputId === issued))
+    // The compact snapshot keeps the open row in full and its frozen transfer once, by delivery.
+    const row = snapshot.open.find((candidate: { inputId: string }) => candidate.inputId === issued)
+    corrupt(
+      row,
+      snapshot.notices.find((notice: RecoveryRecord) => notice.deliveryId === row.notice),
+    )
     const bytes = `${JSON.stringify(snapshot)}\n`
     await writeFile(path, bytes)
     const outboxBefore = await new RecoveryOutbox(dir).list()
@@ -670,8 +678,11 @@ for (const boundary of [
     for (const cover of notice.covers) {
       const row =
         cover.store === 'inbound' ? second.inboundJournal.get(cover.id) : await second.obligations.get(cover.id)
-      expect(row).toMatchObject({ phase: 'notice-owned', generation: cover.generation })
-      expect(row?.transfer?.deliveryId).toBe(notice.deliveryId)
+      expect(row).toMatchObject({
+        phase: 'notice-owned',
+        generation: cover.generation,
+        transfer: { deliveryId: notice.deliveryId },
+      })
     }
     const third = await boot(dir, 'third')
     expect(await third.outbox.list()).toEqual(records)

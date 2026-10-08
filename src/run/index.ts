@@ -955,6 +955,10 @@ async function startAgentRuntime(
     // the helper has already frozen dependent background progress.
     console.warn(`[run] continuity blocked pending operator repair: ${error}`)
   }
+  // Growth-driven compaction runs on the journal's own writer queue once boot recovery has been
+  // attempted. A frozen journal is never rewritten; `inboundJournal.close()` (shutdown or
+  // boot-failure cleanup) stops maintenance and waits for a compaction already in progress.
+  inboundJournal.startMaintenance()
   await bootChannelRestartGreeting({
     agentDir: cwd,
     router: channelManager.router,

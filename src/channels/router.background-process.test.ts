@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { BackgroundObligationStore } from './background-obligations'
+import { LIVE_TURN_ENDED_NOTICE_TEXT, RECOVERY_NOTICE_TEXT } from './continuity-types'
 import { RecoveryOutbox } from './recovery-outbox'
 
 const cwd = join(import.meta.dir, '../..')
@@ -38,7 +39,7 @@ let requests = 0;
 globalThis.fetch = async () => {
   requests++;
   await appendFile(dir+'/provider-calls',requests+'\\n');
-  if(requests>=3&&mode==='provider-failure')return new Response(JSON.stringify({error:{type:'authentication_error',message:'controlled provider outage'}}),{status:401,headers:{'content-type':'application/json'}});
+  if(requests>=3&&(mode==='provider-failure'||mode==='provider-notice'))return new Response(JSON.stringify({error:{type:'authentication_error',message:'controlled provider outage'}}),{status:401,headers:{'content-type':'application/json'}});
   if(requests===3)await stopAt();
   const text = requests===1 ? 'NO_REPLY' : 'Result: 42.';
   return new Response([
@@ -54,7 +55,10 @@ globalThis.fetch = async () => {
 const initial = !['receipt-death','repair','second-repair'].includes(mode);
 const key=mode.includes('review')?{adapter:'github',workspace:'acme/repo',chat:'pr:672',thread:null}:{adapter:'discord-bot',workspace:'guild',chat:'room',thread:null};
 const stopAt=async()=>{console.log(JSON.stringify({boundary:mode}));await forever;throw Error('crash boundary resumed without termination');};
+// Durable notice ownership: written only after the notice's outbox import, so both have landed.
+const noticeOwned=Promise.withResolvers();
 const store=new BackgroundObligationStore(dir,{epoch:mode,onDurability:async(phase,row)=>{
+  if(phase==='directory-synced'&&(row.phase==='notice-owned'||row.phase==='closed'))noticeOwned.resolve();
   if(phase==='directory-synced'&&((mode==='ready'&&row.phase==='result-ready')||(mode==='claim'&&row.phase==='turn-owned')||(mode.startsWith('settled-')&&row.phase==='closed')))await stopAt();
   if(phase==='temp-synced'&&mode.startsWith('ambiguous-')&&row.phase==='closed')await stopAt();
 }});
@@ -143,6 +147,13 @@ if(initial){
     }
   });
   await tool.execute('spawn',{subagent_type:'explorer',prompt:'Compute the answer.'},undefined,undefined,{});
+  if(mode==='provider-notice'){
+    // The live router finishes the failed completion turn on its own; snapshot once
+    // the notice durably owns the child row, not merely once it is prepared.
+    await noticeOwned.promise;
+    await appendFile(dir+'/decided',JSON.stringify({rows:await store.list(),outbox:await new RecoveryOutbox(dir,{epoch:mode}).list()}));
+    await stopAt();
+  }
   await forever;
 }else{
   const outbox=new RecoveryOutbox(dir,{epoch:mode});
@@ -261,9 +272,19 @@ for (const boundary of [
       } else {
         expect(errors).toBe('')
       }
-      const notices = await new RecoveryOutbox(dir, { epoch: 'inspection' }).list()
-      if (closed) expect(notices).toEqual([])
-      else expect(notices).toMatchObject([{ deliveryId, state: 'delivered', attempts: 1 }])
+      const outbox = new RecoveryOutbox(dir, { epoch: 'inspection' })
+      // Acknowledged notices retire from the live outbox.
+      expect(await outbox.list()).toEqual([])
+      const retired = await outbox.listRetired()
+      if (closed) expect(retired).toEqual([])
+      else {
+        if (deliveryId === undefined) throw new Error(`${boundary} recorded no delivery receipt before repair`)
+        expect(retired.map((record) => [record.deliveryId, record.dispatch.state, record.dispatch.attempts])).toEqual([
+          [deliveryId, 'delivered', 1],
+        ])
+        // Genuine process death keeps the frozen restart template.
+        expect(JSON.parse(posts.trim().split('\n').at(-1)!).text).toBe(RECOVERY_NOTICE_TEXT)
+      }
     } finally {
       child.kill('SIGKILL')
       await child.exited
@@ -271,3 +292,47 @@ for (const boundary of [
     }
   }, 30_000)
 }
+
+test('provider-error notice after a consumed child result never erases the child debt; it ends as one live notice', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'typeclaw-router-process-'))
+  await writeFile(
+    join(dir, 'typeclaw.json'),
+    JSON.stringify({ models: { default: { model: 'anthropic/claude-sonnet-4-6' } } }),
+  )
+  const child = spawnWorker(dir, 'provider-notice')
+  try {
+    await killAtBoundary(child, 'provider-notice')
+    const decided = JSON.parse(await readFile(join(dir, 'decided'), 'utf8')) as {
+      rows: Array<{ taskId: string; phase: string; transfer?: { deliveryId: string; text: string } }>
+      outbox: Array<{ deliveryId: string; text: string; covers: Array<{ store: string; id: string }> }>
+    }
+    // The provider failure did not close the consumed result; it was handed
+    // to a durable non-restart notice in the same process.
+    expect(decided.rows).toMatchObject([{ taskId: 'task', phase: 'notice-owned' }])
+    expect(decided.outbox).toHaveLength(1)
+    expect(decided.outbox[0]!.text).toBe(LIVE_TURN_ENDED_NOTICE_TEXT)
+    expect(decided.outbox[0]!.deliveryId).toBe(decided.rows[0]!.transfer!.deliveryId)
+    const providerCalls = await readFile(join(dir, 'provider-calls'), 'utf8')
+    for (const mode of ['repair', 'second-repair']) {
+      const boot = spawnWorker(dir, mode)
+      const bootOutput = await new Response(boot.stdout).text()
+      expect(await boot.exited).toBe(0)
+      expect(await new Response(boot.stderr).text()).toBe('')
+      expect(bootOutput).toContain('recovered')
+    }
+    expect(await readFile(join(dir, 'provider-calls'), 'utf8')).toBe(providerCalls)
+    const rows = await new BackgroundObligationStore(dir, { epoch: 'inspection' }).list()
+    expect(rows).toMatchObject([{ phase: 'closed', outcome: { deliveryId: decided.outbox[0]!.deliveryId } }])
+    const posts = (await readFile(join(dir, 'posts'), 'utf8'))
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line).text)
+    expect(posts.filter((text) => text === LIVE_TURN_ENDED_NOTICE_TEXT)).toHaveLength(1)
+    expect(posts).not.toContain(RECOVERY_NOTICE_TEXT)
+    expect(posts).not.toContain('Result: 42.')
+  } finally {
+    child.kill('SIGKILL')
+    await child.exited
+    await rm(dir, { recursive: true, force: true })
+  }
+}, 30_000)

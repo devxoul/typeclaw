@@ -47,6 +47,7 @@ import { waitFor } from '@/test-helpers/wait-for'
 
 import { createDiscordHistoryCallback } from './adapters/discord'
 import { BackgroundObligationStore } from './background-obligations'
+import { recoveryNoticeCause } from './continuity-types'
 import {
   __resetReviewVerdictGuardForTest,
   configureReviewVerdictCoordinator,
@@ -21149,9 +21150,17 @@ describe('ChannelRouter durable background response coverage', () => {
     }
     await f.router.route(inbound({ externalMessageId: 'followup' }))
     await f.router.__testing!.flushDebounce(KEY)
-    expect((await f.store.get(first.obligationId))?.phase).toBe('closed')
-    expect((await f.store.get(late.obligationId))?.phase).toBe('turn-owned')
+    // The dispatched reply answered exactly what it captured before sending.
+    expect(await f.store.get(first.obligationId)).toMatchObject({ phase: 'closed', outcome: { kind: 'delivered' } })
     expect(f.sent).toEqual(['First result.'])
+    // The result fetched mid-send was never answered. It stays owed: the turn that ended without
+    // delivering it hands it, alone, to its own live-turn-ended notice.
+    const owed = await f.store.get(late.obligationId)
+    expect(owed?.outcome).toBeUndefined()
+    expect(owed?.phase).toBe('notice-owned')
+    const notices = await new RecoveryOutbox(f.dir).list()
+    expect(notices.map((notice) => notice.covers.map((cover) => cover.id))).toEqual([[late.obligationId]])
+    expect(recoveryNoticeCause(notices[0]!)).toBe('live-turn-ended')
     await rm(f.dir, { recursive: true, force: true })
   })
 

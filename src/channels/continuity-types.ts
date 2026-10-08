@@ -20,10 +20,18 @@ export type RecoveryFailure = {
   /** Milliseconds until another attempt is permitted. */
   retryAfter?: number
 }
+/**
+ * Why owed coverage was transferred to a notice. `restart` is the frozen RFC en/v1 boot-recovery
+ * notice (schemaVersion 1, no `cause` field). `live-turn-ended` is a same-process turn that ended
+ * without a confirmed reply; it is a distinct schemaVersion 2 record and never claims a restart.
+ */
+export type RecoveryNoticeCause = 'restart' | 'live-turn-ended'
 export type RecoveryRecord = {
-  schemaVersion: 1
+  schemaVersion: 1 | 2
   deliveryId: string
   purpose: 'interruption-notice'
+  /** Present exactly on schemaVersion 2; absent means the frozen v1 restart notice. */
+  cause?: Exclude<RecoveryNoticeCause, 'restart'>
   target: ChannelKey
   accountIdentity: string
   accountIdentityConflict?: string[]
@@ -49,6 +57,8 @@ export type RecoveryRecord = {
 
 export const RECOVERY_NOTICE_TEXT =
   "⚠️ I restarted before I could confirm a reply to your earlier request. I didn't rerun it automatically — please ask again if you still need it."
+export const LIVE_TURN_ENDED_NOTICE_TEXT =
+  "⚠️ My earlier turn ended before I could confirm a reply to your request. I didn't rerun it automatically — please ask again if you still need it."
 const nonempty = z.string().min(1)
 const timestamp = z.number().finite().nonnegative()
 const generation = z.number().int().positive().max(Number.MAX_SAFE_INTEGER)
@@ -70,62 +80,75 @@ const principal = z.discriminatedUnion('kind', [
     })
     .strict(),
 ])
+// Frozen v1 field order: persisted outbox bytes follow it, so never reorder or insert here.
+const recordFields = {
+  schemaVersion: z.literal(1),
+  deliveryId: z.string().regex(/^[a-f0-9]{64}$/),
+  purpose: z.literal('interruption-notice'),
+  target,
+  accountIdentity: nonempty,
+  accountIdentityConflict: z.array(nonempty).min(2).optional(),
+  boundAccountIdentity: nonempty.optional(),
+  principal,
+  sourceParentSessionId: nonempty.optional(),
+  covers: z
+    .array(
+      z
+        .object({
+          store: z.enum(['inventory', 'background', 'inbound']),
+          id: nonempty,
+          generation,
+          parentSessionId: nonempty.optional(),
+        })
+        .strict(),
+    )
+    .min(1),
+  transferId: nonempty,
+  recoveryGeneration: nonempty,
+  templateVersion: z.literal(1),
+  locale: z.literal('en'),
+  text: z.literal(RECOVERY_NOTICE_TEXT),
+  createdAt: timestamp,
+  generation,
+  state: z.enum(['pending', 'leased', 'delivered', 'blocked', 'suppressed']),
+  lease: z.object({ epoch: nonempty, generation, attemptId: nonempty, acquiredAt: timestamp }).strict().optional(),
+  attempts: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  nextAttemptAt: timestamp.optional(),
+  receipt: z
+    .object({
+      confirmedAt: timestamp,
+      messageId: nonempty.optional(),
+      messageIds: z.array(nonempty).min(1).optional(),
+    })
+    .strict()
+    .optional(),
+  failure: z
+    .object({
+      kind: z.enum(['transient', 'rate-limit', 'unavailable', 'permission', 'identity', 'target', 'configuration']),
+      safeReason: nonempty.max(512),
+      retryAfter: timestamp.optional(),
+    })
+    .strict()
+    .optional(),
+  suppression: z
+    .object({ reason: nonempty.max(512), decisionId: nonempty })
+    .strict()
+    .optional(),
+}
 const schema = z
-  .object({
-    schemaVersion: z.literal(1),
-    deliveryId: z.string().regex(/^[a-f0-9]{64}$/),
-    purpose: z.literal('interruption-notice'),
-    target,
-    accountIdentity: nonempty,
-    accountIdentityConflict: z.array(nonempty).min(2).optional(),
-    boundAccountIdentity: nonempty.optional(),
-    principal,
-    sourceParentSessionId: nonempty.optional(),
-    covers: z
-      .array(
-        z
-          .object({
-            store: z.enum(['inventory', 'background', 'inbound']),
-            id: nonempty,
-            generation,
-            parentSessionId: nonempty.optional(),
-          })
-          .strict(),
-      )
-      .min(1),
-    transferId: nonempty,
-    recoveryGeneration: nonempty,
-    templateVersion: z.literal(1),
-    locale: z.literal('en'),
-    text: z.literal(RECOVERY_NOTICE_TEXT),
-    createdAt: timestamp,
-    generation,
-    state: z.enum(['pending', 'leased', 'delivered', 'blocked', 'suppressed']),
-    lease: z.object({ epoch: nonempty, generation, attemptId: nonempty, acquiredAt: timestamp }).strict().optional(),
-    attempts: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
-    nextAttemptAt: timestamp.optional(),
-    receipt: z
+  .discriminatedUnion('schemaVersion', [
+    // en/v1 restart notice: the RFC's frozen boot-recovery template.
+    z.object(recordFields).strict(),
+    // v2 names its non-restart cause explicitly and pins that cause's own frozen template.
+    z
       .object({
-        confirmedAt: timestamp,
-        messageId: nonempty.optional(),
-        messageIds: z.array(nonempty).min(1).optional(),
+        ...recordFields,
+        schemaVersion: z.literal(2),
+        text: z.literal(LIVE_TURN_ENDED_NOTICE_TEXT),
+        cause: z.literal('live-turn-ended'),
       })
-      .strict()
-      .optional(),
-    failure: z
-      .object({
-        kind: z.enum(['transient', 'rate-limit', 'unavailable', 'permission', 'identity', 'target', 'configuration']),
-        safeReason: nonempty.max(512),
-        retryAfter: timestamp.optional(),
-      })
-      .strict()
-      .optional(),
-    suppression: z
-      .object({ reason: nonempty.max(512), decisionId: nonempty })
-      .strict()
-      .optional(),
-  })
-  .strict()
+      .strict(),
+  ])
   .superRefine((record, context) => {
     const invalid = (message: string) => context.addIssue({ code: 'custom', message })
     if (new Set(record.covers.map((cover) => `${cover.store}:${cover.id}`)).size !== record.covers.length)
@@ -172,15 +195,20 @@ const schema = z
       invalid('Retry on terminal or leased record')
   })
 
-type DeliveryIdentity = Pick<RecoveryRecord, 'purpose' | 'target' | 'accountIdentity' | 'covers' | 'recoveryGeneration'>
+type DeliveryIdentity = Pick<
+  RecoveryRecord,
+  'purpose' | 'target' | 'accountIdentity' | 'covers' | 'recoveryGeneration' | 'cause'
+>
 export function recoveryDeliveryId(record: DeliveryIdentity): string {
   const covers = record.covers
     .map((cover) => [cover.store, cover.id, cover.generation, cover.parentSessionId ?? null])
     .sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)))
+  // The v1 restart seed is frozen; a non-restart notice gets its own seed so the two can never share an ID.
+  const seed = record.cause === undefined ? ['typeclaw:recovery:v1'] : ['typeclaw:recovery:v2', record.cause]
   return createHash('sha256')
     .update(
       JSON.stringify([
-        'typeclaw:recovery:v1',
+        ...seed,
         record.purpose,
         [record.target.adapter, record.target.workspace, record.target.chat, record.target.thread],
         record.accountIdentity,
@@ -189,6 +217,9 @@ export function recoveryDeliveryId(record: DeliveryIdentity): string {
       ]),
     )
     .digest('hex')
+}
+export function recoveryNoticeCause(record: Pick<RecoveryRecord, 'cause'>): RecoveryNoticeCause {
+  return record.cause ?? 'restart'
 }
 export function validateRecoveryRecord(value: unknown): value is RecoveryRecord {
   return schema.safeParse(value).success
@@ -217,7 +248,13 @@ export function recoveryPayload(record: RecoveryRecord): string {
     record.locale,
     record.text,
     record.createdAt,
+    // v1 strings stay byte-identical; later versions also compare their explicit cause.
+    ...(record.schemaVersion === 1 ? [] : [record.schemaVersion, record.cause ?? null]),
   ])
+}
+/** Fixed-size fence for a frozen transfer payload once the full record is no longer retained. */
+export function recoveryPayloadDigest(record: RecoveryRecord): string {
+  return createHash('sha256').update(recoveryPayload(record)).digest('hex')
 }
 function canonical(value: object): string {
   return JSON.stringify(

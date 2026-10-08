@@ -136,8 +136,8 @@ edit, a copy routed to a mention thread or a twin event, returns `duplicate`
 with the existing input ID and outcome. Its obligation and target stay where
 they were and do not move to the new thread. The same message from a different
 author is rejected as a conflicting principal instead of opening a new slot.
-The index is rebuilt in memory from existing rows on load and admission; it adds
-no persisted state and survives compaction and restart. Rows written per edit
+The index is rebuilt in memory on load and admission from open rows and from the
+message key kept in closed tombstones, so it survives compaction and restart. Rows written per edit
 revision by earlier versions are all kept: the earliest one represents the
 message, and none is merged or cancelled. Rows recorded under a different agent
 directory path do not match.
@@ -163,8 +163,7 @@ Queues cache IDs rather than generation snapshots. The target lane resolves
 current ownership and commits a turn claim before splicing, todo updates,
 prompting or tool dispatch. Retries retain their claim; a reload handoff or a
 deferred-work carry moves ownership rather than copying or deleting an
-obligation. Idle eviction and stale-session rollover do not; see the recovery
-boundary below. A confirmed terminal reply or review covers only its captured
+obligation. A confirmed terminal reply or review covers only its captured
 IDs. A substantive `channel_send` to
 the turn's exact origin coordinate (adapter, workspace, chat and thread; a root
 post does not match a thread origin) also settles the invoking session's
@@ -176,7 +175,35 @@ off-target sends and sends from another session never settle that coverage. A
 send that landed before a local settlement failure is not re-sent; the
 coverage stays owed for conservative recovery. Healthy inbound-only `NO_REPLY`
 explicitly records intentional silence; SDK stop, child completion and recovery
-`NO_REPLY` are not delivery or background suppression.
+`NO_REPLY` are not delivery or background suppression. `NO_REPLY` after the
+turn's last origin output was a promise (a progress `channel_send` or a
+`channel_reply` with `more_work_this_turn: true`, in any language) does not
+settle either: the promised work is still owed.
+
+A provider-error notice (`⚠️` plus the redacted provider message) is a terminal
+outcome for the requests its turn owned. The router captures the turn's owned
+inbound refs before sending it and settles exactly those refs at the captured
+generations once the send is confirmed. It never settles consumed or fetched
+background results. A failed or no-op send settles nothing, and a settlement
+write failure is logged without replaying the turn; the debt stays owed.
+
+When a logical turn ends with owed coverage and no provable continuation (no
+queued retry, no running child the coverage is deferred on, nothing queued),
+the router transfers that coverage at once to a **live-turn-ended** notice in
+the same target lane. It is imported into the same recovery outbox, and the
+running dispatcher delivers it without waiting for a restart. A later,
+unrelated input never absorbs it: a fresh "Thanks!" turn settles only its own
+request. Idle eviction pins coverage that awaits a running deferred child (up
+to the stuck-child backstop). Otherwise it transfers remaining owed coverage
+as a live-turn-ended notice before teardown; a failed transfer skips eviction.
+Stale-session rollover instead passes coverage through the bounded reload
+handoff to its successor, whose first in-lane consume moves deferred coverage
+or transfers abandoned coverage. A refused handoff reports a live-turn-ended
+transfer; if that transfer fails, the durable rows remain owed for boot recovery.
+Account-mismatch transfers, reload
+transfers of non-deferred coverage and handoff expiry or capacity transfers
+also use the live-turn-ended cause. Router shutdown transfers nothing; that
+debt stays owed for boot recovery after the restart.
 
 A fresh input that arrives while the previous turn's coverage is deferred on a
 background child does not by itself abandon that coverage. When the same drain
@@ -188,7 +215,8 @@ the session the coverage was deferred from or its current claim owner, its
 account must match, and it must have been accepted no earlier than the start of
 the deferred interval. Generic wakes and stale, closed, transferred,
 wrong-parent, wrong-account or earlier-turn completions are not carriers; a
-genuinely abandoned earlier turn still transfers to the notice outbox.
+genuinely abandoned earlier turn has already transferred to a live-turn-ended
+notice when it ended.
 
 Deferred coverage is the turn's open requests, the child results it already
 consumed, or both. A completion-only turn that consumed one child's result and
@@ -254,7 +282,7 @@ keeps coverage that is deferred to background work (a running child of the
 deferring turn, or its completion wake already queued) in the bounded reload
 handoff. The handoff stores the IDs, source turn, owner, captured account and
 author, and counts toward the existing item, byte, key and expiry limits. Other
-open coverage still transfers at reload as before. The handoff recreates a
+open coverage transfers at reload as a live-turn-ended notice. The handoff recreates a
 successor session even when no queued input remains, without a synthetic
 prompt. A completion that arrives before the successor is installed is held on
 the handoff only if it fits the existing per-key item, per-key byte and global
@@ -277,7 +305,7 @@ settled as intentionally suppressed per account before the owed work is
 dropped. If settlement fails for any account, the whole handoff is kept. Observed context is kept for
 the next session, as with a live stop. No session or provider is created, and
 pending notices for that session are withdrawn. Expiry or capacity
-overflow transfers the coverage under its original principal and account; a
+overflow transfers the coverage as a live-turn-ended notice under its original principal and account; a
 failed transfer keeps the handoff for retry, and a later reload recreates
 successors for handoffs that are still pending.
 
@@ -311,14 +339,71 @@ and related JSON, repair or restore the authoritative journal, then restart.
 Deleting the journal or the child JSON is not a safe repair: it can erase a
 committed cancellation or authorize duplicate work.
 
-Compaction serializes with writes, syncs a same-directory snapshot containing
-tombstones, generations and pending decisions/transfer receipts, closes the
+Maintenance is automatic. `startAgent` starts journal maintenance
+(`InboundJournal.startMaintenance`) after the boot continuity step, including
+when that step failed. A frozen or closed journal is never rewritten: a queued
+compaction is skipped. `close()` stops maintenance; a queued compaction that has
+not started is skipped, and one already in progress finishes before the handle
+closes. A
+compaction is queued on the writer queue when growth since the last snapshot
+line (the whole file if there is none) reaches the larger of 1 MiB and the
+last snapshot's size. The check runs at start and after each successful append
+as a counter comparison, so retained tombstones never cause repeated rewrites
+and a boot or tick without growth rewrites nothing. There is no user setting.
+
+Normalization does not wait for compaction. Every append, and the boot fold,
+turns a closed row into its tombstone and an applied decision into a receipt in
+memory; only unapplied mixed decisions keep their full bodies. Boot streams the
+journal one LF-terminated line at a time with fatal UTF-8 decoding. Bytes after
+the last LF are a torn tail and are truncated before the writer opens; any
+invalid complete line freezes the journal and keeps its bytes.
+
+Compaction serializes with writes, syncs a same-directory snapshot, closes the
 old handle before replacement, syncs the directory and reopens before resuming.
-Without a proven upstream replay/checkpoint floor covering revisions, minimal
-dedupe tombstones are retained indefinitely; unresolved obligations never
-expire. POSIX file/directory sync fences process death. Windows closes handles
-before replacement but cannot promise the same directory-sync power-loss
-durability.
+The snapshot (`schemaVersion: 2`, first line of the same JSONL file) holds each
+frozen transfer payload once per delivery ID, full open rows, minimal closed
+tombstones, pending mixed decisions and the retained decision receipts. A closed
+tombstone keeps the input ID, generation, acceptance time, message reference, a
+principal digest for the author conflict fence, the Slack message key where one
+applies, the outcome and the notice delivery ID; it drops identity, principal,
+claim, target, account, epoch and transfer payload. `get()`/`list()` return
+that minimal shape as soon as a row closes, so replay of an old message still
+returns `duplicate` with the original input ID and outcome before compaction,
+after it and across reboots. Version 1 logs and snapshots stay readable.
+
+Retention follows reachability, not age or count. Without a proven upstream
+replay/checkpoint floor covering revisions, tombstones and frozen notice
+payloads (once per delivery) are kept indefinitely, and unresolved obligations
+never expire. Receipts are kept only while a caller could still present the
+decision ID:
+
+- Derived or caller-named IDs (`prepare:`, `owned:`, `recovery:` and stop
+  decisions) are kept indefinitely.
+- `admit:<inputId>` receipts are never kept, because the permanent row answers
+  admission.
+- Claim and move IDs that the journal minted itself are never kept.
+- Bare-UUID decision IDs, such as router settlements, are kept only while the
+  epoch that minted them is running. They are dropped at the next boot, since
+  no durable record re-issues a bare UUID; until then the running process
+  holds them in memory.
+
+POSIX file/directory sync fences process death. Windows closes handles before
+replacement but cannot promise the same directory-sync power-loss durability.
+
+Measured once on single hosts during development (one run per configuration;
+indicative, not a guarantee for other hardware or workloads):
+
+| Workload and environment                                                                                                                                    | Result                                                                                                                                                                                                                                                                                     |
+| ----------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| 20,000-input schema 1 journal with 40 unresolved or mixed refs, compacted to schema 2 (macOS, local temp directory)                                         | Journal 64,941,255 → 8,694,724 bytes; full closed rows 19,960 → 0; cold boot 1,263 ms → 86.6 ms (58.1 ms second boot); RSS sampled after boot 907.4 MiB → 206.8 MiB; process max RSS 1,075,970,048 → 263,159,808 bytes; two reboots without growth rewrote nothing and kept the same inode |
+| 20,000 inputs written through live maintenance (macOS, local temp directory)                                                                                | 15 automatic compactions; p99 fsync 0.442 ms                                                                                                                                                                                                                                               |
+| 2,000 inputs plus 2 open and 2 mixed, in a fresh disposable `oven/bun:1.3.13` container with `--network none`, read-only source and a bind-mounted `/agent` | 5,998 fsync samples: p50 0.630 ms, p95 1.780 ms, p99 2.543 ms, max 171.492 ms; 5 automatic compactions; full compaction writer stall p50 6.116 ms, p95/p99/max 8.620 ms; 2,534,949 journal bytes retained afterwards                                                                       |
+
+The bind-mount writer stall is measured from compaction start, before the
+snapshot is built, through reopen. It covers building and serializing the
+snapshot, writing and syncing the temp file, closing the old handle, the rename,
+the directory sync and the reopen. Time a write spends queued before the
+compaction starts is not included. Native Windows was not exercised.
 
 ## Background work across runtime death
 
@@ -333,6 +418,17 @@ Live queues and turn coverage retain obligation IDs, not generation snapshots. C
 On boot, unresolved obligations from an earlier epoch transfer to `channels/recovery-outbox/<deliveryId>.json`. An obligation that shares a notice partition with older-epoch inbound requests joins that partition's single mixed notice; the remaining obligations use the existing background-only transfer. The source freezes coverage, target, principal, delivery ID and notice payload before import; outbox import is durable before source ownership changes. A delivered interruption notice ends exactly the obligations it covers. Repeated boots repair the same transfer rather than replaying the child or asking the model to recover it. The old launch-inventory format is read only for migration, respecting already-transferred and delivered receipts before retiring legacy files. Ordinary #291 restart greetings and TUI handoff remain separate.
 
 The dispatcher runs after adapter readiness with independent per-target lanes. Each attempt revalidates the configured authenticated account, original destination and current response/send permission. Removed credentials, permission denial and unavailable destinations leave the record **blocked and still owed**, not terminal or age-expired; another target can continue. Transient failures, including identity preflight failures, are persisted with capped backoff and server retry delays. A lease is usable only after its file and directory publication complete; visible leased bytes following a failed sync do not authorize transport. A confirmed receipt is synced before source acknowledgment. Known receipts are never reposted.
+
+After its first boot wake, the dispatcher also wakes on every new durable
+outbox import, so a live-turn-ended notice is sent by the running process
+rather than at the next restart. Once a delivered or suppressed record is
+acknowledged and its source validates as resolved, the dispatcher retires it
+from `channels/recovery-outbox/<deliveryId>.json` to a minimal fence at
+`channels/recovery-outbox/retired/<deliveryId>.json` (delivery ID, payload
+digest and final dispatch state). Re-importing the same frozen record returns
+that terminal state and never recreates pending work. Pending, leased, blocked
+and unverifiable records (for example while the journal is frozen) stay in the
+live outbox.
 
 Admission also freezes the permission-matching origin context, including a native
 thread's `parentChat` and triggering author, before asynchronous metadata lookup.
@@ -352,20 +448,26 @@ reconstructed from a later live turn.
 | leased → delivered                            | Outbox syncs a confirmed or reconciled receipt before acknowledgment; later boots do not send again.                                                                                                           |
 | pending / blocked / leased → suppressed       | Explicit user-stop decision is synced before parent abort/clear. A concurrently landed receipt is retained without authorizing a retry.                                                                        |
 
-The fixed runtime notice is independent of providers, `NO_REPLY`, session reopening and child execution:
+Two fixed runtime notices exist, both independent of providers, `NO_REPLY`, session reopening and child execution. Boot recovery of genuinely older-epoch work (and legacy inventory migration) uses the frozen restart template, byte-identical to earlier versions:
 
 > ⚠️ I restarted before I could confirm a reply to your earlier request. I didn't rerun it automatically — please ask again if you still need it.
 
-The locale, template version and text are frozen at transfer preparation. This stack uses the existing English system-notice fallback only; it adds no locale selector or model language inference. Recovery sends retain transport/flood checks but do not change unrelated live-turn send counts, promise/leaf/skip state, engagement/reaction policy, typing or sticky state.
+Every transfer the router prepares inside a running process uses the `live-turn-ended` cause (`schemaVersion: 2` record, `recoveryNoticeCause` in `src/channels/continuity-types.ts`):
+
+> ⚠️ My earlier turn ended before I could confirm a reply to your request. I didn't rerun it automatically — please ask again if you still need it.
+
+The cause, locale, template version and text are frozen at transfer preparation and use the same outbox, dispatcher, authorization and reconciliation path. Records prepared before this version stay readable and immutable; a same-epoch transfer that an older version prepared with the restart template is not reclassified. This stack uses the existing English system-notice fallback only; it adds no locale selector or model language inference. Recovery sends retain transport/flood checks but do not change unrelated live-turn send counts, promise/leaf/skip state, engagement/reaction policy, typing or sticky state.
+
+Compatibility is one-directional. This version reads journals, snapshots and outbox records written by earlier versions (schema version 1). Once it writes a version 2 journal snapshot or a version 2 live-turn-ended outbox record, earlier versions reject that state and fail closed, as they do for any unknown schema version: continuity freezes instead of being reinterpreted. Downgrading after such writes is unsupported; an earlier version cannot resume a store this version has written.
 
 ### Recovery boundary
 
 - **Inbound and background guarantee:** unless explicitly cancelled or intentionally suppressed, a durably accepted channel request interrupted by process death eventually receives an answer or interruption notice once the runtime and authorized destination are available again. This starts at the durable admission boundary, not at upstream delivery or the first transcript entry.
 - Healthy terminal replies, reviews and substantive origin `channel_send` deliveries close their exact result coverage without an extra interruption notice. A remote reply, review or send that landed before a settlement-write failure remains ambiguous: the obligation stays owed, and a later notice may accompany that answer. This never authorizes repeating the reply, review, send or logical turn. Notices contain no request content, names, transcript or provider errors, and interrupted work is never automatically replayed.
-- **Known limitation:** idle eviction and stale-session rollover tear a session down without moving or transferring its open coverage. Its requests and consumed results stay owned by the dead turn until the next boot transfers them, so that notice can be late and can arrive after a later reply already answered the request.
+- A turn that ends with owed coverage, and an idle eviction or stale rollover that would discard it, transfers that coverage to a live-turn-ended notice in the running process (see above). A restart notice therefore means the process really died or was shut down with the debt still open; it is never produced for a same-process failure.
 - Delivery is **at least once**, not exactly once. Death after a remote POST succeeds but before the local receipt is synced is ambiguous. Supported adapters reconcile the stable correlation marker against paginated history from their own authenticated actor at the exact target; a read failure or first-page miss is not proof of absence. Unknown or unsupported reconciliation eventually retries, accepting a possible duplicate notice. No ambiguous remote success authorizes replay of a reply, review or logical turn.
 - Inventories written before this version, and new admissions whose cached identity was unavailable, use an unbound marker. The first authorized attempt durably binds the authenticated actor serving the original exact adapter/workspace under its lease before sending. Slack direct-message coordinates use a workspace sentinel, while account identity still uses the authenticated team/user. A later identity change blocks delivery. An unbound record cannot prove that the posting identity stayed unchanged between death and reboot.
-- One active runtime per agent directory is supported. Local leases fence callbacks and reboots, not simultaneous runtimes or already-issued remote requests. JSON publication syncs the file and containing directory on POSIX; Windows development cannot provide the same directory-sync power-loss guarantee. Unresolved records and terminal receipts are retained.
+- One active runtime per agent directory is supported. Local leases fence callbacks and reboots, not simultaneous runtimes or already-issued remote requests. JSON publication syncs the file and containing directory on POSIX; Windows development cannot provide the same directory-sync power-loss guarantee. Unresolved records stay in the live outbox; terminal records are retained as minimal retired fences.
 - `/stop` withdraws current parent coverage before abort/clear. Stop before dispatch prevents the notice; a remote POST already in flight cannot be recalled and may land after stop. Concurrent suppression remains durable and an ambiguous suppressed send is never retried. Running descendants retain their existing independent completion policy.
 - Reaction cleanup is independent work. Persisted trigger targets are not removable reaction-instance refs, and this outbox does not restore or delete temporary reactions.
 
