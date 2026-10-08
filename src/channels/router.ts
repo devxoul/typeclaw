@@ -2442,6 +2442,50 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     return total
   }
 
+  // Preparation advanced the source generation before publication/ownership could
+  // fail. Resume only these cached identities, with their immutable frozen covers;
+  // their old turn claims are no longer authority for this transition.
+  const resumePreparedTransfersInLane = async (
+    target: ChannelKey,
+    inputIds: readonly string[],
+    backgroundIds: readonly string[],
+  ): Promise<void> => {
+    await ready
+    inboundJournal.assertAvailable()
+    const handled = new Set<string>()
+    const resume = async (
+      row: InboundRecord | BackgroundObligation | undefined,
+      store: 'inbound' | 'background',
+      id: string,
+    ) => {
+      if (row?.phase !== 'notice-prepared') return
+      const frozen = row.transfer
+      if (
+        !frozen ||
+        channelKeyId(row.target) !== channelKeyId(target) ||
+        channelKeyId(frozen.target) !== channelKeyId(target) ||
+        !frozen.covers.some((cover) => cover.store === store && cover.id === id && cover.generation === row.generation)
+      )
+        throw new Error('Prepared notice coverage mismatch')
+      if (handled.has(frozen.deliveryId)) return
+      if (frozen.covers.some((cover) => cover.store === 'inbound')) {
+        await inboundJournal.importPrepared(recoveryOutbox, frozen)
+      } else {
+        const imported = await recoveryOutbox.import(frozen)
+        for (const cover of frozen.covers) {
+          if (cover.store !== 'background') throw new Error('Invalid prepared background coverage')
+          const owned = await backgroundObligations.ownNotice(cover.id, cover.generation, imported.deliveryId)
+          if (!owned && imported.state !== 'delivered' && imported.state !== 'suppressed')
+            throw new Error('Background notice ownership conflict')
+        }
+        await backgroundObligations.acknowledgeNotice(imported)
+      }
+      handled.add(frozen.deliveryId)
+    }
+    for (const id of new Set(inputIds)) await resume(inboundJournal.get(id), 'inbound', id)
+    for (const id of new Set(backgroundIds)) await resume(await backgroundObligations.get(id), 'background', id)
+  }
+
   // Every transfer the router prepares ends live work in THIS process: a turn
   // that ended without answering, an account replaced under it, a reload or
   // lifecycle bound that refused its handoff. None of them is a restart, so the
@@ -2455,6 +2499,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   ): Promise<void> => {
     await ready
     inboundJournal.assertAvailable()
+    await resumePreparedTransfersInLane(target, inputIds, backgroundIds)
     // Frozen notices retain the admission's principal, including its original author,
     // grouped by the same partition boot recovery uses for old-epoch rows.
     const groups = new Map<string, { inboundRefs: InboundRef[]; backgroundRefs: BackgroundObligationRef[] }>()
@@ -2503,8 +2548,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     for (const ref of backgroundOnly) {
       const prepared = await backgroundObligations.prepareNotice(ref.obligationId, ref.generation, 'live-turn-ended')
       if (!prepared?.transfer) continue
-      const imported = await recoveryOutbox.import(prepared.transfer)
-      await backgroundObligations.ownNotice(prepared.obligationId, prepared.generation, imported.deliveryId)
+      await resumePreparedTransfersInLane(target, [], [prepared.obligationId])
     }
   }
 
@@ -2589,6 +2633,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   // can retry at its next decision instead of silently dropping the debt.
   const transferHeldCoverageInLane = async (live: LiveSession): Promise<void> => {
     if (live.inboundCoverage.length > 0 || live.backgroundCoverage.length > 0) {
+      await resumePreparedTransfersInLane(live.key, live.inboundCoverage, live.backgroundCoverage)
       const inputIds = live.inboundCoverage.filter((id) => isHeldByLiveTurn(live, inboundJournal.get(id)))
       const backgroundIds: string[] = []
       for (const id of new Set(live.backgroundCoverage)) {
@@ -2631,6 +2676,23 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     await ready
     inboundJournal.assertAvailable()
     await transferMismatchedAccountCoverageInLane(live)
+    // A previous refused handoff may already have frozen otherwise deferred debt.
+    // Finish that decision before a reload can retain it as live-turn coverage.
+    await resumePreparedTransfersInLane(
+      live.key,
+      [
+        ...live.inboundCoverage,
+        ...live.promptQueue.map((input) => input.inputId),
+        ...live.pendingSystemReminders.flatMap((reminder) => reminder.inboundRetry?.inputIds ?? []),
+      ],
+      [
+        ...live.backgroundCoverage,
+        ...live.pendingSystemReminders.flatMap((reminder) => [
+          ...(reminder.backgroundObligationId ? [reminder.backgroundObligationId] : []),
+          ...(reminder.backgroundRetry?.obligationIds ?? []),
+        ]),
+      ],
+    )
     const hasCoverage = live.inboundCoverage.length > 0 || live.backgroundCoverage.length > 0
     const deferredToBackground =
       hasCoverage &&
@@ -4387,12 +4449,23 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       }
       return group
     }
+    const prepared = new Map<string, RecoveryRecord>()
     for (const ref of inboundJournal.resolve([...new Set(inputIds)])) {
       const row = inboundJournal.get(ref.inputId)!
+      if (row.phase === 'notice-prepared') {
+        if (!row.transfer || channelKeyId(row.target) !== channelKeyId(target))
+          throw new Error('Prepared stop coverage mismatch')
+        prepared.set(row.transfer.deliveryId, row.transfer)
+      }
       if (row.phase !== 'closed' && !row.transfer) partition(row.accountIdentity).inbound.push(ref)
     }
     for (const id of new Set(backgroundIds)) {
       const row = await backgroundObligations.get(id)
+      if (row?.phase === 'notice-prepared') {
+        if (!row.transfer || channelKeyId(row.target) !== channelKeyId(target))
+          throw new Error('Prepared stop coverage mismatch')
+        prepared.set(row.transfer.deliveryId, row.transfer)
+      }
       if (
         !row ||
         row.transfer ||
@@ -4402,6 +4475,19 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         continue
       backgroundObligations.assertAvailable()
       partition(row.accountIdentity).background.push({ obligationId: id, generation: row.generation })
+    }
+    for (const frozen of prepared.values()) {
+      const decision = { decisionId: randomUUID(), reason: 'user-stop' }
+      if (frozen.covers.some((cover) => cover.store === 'inbound')) {
+        await inboundJournal.suppressNoticeCoverage(frozen, decision)
+      } else {
+        inboundJournal.assertAvailable()
+        await backgroundObligations.suppressNoticeCoverage(frozen, decision)
+      }
+      for (const cover of frozen.covers) {
+        if (cover.store === 'inbound') withdrawn.inbound.add(cover.id)
+        if (cover.store === 'background') withdrawn.background.add(cover.id)
+      }
     }
     for (const group of partitions.values()) {
       const outcome = { kind: 'intentionally-suppressed' as const, decisionId: randomUUID(), reason: 'user-stop' }
@@ -4873,6 +4959,53 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           if (live.promptQueue.length === 0 && live.pendingSystemReminders.length === 0) return undefined
           await ready
           await transferMismatchedAccountCoverageInLane(live)
+          await resumePreparedTransfersInLane(
+            live.key,
+            [
+              ...live.inboundCoverage,
+              ...live.promptQueue.map((input) => input.inputId),
+              ...live.pendingSystemReminders.flatMap((reminder) => reminder.inboundRetry?.inputIds ?? []),
+            ],
+            [
+              ...live.backgroundCoverage,
+              ...live.pendingSystemReminders.flatMap((reminder) => [
+                ...(reminder.backgroundObligationId ? [reminder.backgroundObligationId] : []),
+                ...(reminder.backgroundRetry?.obligationIds ?? []),
+              ]),
+            ],
+          )
+          // A refused handoff may retain identities only on its retry reminder.
+          // Completed transfers must neither enter a new prompt nor reach move().
+          const stillUntransferred = (id: string) => {
+            const row = inboundJournal.get(id)
+            return row !== undefined && row.phase !== 'closed' && !row.transfer
+          }
+          live.promptQueue = live.promptQueue.filter((input) => stillUntransferred(input.inputId))
+          live.inboundCoverage = live.inboundCoverage.filter(stillUntransferred)
+          const staleBackground = new Set<string>()
+          for (const id of new Set([
+            ...live.backgroundCoverage,
+            ...live.pendingSystemReminders.flatMap((reminder) => [
+              ...(reminder.backgroundObligationId ? [reminder.backgroundObligationId] : []),
+              ...(reminder.backgroundRetry?.obligationIds ?? []),
+            ]),
+          ])) {
+            const row = await backgroundObligations.get(id)
+            if (!row || row.phase === 'closed' || row.transfer) staleBackground.add(id)
+          }
+          const identityRetries = new Set(
+            live.pendingSystemReminders.filter((reminder) => reminder.inboundRetry || reminder.backgroundRetry),
+          )
+          retireBackgroundCache(live, staleBackground)
+          live.pendingSystemReminders = live.pendingSystemReminders.filter((reminder) => {
+            if (reminder.inboundRetry)
+              reminder.inboundRetry.inputIds = reminder.inboundRetry.inputIds.filter(stillUntransferred)
+            return (
+              !identityRetries.has(reminder) ||
+              (reminder.inboundRetry?.inputIds.length ?? 0) > 0 ||
+              (reminder.backgroundRetry?.obligationIds.length ?? 0) > 0
+            )
+          })
           if (live.promptQueue.length === 0 && live.pendingSystemReminders.length === 0) return undefined
           const batchCount = live.promptQueue.length
           const observedCount = live.contextBuffer.length
@@ -5485,19 +5618,55 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     // stop()/idle-gc that already tore it down wins the race without a double
     // teardown.
     if (live.pendingTeardown && !live.destroyed) {
-      live.pendingTeardown = false
       // Snapshot the post-reload inbounds that arrived during the held prompt
       // BEFORE tearDownLive (its clearQueuedEngageReactions must not drop the
       // engage acks we are handing to the successor). Clear the source arrays so
       // the dying session owns nothing we are moving forward.
       const retained = await backgroundObligations.withTargetLane(live.key, async () => {
+        await resumePreparedTransfersInLane(
+          live.key,
+          [
+            ...live.inboundCoverage,
+            ...live.pendingSystemReminders.flatMap((reminder) => reminder.inboundRetry?.inputIds ?? []),
+          ],
+          [
+            ...live.backgroundCoverage,
+            ...live.pendingSystemReminders.flatMap((reminder) => reminder.backgroundRetry?.obligationIds ?? []),
+          ],
+        )
+        const reminders: PendingSystemReminder[] = []
+        for (const reminder of live.pendingSystemReminders) {
+          const hadRetryCoverage = reminder.inboundRetry !== undefined || reminder.backgroundRetry !== undefined
+          if (reminder.inboundRetry) {
+            reminder.inboundRetry.inputIds = reminder.inboundRetry.inputIds.filter((id) => {
+              const row = inboundJournal.get(id)
+              return row !== undefined && row.phase !== 'closed' && !row.transfer
+            })
+          }
+          if (reminder.backgroundRetry) {
+            const ids: string[] = []
+            for (const id of reminder.backgroundRetry.obligationIds) {
+              const row = await backgroundObligations.get(id)
+              if (row && row.phase !== 'closed' && !row.transfer) ids.push(id)
+            }
+            reminder.backgroundRetry.obligationIds = ids
+          }
+          if (
+            !hadRetryCoverage ||
+            (reminder.inboundRetry?.inputIds.length ?? 0) > 0 ||
+            (reminder.backgroundRetry?.obligationIds.length ?? 0) > 0
+          )
+            reminders.push(reminder)
+        }
+        live.pendingSystemReminders = reminders
         const retry =
           live.promptQueue.length === 0 ? live.pendingSystemReminders.find((r) => r.kind === 'retry') : undefined
         if (retry) {
           // A queued retry already carries this turn's lineage and retry budgets
           // forward; the coverage rides on it rather than as a separate snapshot.
           const refs = await resolveBackgroundCoverage(live, live.backgroundCoverage, true)
-          if (refs.length > 0 || live.inboundCoverage.length > 0) {
+          const inputIds = live.inboundCoverage.filter((id) => isHeldByLiveTurn(live, inboundJournal.get(id)))
+          if (refs.length > 0 || inputIds.length > 0) {
             retry.backgroundRetry = {
               turnId: live.backgroundTurnId,
               obligationIds: refs.map((ref) => ref.obligationId),
@@ -5507,8 +5676,8 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
               nextPromptMaxTokens: live.nextPromptMaxTokens,
             }
           }
-          if (live.inboundCoverage.length > 0) {
-            retry.inboundRetry = { inputIds: [...live.inboundCoverage], turnId: live.backgroundTurnId }
+          if (inputIds.length > 0) {
+            retry.inboundRetry = { inputIds, turnId: live.backgroundTurnId }
           }
           live.inboundCoverage = []
           live.backgroundCoverage = []
@@ -5519,6 +5688,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         if (liveSessions.get(live.keyId) === live) liveSessions.delete(live.keyId)
         return kept
       })
+      live.pendingTeardown = false
       await tearDownLive(live)
       if (retained) await handOffToSuccessor(live.key)
     }
@@ -8039,32 +8209,39 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     // stays in liveSessions (so a concurrent inbound coalesces into the running
     // turn instead of spawning a duplicate) and is torn down by the drain
     // finally once its turn drains. Idle sessions tear down immediately below.
-    const deferred: LiveSession[] = []
     const immediate: LiveSession[] = []
     for (const live of all) {
       if (live.draining && !live.destroyed) {
         live.pendingTeardown = true
-        deferred.push(live)
-      } else immediate.push(live)
+      } else {
+        // A failed immediate reload still fences the old configuration's prompt.
+        live.pendingTeardown = true
+        immediate.push(live)
+      }
     }
-    liveSessions.clear()
-    for (const live of deferred) liveSessions.set(live.keyId, live)
     // Seal only around the flush — unlike stop() the router keeps serving after a
     // roles reload, so re-enable persist() once pending writes have drained.
     closing = true
     const successors = new Map<string, ChannelKey>()
-    for (const live of immediate) {
-      const retained = await backgroundObligations.withTargetLane(live.key, () => retainLiveWorkInLane(live))
-      if (retained) successors.set(live.keyId, live.key)
-      await tearDownLive(live)
+    try {
+      for (const live of immediate) {
+        const retained = await backgroundObligations.withTargetLane(live.key, async () => {
+          const kept = await retainLiveWorkInLane(live)
+          // A failed transfer must keep the original live cache reachable.
+          if (liveSessions.get(live.keyId) === live) liveSessions.delete(live.keyId)
+          return kept
+        })
+        if (retained) successors.set(live.keyId, live.key)
+        await tearDownLive(live)
+      }
+      // A handoff from an earlier reload whose successor never installed is recreated too.
+      for (const [keyId, pending] of pendingReloadHandoffs) {
+        if (!liveSessions.has(keyId)) successors.set(keyId, pending.key)
+      }
+      await persistChain
+    } finally {
+      closing = false
     }
-    // A handoff from an earlier reload whose successor never installed (this
-    // reload superseded its creation, or it failed) is recreated now as well.
-    for (const [keyId, pending] of pendingReloadHandoffs) {
-      if (!liveSessions.has(keyId)) successors.set(keyId, pending.key)
-    }
-    await persistChain
-    closing = false
     await Promise.all(Array.from(successors.values(), handOffToSuccessor))
   }
 

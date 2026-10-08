@@ -196,13 +196,19 @@ unrelated input never absorbs it: a fresh "Thanks!" turn settles only its own
 request. Idle eviction pins coverage that awaits a running deferred child (up
 to the stuck-child backstop). Otherwise it transfers remaining owed coverage
 as a live-turn-ended notice before teardown; a failed transfer skips eviction.
+If preparation committed but outbox publication or source ownership failed,
+the next applicable in-lane lifecycle or consume decision resumes that frozen
+transfer unchanged. Cached identities stay reachable until ownership completes,
+including across failed reloads and handoff discard attempts. A later input
+never joins that frozen coverage, and recovery does not replay the model or tools.
 Stale-session rollover instead passes coverage through the bounded reload
 handoff to its successor, whose first in-lane consume moves deferred coverage
 or transfers abandoned coverage. A refused handoff reports a live-turn-ended
-transfer; if that transfer fails, the durable rows remain owed for boot recovery.
-Account-mismatch transfers, reload
-transfers of non-deferred coverage and handoff expiry or capacity transfers
-also use the live-turn-ended cause. Router shutdown transfers nothing; that
+transfer and retains its retry identities if that transfer fails.
+Account-mismatch transfers, reload transfers of non-deferred coverage and
+handoff expiry or capacity transfers also use the live-turn-ended cause.
+An actual source-journal write failure still freezes continuity; it is not an
+outbox-only failure that the running process can repair. Router shutdown transfers nothing; that
 debt stays owed for boot recovery after the restart.
 
 A fresh input that arrives while the previous turn's coverage is deferred on a
@@ -468,7 +474,7 @@ Compatibility is one-directional. This version reads journals, snapshots and out
 - Delivery is **at least once**, not exactly once. Death after a remote POST succeeds but before the local receipt is synced is ambiguous. Supported adapters reconcile the stable correlation marker against paginated history from their own authenticated actor at the exact target; a read failure or first-page miss is not proof of absence. Unknown or unsupported reconciliation eventually retries, accepting a possible duplicate notice. No ambiguous remote success authorizes replay of a reply, review or logical turn.
 - Inventories written before this version, and new admissions whose cached identity was unavailable, use an unbound marker. The first authorized attempt durably binds the authenticated actor serving the original exact adapter/workspace under its lease before sending. Slack direct-message coordinates use a workspace sentinel, while account identity still uses the authenticated team/user. A later identity change blocks delivery. An unbound record cannot prove that the posting identity stayed unchanged between death and reboot.
 - One active runtime per agent directory is supported. Local leases fence callbacks and reboots, not simultaneous runtimes or already-issued remote requests. JSON publication syncs the file and containing directory on POSIX; Windows development cannot provide the same directory-sync power-loss guarantee. Unresolved records stay in the live outbox; terminal records are retained as minimal retired fences.
-- `/stop` withdraws current parent coverage before abort/clear. Stop before dispatch prevents the notice; a remote POST already in flight cannot be recalled and may land after stop. Concurrent suppression remains durable and an ambiguous suppressed send is never retried. Running descendants retain their existing independent completion policy.
+- `/stop` durably withdraws current parent coverage before abort/clear, including frozen prepared transfers whose outbox publication never succeeded. A partially published notice then validates as resolved, not sendable. Stop before dispatch prevents the notice; a remote POST already in flight cannot be recalled and may land after stop. Concurrent suppression remains durable and an ambiguous suppressed send is never retried. Running descendants retain their existing independent completion policy.
 - Reaction cleanup is independent work. Persisted trigger targets are not removable reaction-instance refs, and this outbox does not restore or delete temporary reactions.
 
 ## Rules of thumb

@@ -2,7 +2,7 @@ import { afterEach, expect, test } from 'bun:test'
 import { createHash, randomUUID } from 'node:crypto'
 import { mkdir, mkdtemp, readFile, readdir, rename, writeFile, appendFile, rm, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 
 import type { MatchableOrigin } from '../permissions/resolve'
 import { BackgroundObligationStore } from './background-obligations'
@@ -1645,13 +1645,17 @@ test('a compaction swap keeps reads and dependents available, holds writes until
   const compaction = Promise.allSettled([journal.compact()])
   await swap.reached
   const write = Promise.allSettled([journal.admit({ ...input, messageId: 'during-swap' })])
-  const installed = `${journal.path}.installed`
-  await rename(journal.path, installed)
-  await mkdir(journal.path)
+  // A regular file at the parent path makes traversal fail even where opening a directory succeeds.
+  // Both the saved snapshot and the obstruction stay inside the fixture's cleanup directory.
+  const parent = dirname(journal.path)
+  const savedParent = `${parent}.installed`
+  const installed = join(savedParent, basename(journal.path))
+  await rename(parent, savedParent)
+  await writeFile(parent, 'reopen blocked')
   swap.resume()
   const [compacted] = await compaction
   const [written] = await write
-  expect(compacted).toMatchObject({ status: 'rejected', reason: { code: 'EISDIR' } })
+  expect(compacted).toMatchObject({ status: 'rejected', reason: expect.any(Error) })
   expect(written).toMatchObject({ status: 'rejected', reason: { message: expect.stringContaining('frozen') } })
   expect(failures).toHaveLength(1)
   expect(aborted).toEqual(failures)

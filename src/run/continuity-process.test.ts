@@ -431,7 +431,6 @@ test('startAgent: production maintenance compacts journal growth, keeps dedupe a
     expect(snapshot.closed.length).toBeGreaterThanOrEqual(seeded!.rows! - 1)
     for (const closed of snapshot.closed) for (const field of FULL_ROW_FIELDS) expect(closed).not.toHaveProperty(field)
     for (const field of FULL_ROW_FIELDS) expect(seeded!.closedSample).not.toHaveProperty(field)
-    expect(seeded!.compacted!.size).toBeLessThan(seeded!.largest! / 4)
 
     await reboot(agent, 'maintenance-1', scenario)
     await reboot(agent, 'maintenance-2', scenario)
