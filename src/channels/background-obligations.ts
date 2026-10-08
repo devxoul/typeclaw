@@ -8,7 +8,7 @@ import type { MatchableOrigin } from '../permissions/resolve'
 import { createLegacyRecoveryNotice } from './background-handoff'
 import type { LegacyBackgroundHandoffReader } from './background-handoff'
 import { parseRecoveryRecord } from './continuity-types'
-import type { RecoveryRecord } from './continuity-types'
+import type { RecoveryNoticeCause, RecoveryRecord } from './continuity-types'
 import { createRecoveryNotice, sameRecoveryPrincipal } from './recovery-notice'
 import type { RecoveryOutbox } from './recovery-outbox'
 import { channelKeyId, type ChannelKey } from './types'
@@ -55,6 +55,30 @@ export type BackgroundAcceptance = {
 }
 export type BackgroundDecision = { transitionId: string; decisionDigest: string }
 const queues = new Map<string, Promise<void>>()
+/**
+ * Process-wide lookup index per store directory, shared by every instance in this process. One
+ * directory scan builds it and every write in this process extends it, so completion lookups read
+ * only exact candidates. Provenance (taskId) and frozen transfers never change once written, and
+ * closed rows stay on disk as tombstones, so entries are only ever added. The directory has one
+ * writer process; a new instance (a new boot or test phase) discards the cached index.
+ */
+type ObligationIndex = {
+  byTask: Map<string, Set<string>>
+  byDelivery: Map<string, Set<string>>
+  ready: Promise<void>
+}
+const indexes = new Map<string, ObligationIndex>()
+function indexRow(directory: string, row: BackgroundObligation) {
+  const index = indexes.get(directory)
+  if (!index) return
+  const add = (map: Map<string, Set<string>>, key: string) => {
+    const ids = map.get(key) ?? new Set<string>()
+    ids.add(row.obligationId)
+    map.set(key, ids)
+  }
+  add(index.byTask, row.taskId)
+  if (row.transfer) add(index.byDelivery, row.transfer.deliveryId)
+}
 const hash = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex')
 async function syncDirectory(path: string) {
   if (process.platform === 'win32') return
@@ -202,6 +226,7 @@ export class BackgroundObligationStore {
   ) {
     this.directory = resolve(agentDir, 'channels', 'background-obligations')
     this.epoch = options.epoch ?? randomUUID()
+    indexes.delete(this.directory)
   }
   assertAvailable() {
     this.check()
@@ -274,6 +299,8 @@ export class BackgroundObligationStore {
       }
       await this.options.onDurability?.('temp-synced', row)
       await rename(temp, path)
+      // Visible to a concurrent directory scan from here on; keep the lookup index in step.
+      indexRow(this.directory, row)
       await this.options.onDurability?.('replaced', row)
       await syncDirectory(this.directory)
       await this.options.onDurability?.('directory-synced', row)
@@ -304,15 +331,55 @@ export class BackgroundObligationStore {
     for (const file of files.sort()) {
       if (!/^[a-f0-9]{64}\.json$/.test(file)) continue
       const row = await this.get(file.slice(0, -5))
+      if (!row) continue
+      indexRow(this.directory, row)
+      rows.push(row)
+    }
+    return rows
+  }
+  /** Builds the lookup index with one directory scan per process; later lookups never scan. */
+  private async index(): Promise<ObligationIndex> {
+    const existing = indexes.get(this.directory)
+    if (existing) {
+      await existing.ready
+      return existing
+    }
+    const index: ObligationIndex = { byTask: new Map(), byDelivery: new Map(), ready: Promise.resolve() }
+    indexes.set(this.directory, index)
+    // Registered before the scan starts, so a row renamed in after its readdir is added by write().
+    index.ready = this.list().then(
+      () => undefined,
+      (error: unknown) => {
+        if (indexes.get(this.directory) === index) indexes.delete(this.directory)
+        throw error
+      },
+    )
+    await index.ready
+    return index
+  }
+  private async indexedRows(map: 'byTask' | 'byDelivery', key: string) {
+    const rows: BackgroundObligation[] = []
+    // Sorted IDs keep the previous canonical choice: the first matching file in directory order.
+    for (const id of [...((await this.index())[map].get(key) ?? [])].sort()) {
+      const row = await this.get(id)
       if (row) rows.push(row)
     }
     return rows
   }
+  /** Exact parent/task row, closed tombstones included so a late completion cannot reopen work. */
   async lookup(parentSessionId: string, taskId: string) {
-    return (await this.list()).find((row) => row.parentSessionId === parentSessionId && row.taskId === taskId)
+    return (await this.indexedRows('byTask', taskId)).find(
+      (row) => row.parentSessionId === parentSessionId && row.taskId === taskId,
+    )
   }
-  findTask(parentSessionId: string, taskId: string) {
-    return this.lookup(parentSessionId, taskId)
+  /** Task row on one destination, for a successor session fetching a predecessor's result. */
+  async lookupTask(taskId: string, target: ChannelKey) {
+    return (await this.indexedRows('byTask', taskId)).find(
+      (row) => row.taskId === taskId && channelKeyId(row.target) === channelKeyId(target),
+    )
+  }
+  private async deliveryRows(deliveryId: string) {
+    return (await this.indexedRows('byDelivery', deliveryId)).filter((row) => row.transfer?.deliveryId === deliveryId)
   }
   accept(input: BackgroundAcceptance): Promise<BackgroundObligation> {
     const target = input.target ?? input.key
@@ -590,14 +657,24 @@ export class BackgroundObligationStore {
       if (!row) throw new Error('Background outcome generation changed')
     }
   }
-  async prepareNotice(id: string, expectedGeneration: number) {
+  /**
+   * Freezes this child's transfer. Boot recovery keeps the default `restart`; a same-process
+   * abandonment passes `live-turn-ended`. An already-frozen transfer is returned unchanged.
+   */
+  async prepareNotice(id: string, expectedGeneration: number, cause: RecoveryNoticeCause = 'restart') {
     const ref = { obligationId: id, generation: expectedGeneration }
     const row = await this.get(id)
     if (!row || row.phase === 'closed') return undefined
     if (row.transfer) return row
     return this.apply(
       ref,
-      { transitionId: `notice:${id}:${expectedGeneration}`, decisionDigest: hash(['notice', id, expectedGeneration]) },
+      {
+        transitionId: `notice:${id}:${expectedGeneration}`,
+        // The restart digest is frozen; another cause for the same generation conflicts with it.
+        decisionDigest: hash(
+          cause === 'restart' ? ['notice', id, expectedGeneration] : ['notice', id, expectedGeneration, cause],
+        ),
+      },
       (current) => {
         const generation = current.generation + 1
         const transfer = createRecoveryNotice({
@@ -608,6 +685,7 @@ export class BackgroundObligationStore {
           recoveryGeneration: `${id}:${generation}`,
           transferId: hash(['background-transfer', id, generation]),
           sourceParentSessionId: current.parentSessionId,
+          cause,
         })
         return { ...current, phase: 'notice-prepared', transfer }
       },
@@ -636,7 +714,7 @@ export class BackgroundObligationStore {
     const coverage = record.covers.filter((item) => item.store === 'background')
     if (!coverage.length) {
       if (!record.covers.every((cover) => cover.store === 'inventory')) return 'open'
-      const migrated = (await this.list()).filter((row) => row.transfer?.deliveryId === record.deliveryId)
+      const migrated = await this.deliveryRows(record.deliveryId)
       for (const row of migrated) {
         if (
           !row.legacyCoverage ||
@@ -679,7 +757,7 @@ export class BackgroundObligationStore {
       .filter((cover) => cover.store === 'background')
       .map((cover) => ({ obligationId: cover.id, generation: cover.generation }))
     if (record.covers.some((cover) => cover.store === 'inventory')) {
-      for (const row of await this.list()) {
+      for (const row of await this.deliveryRows(record.deliveryId)) {
         if (
           row.legacyCoverage &&
           row.transfer?.deliveryId === record.deliveryId &&
@@ -720,8 +798,8 @@ export class BackgroundObligationStore {
       if (row.phase !== 'closed') refs.push({ obligationId: row.obligationId, generation: cover.generation })
     }
     if (record.covers.some((cover) => cover.store === 'inventory')) {
-      for (const row of await this.list()) {
-        if (row.transfer?.deliveryId !== record.deliveryId || row.phase === 'closed') continue
+      for (const row of await this.deliveryRows(record.deliveryId)) {
+        if (row.phase === 'closed') continue
         if (
           !row.legacyCoverage ||
           !record.covers.some(

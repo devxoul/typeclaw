@@ -1,11 +1,14 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
+import { createHash, randomUUID } from 'node:crypto'
 import { existsSync } from 'node:fs'
-import { mkdir, mkdtemp } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 
 import { __resetForwardRequestForTesting as resetDashboardForwardRequest } from '@/bundled-plugins/agent-browser'
 import { createChannelRouter, type ChannelManager, type ChannelManagerOptions } from '@/channels'
+import { InboundJournal } from '@/channels/inbound-journal'
+import { channelKeyId } from '@/channels/types'
 import { __resetConfigForTesting, reloadConfig } from '@/config/config'
 import type { CronFile, CronJob, LoadCronResult, Scheduler } from '@/cron'
 import { exportGithubCliStoreForAgent, SecretsBackend } from '@/secrets'
@@ -33,6 +36,101 @@ function startAgent(options: StartAgentOptions) {
       options.exportGithubCliStore ??
       ((exportOptions) => exportGithubCliStoreForAgent({ ...exportOptions, homeDir: githubCliHomeDir })),
   })
+}
+
+const journalTarget = { adapter: 'discord-bot' as const, workspace: 'guild', chat: 'room', thread: null }
+const journalPrincipal = {
+  kind: 'channel' as const,
+  adapter: 'discord-bot' as const,
+  workspace: 'guild',
+  chat: 'room',
+  lastInboundAuthorId: 'human',
+}
+const journalAdmission = (messageId: string) => ({
+  accountIdentity: 'discord-bot:B',
+  target: journalTarget,
+  principal: journalPrincipal,
+  messageId,
+  eventKind: 'message',
+  revision: '0',
+})
+/** A pre-maintenance journal: schema-1 admission and outcome lines for answered inputs, never compacted. */
+async function seedAnsweredJournal(agentDir: string, count: number): Promise<string> {
+  const path = join(agentDir, 'channels', 'inbound-continuity.jsonl')
+  await mkdir(dirname(path), { recursive: true })
+  const lines: string[] = []
+  for (let index = 0; index < count; index++) {
+    const admission = journalAdmission(`m${index}`)
+    const identity = JSON.stringify([
+      agentDir,
+      admission.accountIdentity,
+      channelKeyId(journalTarget),
+      admission.messageId,
+      admission.eventKind,
+      admission.revision,
+    ])
+    const inputId = createHash('sha256')
+      .update(JSON.stringify(['inbound', identity]))
+      .digest('hex')
+    const row = {
+      schemaVersion: 1,
+      inputId,
+      identity,
+      generation: 1,
+      accountIdentity: admission.accountIdentity,
+      target: journalTarget,
+      principal: journalPrincipal,
+      epoch: 'legacy',
+      acceptedAt: index,
+      phase: 'admitted',
+      reference: { messageId: admission.messageId },
+    }
+    const decisionId = randomUUID()
+    const decision = (seq: number, transitionId: string, type: string, expected: number, next: object) =>
+      JSON.stringify({
+        schemaVersion: 1,
+        seq,
+        transitionId,
+        epoch: 'legacy',
+        type,
+        changes: [{ expected: { inputId, generation: expected }, row: next }],
+        backgroundChanges: [],
+        ...(type === 'admitted' ? {} : { requestDigest: createHash('sha256').update(decisionId).digest('hex') }),
+      })
+    lines.push(
+      decision(2 * index + 1, `admit:${inputId}`, 'admitted', 0, row),
+      decision(2 * index + 2, decisionId, 'outcome-decided', 1, {
+        ...row,
+        generation: 2,
+        phase: 'closed',
+        outcome: { kind: 'delivered', decisionId },
+      }),
+    )
+  }
+  await writeFile(path, `${lines.join('\n')}\n`)
+  return path
+}
+function journalCapturingManager(
+  agentDir: string,
+  capture: (journal: InboundJournal) => void,
+  start: () => Promise<void> = async () => {},
+) {
+  return (opts: ChannelManagerOptions): ChannelManager => {
+    capture(opts.inboundJournal!)
+    return {
+      router: createChannelRouter({
+        agentDir,
+        configForAdapter: () => undefined,
+        backgroundObligations: opts.backgroundObligations,
+        inboundJournal: opts.inboundJournal,
+        recoveryOutbox: opts.recoveryOutbox,
+      }),
+      start,
+      stop: async () => {},
+      reload: async () => ({ started: [], stopped: [], restarted: [], restartRequired: [] }),
+      restartAdapter: async () => {},
+    }
+  }
 }
 
 function stubScheduler(): Scheduler {
@@ -744,6 +842,69 @@ describe('startAgent', () => {
       __resetConfigForTesting()
       await rmTempDir(agentDir)
     }
+  })
+
+  test('boot recovery starts growth-driven journal compaction; an unchanged reboot never rewrites it', async () => {
+    const path = await seedAnsweredJournal(testCwd, 1_000)
+    const seeded = (await stat(path)).size
+    expect(seeded).toBeGreaterThan(1024 * 1024)
+    let journal!: InboundJournal
+    const createChannelManager = journalCapturingManager(testCwd, (captured) => {
+      journal = captured
+    })
+    running = await startAgent({ port: 0, attachTui: false, cwd: testCwd, loadCron: noCron, createChannelManager })
+    await journal.flush()
+    const snapshot = JSON.parse((await readFile(path, 'utf8')).split('\n')[0]!)
+    // Nothing called compact(): the production lifecycle rewrote the history as minimal tombstones.
+    expect(snapshot).toMatchObject({ schemaVersion: 2, type: 'snapshot', open: [], decisions: [], receipts: [] })
+    expect(snapshot.closed).toHaveLength(1_000)
+    for (const row of snapshot.closed) {
+      expect(row).not.toHaveProperty('principal')
+      expect(row).not.toHaveProperty('identity')
+    }
+    expect((await stat(path)).size).toBeLessThan(seeded / 2)
+    await running.stop()
+    running = null
+
+    const { ino } = await stat(path)
+    const bytes = await readFile(path)
+    running = await startAgent({ port: 0, attachTui: false, cwd: testCwd, loadCron: noCron, createChannelManager })
+    await journal.flush()
+    expect((await stat(path)).ino).toBe(ino)
+    expect(await readFile(path)).toEqual(bytes)
+    expect(await journal.admit(journalAdmission('m0'))).toMatchObject({
+      kind: 'duplicate',
+      outcome: { kind: 'delivered' },
+    })
+  })
+
+  test('a boot failure after recovery stops journal maintenance and releases the journal writer', async () => {
+    const path = await seedAnsweredJournal(testCwd, 1_000)
+    let journal!: InboundJournal
+    const createChannelManager = journalCapturingManager(
+      testCwd,
+      (captured) => {
+        journal = captured
+      },
+      async () => {
+        throw new Error('boot failure: adapters rejected')
+      },
+    )
+    await expect(
+      startAgent({ port: 0, attachTui: false, cwd: testCwd, loadCron: noCron, createChannelManager }),
+    ).rejects.toThrow('boot failure: adapters rejected')
+    // Boot cleanup closed the journal after any compaction already in progress; nothing writes afterwards.
+    await journal.flush()
+    expect(journal.health().available).toBe(false)
+    await expect(journal.admit(journalAdmission('late'))).rejects.toThrow('frozen')
+    const bytes = await readFile(path)
+    const successor = new InboundJournal(testCwd)
+    await successor.initialize()
+    const rows = successor.list()
+    expect(rows).toHaveLength(1_000)
+    expect(rows.every((row) => row.phase === 'closed')).toBe(true)
+    await successor.close()
+    expect(await readFile(path)).toEqual(bytes)
   })
 })
 

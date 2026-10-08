@@ -1,16 +1,26 @@
 import { afterEach, expect, test } from 'bun:test'
-import { createHash } from 'node:crypto'
-import { mkdir, mkdtemp, readFile, writeFile, appendFile, rm, stat } from 'node:fs/promises'
+import { createHash, randomUUID } from 'node:crypto'
+import { mkdir, mkdtemp, readFile, readdir, rename, writeFile, appendFile, rm, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 
 import type { MatchableOrigin } from '../permissions/resolve'
 import { BackgroundObligationStore } from './background-obligations'
+import { RECOVERY_NOTICE_TEXT } from './continuity-types'
+import type { RecoveryRecord } from './continuity-types'
 import { InboundJournal } from './inbound-journal'
-import type { InboundAdmission } from './inbound-journal'
+import type { ClosedInboundRecord, InboundAdmission, InboundRecord, OpenInboundRecord } from './inbound-journal'
 import { RecoveryOutbox } from './recovery-outbox'
 import { channelKeyId } from './types'
 import type { ChannelKey } from './types'
+function openRow(row: InboundRecord | undefined): OpenInboundRecord {
+  if (!row || row.phase === 'closed') throw new Error(`Expected an open inbound row, got ${row?.phase}`)
+  return row
+}
+function closedRow(row: InboundRecord | undefined): ClosedInboundRecord {
+  if (row?.phase !== 'closed') throw new Error(`Expected a closed inbound row, got ${row?.phase}`)
+  return row
+}
 const directories: string[] = []
 afterEach(async () => {
   for (const dir of directories.splice(0)) await rm(dir, { recursive: true, force: true })
@@ -278,7 +288,7 @@ test('invalid mixed coverage writes nothing and crash repair applies original de
   const nextBg = new BackgroundObligationStore(dir, { epoch: 'two' })
   const boot = new InboundJournal(dir, { backgroundObligations: nextBg })
   await boot.initialize()
-  expect(boot.get(a.inputId)?.outcome?.decisionId).toBe('stop')
+  expect(closedRow(boot.get(a.inputId)).outcome.decisionId).toBe('stop')
   expect((await nextBg.get(child.obligationId))?.outcome?.decisionId).toBe('stop')
   await boot.repair()
   expect((await nextBg.get(child.obligationId))?.applications.filter((r) => r.transitionId === 'stop')).toHaveLength(1)
@@ -304,7 +314,7 @@ test('old epoch transfers import before ownership; terminal receipt acknowledgme
   const delivered = (await outbox.get(notice.deliveryId))!
   await journal.acknowledgeNotice(delivered)
   await journal.acknowledgeNotice(delivered)
-  expect(journal.get(a.inputId)?.outcome?.deliveryId).toBe(notice.deliveryId)
+  expect(closedRow(journal.get(a.inputId)).outcome.deliveryId).toBe(notice.deliveryId)
   await journal.close()
   const boot = new InboundJournal(dir, { epoch: 'again' })
   await boot.importOldEpoch(outbox)
@@ -313,8 +323,9 @@ test('old epoch transfers import before ownership; terminal receipt acknowledgme
   await boot.close()
 })
 
-test('independent process death at compaction boundaries retains admissions and never appends an unlinked handle', async () => {
+test('independent process death at each automatic compaction boundary leaves the valid old or new journal and never appends an unlinked handle', async () => {
   const module = import.meta.resolve('./inbound-journal.ts')
+  const outboxModule = import.meta.resolve('./recovery-outbox.ts')
   for (const boundary of [
     'append-synced',
     'temp-synced',
@@ -325,27 +336,47 @@ test('independent process death at compaction boundaries retains admissions and 
   ]) {
     const dir = await directory()
     const token = { boundary }
+    // Maintenance starts only after the history exists, so its first automatic compaction is the one killed.
     await killAtBoundary(
       dir,
-      `import { InboundJournal } from ${JSON.stringify(module)}; const j = new InboundJournal(${JSON.stringify(dir)},{epoch:'child',onDurability:async phase => { if (phase === ${JSON.stringify(boundary)}) { console.log(${JSON.stringify(JSON.stringify(token))}); await Bun.stdin.text(); throw new Error('Crash boundary resumed'); } }}); await j.admit(${JSON.stringify(input)}); await j.compact();`,
+      `import { InboundJournal } from ${JSON.stringify(module)}; import { RecoveryOutbox } from ${JSON.stringify(outboxModule)};
+      let armed = false; const input = ${JSON.stringify(input)};
+      const j = new InboundJournal(${JSON.stringify(dir)},{epoch:'child',compactionFloorBytes:1,onDurability:async phase => { if (armed && phase === ${JSON.stringify(boundary)}) { console.log(${JSON.stringify(JSON.stringify(token))}); await Bun.stdin.text(); throw new Error('Crash boundary resumed'); } }});
+      const answered = await j.admit({...input,messageId:'answered'});
+      await j.settle([{inputId:answered.inputId,generation:1}],{kind:'delivered',decisionId:'answer'});
+      const noticed = await j.admit({...input,messageId:'noticed'});
+      await j.importPrepared(new RecoveryOutbox(${JSON.stringify(dir)},{epoch:'child'}), await j.prepareNotice([{inputId:noticed.inputId,generation:1}], input.target));
+      armed = true; await j.admit(input); j.startMaintenance(); await j.flush();`,
       token,
     )
-    const boot = new InboundJournal(dir, { epoch: 'boot' })
-    await boot.initialize()
-    expect((await boot.admit(input)).kind).toBe('duplicate')
-    await boot.admit({ ...input, messageId: 'after' })
-    await boot.close()
-    const final = new InboundJournal(dir, { epoch: 'last' })
-    await final.initialize()
-    expect(
-      final
-        .list()
-        .map((r) => r.reference?.messageId)
-        .sort(),
-    ).toEqual(['after', 'm'])
-    await final.close()
+    const lines = (await readFile(join(dir, 'channels', 'inbound-continuity.jsonl'), 'utf8')).split('\n')
+    const replaced = ['replaced', 'directory-synced', 'reopened'].includes(boundary)
+    expect(JSON.parse(lines[0]!)).toMatchObject(
+      replaced ? { schemaVersion: 2, type: 'snapshot' } : { type: 'admitted' },
+    )
+    for (const epoch of ['boot', 'last']) {
+      const boot = new InboundJournal(dir, { epoch })
+      await boot.initialize()
+      expect((await boot.admit(input)).kind).toBe('duplicate')
+      expect(await boot.admit({ ...input, messageId: 'answered', revision: '1' })).toMatchObject({
+        kind: 'duplicate',
+        outcome: { kind: 'delivered', decisionId: 'answer' },
+      })
+      const noticed = openRow(boot.list().find((row) => row.reference?.messageId === 'noticed'))
+      expect(noticed.phase).toBe('notice-owned')
+      expect(await boot.validateNotice(noticed.transfer!)).toBe('open')
+      // The first admission after recovery lands in the installed file and survives the next boot.
+      if (epoch === 'boot') expect((await boot.admit({ ...input, messageId: 'after' })).kind).toBe('accepted')
+      expect(
+        boot
+          .list()
+          .map((r) => r.reference?.messageId)
+          .sort(),
+      ).toEqual(['after', 'answered', 'm', 'noticed'])
+      await boot.close()
+    }
   }
-}, 20000)
+}, 30000)
 
 test('duplicate decision identity remains strict after compaction, generations reject stale ownership and a closed Slack message stays answered', async () => {
   const dir = await directory()
@@ -453,36 +484,80 @@ test('actual append fsync EIO rejects admission and freezes cached and dependent
   expect(JSON.parse(stdout)).toEqual({ rejected: true, frozen: true, failures: 1 })
 })
 
-test('complete schema/state/sequence corruption in retained snapshots is never truncated', async () => {
+test('complete schema/state/sequence/tombstone/notice corruption in retained snapshots is never truncated', async () => {
   type CorruptSnapshot = {
-    rows: Array<{ target: { adapter: string }; principal: { kind: string }; generation: number; rawContent?: string }>
-    receipts: Array<{ seq: number }>
+    schemaVersion: number
     seq: number
+    notices: Array<{ covers: Array<{ generation: number }> }>
+    open: Array<{
+      target: { adapter: string }
+      principal: { kind: string }
+      generation: number
+      rawContent?: string
+      transfer?: unknown
+    }>
+    closed: Array<{ phase: string; principalDigest: string; noticeDeliveryId?: string; identity?: string }>
+    receipts: Array<{ seq: number }>
   }
   const mutations = [
     (snapshot: CorruptSnapshot) => {
-      snapshot.rows[0]!.target.adapter = 'unknown'
+      snapshot.open[0]!.target.adapter = 'unknown'
     },
     (snapshot: CorruptSnapshot) => {
-      snapshot.rows[0]!.principal.kind = 'unknown'
+      snapshot.open[0]!.principal.kind = 'unknown'
     },
     (snapshot: CorruptSnapshot) => {
-      snapshot.rows[0]!.generation = -1
+      snapshot.open[0]!.generation = -1
+    },
+    (snapshot: CorruptSnapshot) => {
+      snapshot.open[0]!.rawContent = 'not allowed'
+    },
+    (snapshot: CorruptSnapshot) => {
+      snapshot.open[0]!.transfer = snapshot.notices[0]
     },
     (snapshot: CorruptSnapshot) => {
       snapshot.receipts[0]!.seq = snapshot.seq + 1
     },
     (snapshot: CorruptSnapshot) => {
-      snapshot.rows[0]!.rawContent = 'not allowed'
+      snapshot.schemaVersion = 3
+    },
+    (snapshot: CorruptSnapshot) => {
+      snapshot.closed.find((row) => !row.noticeDeliveryId)!.phase = 'admitted'
+    },
+    (snapshot: CorruptSnapshot) => {
+      snapshot.closed.find((row) => !row.noticeDeliveryId)!.principalDigest = 'not-a-digest'
+    },
+    (snapshot: CorruptSnapshot) => {
+      snapshot.closed.find((row) => !row.noticeDeliveryId)!.identity = 'smuggled full identity'
+    },
+    (snapshot: CorruptSnapshot) => {
+      // The author fence no longer matches the frozen notice that closed the input.
+      snapshot.closed.find((row) => row.noticeDeliveryId)!.principalDigest = '0'.repeat(64)
+    },
+    (snapshot: CorruptSnapshot) => {
+      snapshot.closed.find((row) => row.noticeDeliveryId)!.noticeDeliveryId = '0'.repeat(64)
+    },
+    (snapshot: CorruptSnapshot) => {
+      snapshot.notices[0]!.covers[0]!.generation += 1
+    },
+    (snapshot: CorruptSnapshot) => {
+      snapshot.notices.push(snapshot.notices[0]!)
     },
   ]
   for (const mutate of mutations) {
     const dir = await directory()
     const journal = new InboundJournal(dir)
-    await journal.admit(input)
+    const open = await journal.admit(input)
+    await journal.claim([{ inputId: open.inputId, generation: 1 }], { turnId: 'turn', target }, [], 'claim-a')
+    const answered = await journal.admit({ ...input, messageId: 'answered' })
+    await journal.settle([{ inputId: answered.inputId, generation: 1 }], { kind: 'delivered', decisionId: 'answer' })
+    const noticed = await journal.admit({ ...input, messageId: 'noticed' })
+    const transfer = await journal.prepareNotice([{ inputId: noticed.inputId, generation: 1 }], target)
+    await journal.suppressNoticeCoverage(transfer, { decisionId: 'stop', reason: 'user-stop' })
     await journal.compact()
     await journal.close()
     const snapshot = JSON.parse(await readFile(journal.path, 'utf8'))
+    expect(snapshot).toMatchObject({ schemaVersion: 2, open: [{}], closed: [{}, {}], notices: [{}] })
     mutate(snapshot)
     const corrupt = `${JSON.stringify(snapshot)}\n`
     await writeFile(journal.path, corrupt)
@@ -510,7 +585,7 @@ test('independent mixed claim move and notice crashes repair exact JSON receipts
       const bg = new BackgroundObligationStore(dir, { epoch: 'new' })
       const journal = new InboundJournal(dir, { backgroundObligations: bg })
       await journal.initialize()
-      const row = journal.list()[0]!
+      const row = openRow(journal.list()[0])
       const child = (await bg.list())[0]!
       const generation = operation === 'move' ? 3 : 2
       expect(row.generation).toBe(generation)
@@ -556,6 +631,32 @@ test('independent mixed claim move and notice crashes repair exact JSON receipts
         (await finalBg.get(child.obligationId))?.applications.filter((r) => r.transitionId === decisionId),
       ).toHaveLength(1)
       expect(final.list()[0]!.generation).toBe(generation)
+      if (operation === 'notice') {
+        // The frozen transfer, now kept once per delivery, still acknowledges and closes both stores.
+        const outbox = new RecoveryOutbox(dir, { epoch: 'last' })
+        const notice = (await outbox.list())[0]!
+        const lease = await outbox.lease(notice.deliveryId, notice.generation)
+        if (!lease) throw new Error('Notice lease unavailable')
+        expect(await outbox.delivered(notice.deliveryId, lease, { confirmedAt: Date.now() })).toBe(true)
+        const delivered = (await outbox.get(notice.deliveryId))!
+        await finalBg.withTargetLane(target, () => final.acknowledgeNotice(delivered))
+        expect(closedRow(final.list()[0])).toMatchObject({
+          outcome: { kind: 'delivered', deliveryId: notice.deliveryId },
+          noticeDeliveryId: notice.deliveryId,
+        })
+        expect((await finalBg.get(child.obligationId))?.phase).toBe('closed')
+        await final.compact()
+        await final.close()
+        const againBg = new BackgroundObligationStore(dir, { epoch: 'again' })
+        const again = new InboundJournal(dir, { backgroundObligations: againBg })
+        await again.initialize()
+        const bytes = await readFile(again.path)
+        expect(await again.validateNotice(delivered)).toBe('resolved')
+        await againBg.withTargetLane(target, () => again.acknowledgeNotice(delivered))
+        expect(await readFile(again.path)).toEqual(bytes)
+        await again.close()
+        continue
+      }
       await final.close()
     }
   }
@@ -590,8 +691,8 @@ test('multi-author logical turns preserve each provenance and notice transfers p
       { obligationId: ready.obligationId, generation: ready.generation },
     ]),
   )
-  expect(journal.get(first.inputId)?.principal).toEqual(principal)
-  expect(journal.get(second.inputId)?.principal).toEqual(secondPrincipal)
+  expect(openRow(journal.get(first.inputId)).principal).toEqual(principal)
+  expect(openRow(journal.get(second.inputId)).principal).toEqual(secondPrincipal)
   const before = await readFile(journal.path)
   await expect(
     bg.withTargetLane(target, () =>
@@ -607,7 +708,10 @@ test('multi-author logical turns preserve each provenance and notice transfers p
       target,
     ),
   )
-  expect(journal.list().map((row) => row.outcome?.decisionId)).toEqual(['multi-author-reply', 'multi-author-reply'])
+  expect(journal.list().map((row) => closedRow(row).outcome.decisionId)).toEqual([
+    'multi-author-reply',
+    'multi-author-reply',
+  ])
   expect((await bg.get(child.obligationId))?.outcome?.decisionId).toBe('multi-author-reply')
   await journal.close()
 })
@@ -834,7 +938,7 @@ for (const adapter of ['slack', 'slack-bot'] as const) {
         expect(await journal.admit(message)).toEqual({
           kind: 'duplicate',
           inputId: edited.inputId,
-          outcome: row.outcome,
+          outcome: row.phase === 'closed' ? row.outcome : undefined,
         })
         expect(journal.list()).toEqual([row])
         expect(await readFile(journal.path)).toEqual(bytes)
@@ -1037,4 +1141,529 @@ test('multiple legacy revisions keep every row and receipt; a new delivery resol
     'coverage',
   )
   await boot.close()
+})
+
+const tombstoneFields = [
+  'inputId',
+  'generation',
+  'phase',
+  'acceptedAt',
+  'reference',
+  'principalDigest',
+  'messageKey',
+  'outcome',
+  'noticeDeliveryId',
+]
+type SnapshotLine = {
+  schemaVersion: number
+  type: string
+  notices: Array<{ deliveryId: string }>
+  open: Array<Record<string, unknown>>
+  closed: Array<Record<string, unknown>>
+  decisions: unknown[]
+  receipts: Array<{ transitionId: string; type: string; epoch?: string }>
+}
+async function firstLine(journal: InboundJournal): Promise<SnapshotLine> {
+  return JSON.parse((await readFile(journal.path, 'utf8')).split('\n')[0]!)
+}
+const slackTs = (index: number) => `1700000000.${String(index).padStart(6, '0')}`
+
+test('production maintenance compacts by new growth into minimal tombstones; compaction and two reboots keep every dedupe and transition fence', async () => {
+  const dir = await directory()
+  const message = slackMessage()
+  const owner = { turnId: 'turn', ownerSessionId: 'parent', target: message.target }
+  let rewrites = 0
+  const boot = async (epoch: string) => {
+    const journal = new InboundJournal(dir, {
+      epoch,
+      compactionFloorBytes: 16 * 1024,
+      onDurability: (phase) => {
+        if (phase === 'replaced') rewrites++
+      },
+    })
+    await journal.initialize()
+    journal.startMaintenance()
+    await journal.flush()
+    return journal
+  }
+  // Router-shaped work: an unnamed claim and a fresh UUID decision for the terminal outcome.
+  const answer = async (journal: InboundJournal, index: number) => {
+    const admitted = await journal.admit({ ...message, messageId: slackTs(index) })
+    if (admitted.kind !== 'accepted') throw new Error('Expected a fresh admission')
+    const claimed = await journal.claim([{ inputId: admitted.inputId, generation: 1 }], {
+      ...owner,
+      turnId: `turn-${index}`,
+    })
+    await journal.settle(claimed.inboundRefs, { kind: 'delivered', decisionId: randomUUID() })
+    return admitted.inputId
+  }
+  let journal = await boot('one')
+  const answered: string[] = []
+  for (let index = 0; index < 60; index++) answered.push(await answer(journal, index))
+  const kept = await journal.admit({ ...message, messageId: '1700000099.000001' })
+  const named = await journal.admit({ ...message, messageId: '1700000099.000002' })
+  if (kept.kind !== 'accepted' || named.kind !== 'accepted') throw new Error('Expected fresh admissions')
+  const keptRefs = [{ inputId: kept.inputId, generation: 1 }]
+  const claim = await journal.claim(keptRefs, owner, [], 'claim-kept')
+  const outcome = { kind: 'delivered' as const, decisionId: 'answer-named' }
+  const settled = await journal.settle([{ inputId: named.inputId, generation: 1 }], outcome)
+  await journal.flush()
+  expect(rewrites).toBeGreaterThan(0)
+
+  const expectFences = async (current: InboundJournal, rebooted: boolean) => {
+    const original = slackTs(0)
+    for (const delivery of [
+      { ...message, messageId: original, revision: '1700000001.000200' },
+      { ...message, messageId: original, target: { ...message.target, thread: original } },
+    ])
+      expect(await current.admit(delivery)).toMatchObject({
+        kind: 'duplicate',
+        inputId: answered[0],
+        outcome: { kind: 'delivered' },
+      })
+    const impostor: InboundAdmission = {
+      ...message,
+      messageId: original,
+      target: { ...message.target, thread: 'elsewhere' },
+      principal: { ...message.principal, lastInboundAuthorId: 'U2' } as MatchableOrigin,
+    }
+    expect(() => current.lookupAdmission(impostor)).toThrow('Conflicting duplicate admission principal')
+    await expect(current.admit(impostor)).rejects.toThrow('Conflicting duplicate admission principal')
+    expect(await current.settle([{ inputId: named.inputId, generation: 1 }], outcome)).toEqual(settled)
+    await expect(
+      current.settle([{ inputId: named.inputId, generation: 1 }], { ...outcome, kind: 'intentionally-suppressed' }),
+    ).rejects.toThrow('Conflicting duplicate')
+    if (rebooted) await expect(current.claim(keptRefs, owner, [], 'claim-kept')).rejects.toThrow('superseded')
+    else expect(await current.claim(keptRefs, owner, [], 'claim-kept')).toEqual(claim)
+    await expect(current.claim(keptRefs, { ...owner, turnId: 'other' }, [], 'claim-kept')).rejects.toThrow(
+      'Conflicting duplicate',
+    )
+    await expect(current.claim(keptRefs, { ...owner, turnId: 'late' })).rejects.toThrow('coverage')
+    await expect(
+      current.settle([{ inputId: answered[0]!, generation: 2 }], { kind: 'delivered', decisionId: 'late' }),
+    ).rejects.toThrow('coverage')
+    for (const row of current.list().filter((row) => row.phase === 'closed'))
+      expect(Object.keys(row).filter((key) => !tombstoneFields.includes(key))).toEqual([])
+  }
+  await expectFences(journal, false)
+  let snapshot = await firstLine(journal)
+  expect(snapshot).toMatchObject({ schemaVersion: 2, type: 'snapshot', decisions: [], notices: [] })
+  expect(snapshot.closed.length).toBeGreaterThan(0)
+  for (const row of snapshot.closed) {
+    expect(Object.keys(row).filter((key) => !tombstoneFields.includes(key))).toEqual([])
+    expect(row.messageKey).toMatch(/^[a-f0-9]{64}$/)
+  }
+  // Admission and journal-minted claim IDs are answered by the rows themselves; no receipt keeps them.
+  expect(
+    snapshot.receipts.filter(
+      (r) => r.transitionId.startsWith('admit:') || (r.type === 'turn-claimed' && r.transitionId !== 'claim-kept'),
+    ),
+  ).toEqual([])
+  // A maintenance check without new growth never rewrites.
+  const settledRewrites = rewrites
+  journal.startMaintenance()
+  await journal.flush()
+  expect(rewrites).toBe(settledRewrites)
+  await journal.close()
+
+  const bytes = await readFile(journal.path)
+  const inode = (await stat(journal.path)).ino
+  journal = await boot('two')
+  expect(rewrites).toBe(settledRewrites)
+  expect(await readFile(journal.path)).toEqual(bytes)
+  expect((await stat(journal.path)).ino).toBe(inode)
+  await expectFences(journal, true)
+  for (let index = 60; rewrites === settledRewrites && index < 2_000; index++)
+    answered.push(await answer(journal, index))
+  await journal.flush()
+  expect(rewrites).toBeGreaterThan(settledRewrites)
+  snapshot = await firstLine(journal)
+  // The ended epoch's bare-UUID decisions were normalized away at boot; caller-named fences remain.
+  expect(
+    snapshot.receipts
+      .filter((r) => r.epoch === 'one')
+      .map((r) => r.transitionId)
+      .sort(),
+  ).toEqual(['answer-named', 'claim-kept'])
+  await journal.close()
+
+  journal = await boot('three')
+  await expectFences(journal, true)
+  expect(openRow(journal.get(kept.inputId))).toMatchObject({ phase: 'turn-owned', claim: { turnId: 'turn' } })
+  await journal.close()
+}, 30000)
+
+test('a frozen notice is kept once per delivery and still validates, acknowledges, reimports and repeats after closure and compaction', async () => {
+  const dir = await directory()
+  const journal = new InboundJournal(dir, { epoch: 'one' })
+  const outbox = new RecoveryOutbox(dir, { epoch: 'one' })
+  const first = await journal.admit({ ...input, ownerSessionId: 'parent' })
+  const second = await journal.admit({ ...input, messageId: 'second', ownerSessionId: 'parent' })
+  const refs = [
+    { inputId: first.inputId, generation: 1 },
+    { inputId: second.inputId, generation: 1 },
+  ]
+  const transfer = await journal.prepareNotice(refs, target)
+  const imported = await journal.importPrepared(outbox, transfer)
+  expect(await journal.validateNotice(imported)).toBe('open')
+  const lease = await outbox.lease(imported.deliveryId, imported.generation)
+  if (!lease) throw new Error('Notice lease unavailable')
+  expect(await outbox.delivered(imported.deliveryId, lease, { confirmedAt: Date.now() })).toBe(true)
+  const delivered = (await outbox.get(imported.deliveryId))!
+  await journal.acknowledgeNotice(delivered)
+  for (const ref of refs)
+    expect(closedRow(journal.get(ref.inputId))).toMatchObject({
+      noticeDeliveryId: transfer.deliveryId,
+      outcome: { kind: 'delivered', deliveryId: transfer.deliveryId },
+    })
+  await journal.compact()
+  await journal.close()
+  const snapshot = await firstLine(journal)
+  expect(snapshot.notices.map((notice) => notice.deliveryId)).toEqual([transfer.deliveryId])
+  expect(snapshot.closed.map((row) => row.noticeDeliveryId)).toEqual([transfer.deliveryId, transfer.deliveryId])
+
+  for (const epoch of ['two', 'three']) {
+    const boot = new InboundJournal(dir, { epoch })
+    await boot.initialize()
+    const bytes = await readFile(boot.path)
+    expect(await boot.validateNotice(delivered)).toBe('resolved')
+    await boot.acknowledgeNotice(delivered)
+    expect(await boot.importPrepared(outbox, transfer)).toMatchObject({ deliveryId: transfer.deliveryId })
+    expect(await boot.prepareNotice(refs, target)).toEqual(transfer)
+    await expect(boot.prepareNotice(refs, target, [], undefined, 'live-turn-ended')).rejects.toThrow(
+      'Conflicting duplicate notice preparation',
+    )
+    // A record whose frozen payload differs is never accepted as this delivery's authority.
+    await expect(boot.validateNotice({ ...delivered, createdAt: delivered.createdAt + 1 })).rejects.toThrow(
+      'Invalid inbound notice authority',
+    )
+    expect(await readFile(boot.path)).toEqual(bytes)
+    await boot.close()
+  }
+})
+
+test('a live-turn-ended transfer freezes its own notice; restart preparation keeps its original identity', async () => {
+  const journal = new InboundJournal(await directory(), { epoch: 'one' })
+  const transfers: RecoveryRecord[] = []
+  for (const cause of ['live-turn-ended', undefined] as const) {
+    const admitted = await journal.admit({ ...input, messageId: cause ?? 'restart', ownerSessionId: 'parent' })
+    const refs = [{ inputId: admitted.inputId, generation: 1 }]
+    const transfer = await journal.prepareNotice(refs, target, [], 'parent', cause)
+    expect(await journal.prepareNotice(refs, target, [], 'parent', cause)).toEqual(transfer)
+    await expect(
+      journal.prepareNotice(refs, target, [], 'parent', cause ? 'restart' : 'live-turn-ended'),
+    ).rejects.toThrow('Conflicting duplicate notice preparation')
+    // Either cause keeps the transfer identity derived from the covered refs alone.
+    expect(transfer.transferId).toBe(
+      createHash('sha256')
+        .update(`["inbound-transfer",[{"generation":1,"inputId":"${admitted.inputId}"}],[]]`)
+        .digest('hex'),
+    )
+    transfers.push(transfer)
+  }
+  await journal.close()
+  const [ended, restarted] = transfers
+  expect(restarted).toMatchObject({ schemaVersion: 1, templateVersion: 1, locale: 'en', text: RECOVERY_NOTICE_TEXT })
+  expect(restarted).not.toHaveProperty('cause')
+  expect(ended).toMatchObject({ schemaVersion: 2, cause: 'live-turn-ended' })
+  expect(ended!.text).not.toBe(RECOVERY_NOTICE_TEXT)
+})
+
+test('a legacy full-row snapshot and decision log fold once into tombstones and compact to the minimal shape', async () => {
+  const dir = await directory()
+  const message = slackMessage()
+  const legacy = new InboundJournal(dir, { epoch: 'legacy' })
+  const outbox = new RecoveryOutbox(dir, { epoch: 'legacy' })
+  const answered = await legacy.admit(message)
+  const claimed = await legacy.claim([{ inputId: answered.inputId, generation: 1 }], {
+    turnId: 'turn',
+    ownerSessionId: 'parent',
+    target: message.target,
+  })
+  await legacy.settle(claimed.inboundRefs, { kind: 'delivered', decisionId: randomUUID() })
+  const noticed = await legacy.admit({ ...message, messageId: '1700000002.000300' })
+  const transfer = await legacy.prepareNotice([{ inputId: noticed.inputId, generation: 1 }], message.target)
+  const imported = await legacy.importPrepared(outbox, transfer)
+  await legacy.suppressNoticeCoverage(imported, { decisionId: 'stop:legacy', reason: 'user-stop' })
+  const open = await legacy.admit({ ...message, messageId: '1700000003.000400' })
+  await legacy.close()
+  // The pre-tombstone snapshot shape: every row in full, with one bare-UUID and one named receipt.
+  type LegacyLine = { seq: number; changes?: Array<{ row: { inputId: string } }> }
+  const lines: LegacyLine[] = (await readFile(legacy.path, 'utf8'))
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => JSON.parse(line))
+  const rows = new Map<string, unknown>()
+  for (const line of lines) for (const change of line.changes ?? []) rows.set(change.row.inputId, change.row)
+  const receipt = (transitionId: string, seq: number) => ({
+    transitionId,
+    seq,
+    type: 'turn-claimed',
+    decisionDigest: 'a'.repeat(64),
+    payloadDigest: 'b'.repeat(64),
+    inboundRefs: [{ inputId: open.inputId, generation: 1 }],
+    backgroundRefs: [],
+  })
+  const legacySnapshot = {
+    schemaVersion: 1,
+    seq: lines.at(-1)!.seq,
+    type: 'snapshot',
+    rows: [...rows.values()],
+    decisions: [],
+    receipts: [receipt(randomUUID(), 1), receipt('claim-legacy', 2)],
+  }
+  await writeFile(legacy.path, `${JSON.stringify(legacySnapshot)}\n`)
+  const bytes = await readFile(legacy.path)
+
+  const boot = new InboundJournal(dir, { epoch: 'new' })
+  await boot.initialize()
+  expect(await readFile(boot.path)).toEqual(bytes)
+  expect(closedRow(boot.get(answered.inputId))).not.toHaveProperty('principal')
+  expect(closedRow(boot.get(noticed.inputId)).noticeDeliveryId).toBe(transfer.deliveryId)
+  expect(openRow(boot.get(open.inputId)).principal).toEqual(message.principal)
+  expect(await boot.admit({ ...message, revision: 'edited' })).toMatchObject({
+    kind: 'duplicate',
+    inputId: answered.inputId,
+    outcome: { kind: 'delivered' },
+  })
+  expect(await boot.validateNotice(imported)).toBe('resolved')
+  await boot.compact()
+  await boot.close()
+  const snapshot = await firstLine(boot)
+  expect(snapshot).toMatchObject({ schemaVersion: 2, notices: [{ deliveryId: transfer.deliveryId }] })
+  expect(snapshot.open.map((row) => row.inputId)).toEqual([open.inputId])
+  expect(snapshot.closed.map((row) => row.inputId).sort()).toEqual([answered.inputId, noticed.inputId].sort())
+  // The bare UUID from the ended legacy epoch is unreachable; the named receipt is kept as it was.
+  expect(snapshot.receipts.map((r) => r.transitionId)).toEqual(['claim-legacy'])
+  const again = new InboundJournal(dir, { epoch: 'again' })
+  await again.initialize()
+  expect(again.lookupAdmission({ ...message, target: { ...message.target, thread: message.messageId! } })).toEqual(
+    again.get(answered.inputId),
+  )
+  expect(await again.validateNotice(imported)).toBe('resolved')
+  await again.close()
+})
+
+test('the boot pass streams chunk-spanning multibyte lines, truncates only a torn tail and freezes on an invalid complete line', async () => {
+  const dir = await directory()
+  const journal = new InboundJournal(dir, { epoch: 'one' })
+  const korean = '확인해볼게요'.repeat(60)
+  const ids: string[] = []
+  for (let index = 0; index < 120; index++)
+    ids.push((await journal.admit({ ...input, messageId: `${korean}-${index}` })).inputId)
+  await journal.close()
+  const valid = await readFile(journal.path)
+  expect(valid.length).toBeGreaterThan(4 * 64 * 1024)
+  // A torn append that stops inside a multibyte character.
+  const torn = Buffer.from(`{"schemaVersion":1,"seq":121,"note":"${korean}`)
+  await appendFile(journal.path, torn.subarray(0, torn.length - 1))
+  const boot = new InboundJournal(dir, { epoch: 'two' })
+  await boot.initialize()
+  expect(await readFile(boot.path)).toEqual(valid)
+  expect(
+    boot
+      .list()
+      .map((row) => row.inputId)
+      .sort(),
+  ).toEqual([...ids].sort())
+  await boot.close()
+  // A complete line that is not valid UTF-8 is corruption: freeze and keep every byte.
+  const corrupt = Buffer.from(valid)
+  const lastLine = corrupt.lastIndexOf(10, corrupt.length - 2) + 1
+  corrupt[corrupt.indexOf('확', lastLine)] = 0xff
+  await writeFile(boot.path, corrupt)
+  const background = new BackgroundObligationStore(dir, { epoch: 'three' })
+  const frozen = new InboundJournal(dir, { backgroundObligations: background })
+  await expect(frozen.initialize()).rejects.toThrow()
+  expect(await readFile(boot.path)).toEqual(corrupt)
+  expect(() => background.assertAvailable()).toThrow('frozen')
+  await frozen.close()
+})
+
+test('maintenance lifecycle: close skips a queued compaction, waits for one in progress, and a failed compaction freezes dependents', async () => {
+  const seed = async (dir: string) => {
+    const journal = new InboundJournal(dir, { epoch: 'seed' })
+    for (let index = 0; index < 4; index++) await journal.admit({ ...input, messageId: `m${index}` })
+    await journal.close()
+    return readFile(journal.path)
+  }
+  const temps = async (dir: string) => (await readdir(join(dir, 'channels'))).filter((name) => name.endsWith('.tmp'))
+
+  // Queued but not started: close() wins and the journal is left exactly as it was.
+  const queuedDir = await directory()
+  const queuedBytes = await seed(queuedDir)
+  const queued = new InboundJournal(queuedDir, { epoch: 'queued', compactionFloorBytes: 1 })
+  await queued.initialize()
+  queued.startMaintenance()
+  await queued.close()
+  expect(await readFile(queued.path)).toEqual(queuedBytes)
+
+  // In progress: close() waits for the reopened handle and then releases the writer.
+  const runningDir = await directory()
+  await seed(runningDir)
+  let paused!: () => void
+  let resume!: () => void
+  const reached = new Promise<void>((resolve) => {
+    paused = resolve
+  })
+  const gate = new Promise<void>((resolve) => {
+    resume = resolve
+  })
+  const running = new InboundJournal(runningDir, {
+    epoch: 'running',
+    compactionFloorBytes: 1,
+    async onDurability(phase) {
+      if (phase !== 'temp-synced') return
+      paused()
+      await gate
+    },
+  })
+  await running.initialize()
+  running.startMaintenance()
+  await reached
+  const closing = running.close()
+  // The paused compaction holds the writer queue, so close() cannot have settled yet.
+  expect(await Promise.race([closing.then(() => 'closed'), Promise.resolve('waiting')])).toBe('waiting')
+  resume()
+  await closing
+  expect(running.health().available).toBe(false)
+  expect(await firstLine(running)).toMatchObject({ schemaVersion: 2, type: 'snapshot' })
+  const successor = new InboundJournal(runningDir, { epoch: 'successor' })
+  expect((await successor.admit({ ...input, messageId: 'm0' })).kind).toBe('duplicate')
+  await successor.close()
+
+  // Failure before replace removes only its own temp file; failure after replace keeps the installed
+  // snapshot. Either way the writer, cached reads and dependent background progress freeze.
+  for (const boundary of ['temp-synced', 'replaced'] as const) {
+    const dir = await directory()
+    const bytes = await seed(dir)
+    const failures: unknown[] = []
+    const background = new BackgroundObligationStore(dir, { epoch: boundary })
+    const journal = new InboundJournal(dir, {
+      backgroundObligations: background,
+      compactionFloorBytes: 1,
+      onError: (error) => failures.push(error),
+      onDurability(phase) {
+        if (phase === boundary) throw new Error(`compaction failed at ${boundary}`)
+      },
+    })
+    await journal.initialize()
+    journal.startMaintenance()
+    await journal.flush()
+    expect(failures).toHaveLength(1)
+    expect(journal.health().available).toBe(false)
+    expect(() => journal.list()).toThrow('frozen')
+    expect(() => background.assertAvailable()).toThrow('frozen')
+    await expect(journal.admit({ ...input, messageId: 'blocked' })).rejects.toThrow('frozen')
+    expect(await temps(dir)).toEqual([])
+    if (boundary === 'temp-synced') expect(await readFile(journal.path)).toEqual(bytes)
+    else expect(await firstLine(journal)).toMatchObject({ schemaVersion: 2, type: 'snapshot' })
+    await journal.close()
+    const reboot = new InboundJournal(dir, { epoch: `${boundary}-reboot` })
+    await reboot.initialize()
+    expect(reboot.list()).toHaveLength(4)
+    await reboot.close()
+  }
+})
+
+test('a compaction swap keeps reads and dependents available, holds writes until reopen, and a failed reopen freezes', async () => {
+  const hold = () => {
+    let paused!: () => void
+    let resume!: () => void
+    const reached = new Promise<void>((resolve) => {
+      paused = resolve
+    })
+    const gate = new Promise<void>((resolve) => {
+      resume = resolve
+    })
+    return { reached, gate, paused: () => paused(), resume: () => resume() }
+  }
+  for (const held of ['handle-closed', 'replaced', 'directory-synced'] as const) {
+    const dir = await directory()
+    const events: string[] = []
+    const swap = hold()
+    const background = new BackgroundObligationStore(dir, { epoch: held })
+    const journal = new InboundJournal(dir, {
+      backgroundObligations: background,
+      async onDurability(phase, record) {
+        const type = record && typeof record === 'object' && 'type' in record ? String(record.type) : undefined
+        events.push(phase === 'append-written' ? `append:${type}` : phase)
+        if (phase !== held) return
+        swap.paused()
+        await swap.gate
+      },
+    })
+    const answered = await journal.admit(input)
+    await journal.settle([{ inputId: answered.inputId, generation: 1 }], { kind: 'delivered', decisionId: 'answer' })
+    const compaction = journal.compact()
+    await swap.reached
+    // Mid-swap there is no open handle, yet the healthy journal and its dependents stay readable.
+    expect(journal.health().available).toBe(true)
+    expect(() => journal.assertAvailable()).not.toThrow()
+    expect(() => background.assertAvailable()).not.toThrow()
+    expect(closedRow(journal.get(answered.inputId)).outcome.decisionId).toBe('answer')
+    expect(journal.resolve([answered.inputId])).toEqual([{ inputId: answered.inputId, generation: 2 }])
+    expect(journal.lookupAdmission({ ...input, revision: '1' })?.inputId).toBe(answered.inputId)
+    const write = journal.admit({ ...input, messageId: 'during-swap' })
+    expect(await Promise.race([write.then(() => 'written'), Promise.resolve('waiting')])).toBe('waiting')
+    swap.resume()
+    await compaction
+    expect((await write).kind).toBe('accepted')
+    // The queued admission went only through the installed file's reopened handle.
+    expect(events.lastIndexOf('append:admitted')).toBeGreaterThan(events.indexOf('reopened'))
+    await journal.close()
+    const reboot = new InboundJournal(dir, { epoch: `${held}-reboot` })
+    await reboot.initialize()
+    expect(
+      reboot
+        .list()
+        .map((row) => row.reference?.messageId)
+        .sort(),
+    ).toEqual(['during-swap', 'm'])
+    await reboot.close()
+  }
+
+  // A swap whose reopen genuinely fails freezes the writer, dependents and queued work; nothing is
+  // written through the closed handle or into the installed snapshot.
+  const dir = await directory()
+  const swap = hold()
+  const failures: unknown[] = []
+  const background = new BackgroundObligationStore(dir, { epoch: 'reopen-failure' })
+  const journal = new InboundJournal(dir, {
+    backgroundObligations: background,
+    onError: (error) => failures.push(error),
+    async onDurability(phase) {
+      if (phase !== 'directory-synced') return
+      swap.paused()
+      await swap.gate
+    },
+  })
+  const aborted: unknown[] = []
+  journal.subscribeFailure((error) => aborted.push(error))
+  await journal.admit(input)
+  // Both outcomes are observed from creation, so neither expected rejection is ever unhandled.
+  const compaction = Promise.allSettled([journal.compact()])
+  await swap.reached
+  const write = Promise.allSettled([journal.admit({ ...input, messageId: 'during-swap' })])
+  // A regular file at the parent path makes traversal fail even where opening a directory succeeds.
+  // Both the saved snapshot and the obstruction stay inside the fixture's cleanup directory.
+  const parent = dirname(journal.path)
+  const savedParent = `${parent}.installed`
+  const installed = join(savedParent, basename(journal.path))
+  await rename(parent, savedParent)
+  await writeFile(parent, 'reopen blocked')
+  swap.resume()
+  const [compacted] = await compaction
+  const [written] = await write
+  expect(compacted).toMatchObject({ status: 'rejected', reason: expect.any(Error) })
+  expect(written).toMatchObject({ status: 'rejected', reason: { message: expect.stringContaining('frozen') } })
+  expect(failures).toHaveLength(1)
+  expect(aborted).toEqual(failures)
+  expect(journal.health().available).toBe(false)
+  expect(() => journal.get('0'.repeat(64))).toThrow('frozen')
+  expect(() => background.assertAvailable()).toThrow('frozen')
+  const lines = (await readFile(installed, 'utf8')).split('\n').filter(Boolean)
+  expect(lines).toHaveLength(1)
+  expect(JSON.parse(lines[0]!)).toMatchObject({ schemaVersion: 2, type: 'snapshot' })
+  await journal.close()
 })

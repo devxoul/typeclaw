@@ -11,6 +11,7 @@ import type { AgentSession } from '@/agent'
 import { createPostGithubReviewTool } from '@/agent/tools/post-github-review'
 
 import { BackgroundObligationStore, type BackgroundObligationRef } from './background-obligations'
+import { recoveryNoticeCause } from './continuity-types'
 import {
   __resetReviewObserverForTest,
   recordReview,
@@ -163,27 +164,29 @@ async function fixture() {
   return { dir, store, router, session, sent, outputs, turn, accept, fetch, cleanup, outbound }
 }
 
-// Real-file boot transfer and receipt; this deliberately does not claim process-death proof.
-async function proveBootNotice(dir: string, owed: BackgroundObligationRef, closed?: BackgroundObligationRef) {
-  const boot = new BackgroundObligationStore(dir, { epoch: 'review-after-boot' })
-  const outbox = new RecoveryOutbox(dir, { epoch: 'review-after-boot' })
-  await boot.importOldEpoch(outbox)
-  const row = (await boot.get(owed.obligationId))!
+// The review turn ended still owing `owed`: a review never answers a result it did not capture,
+// so the turn's own end transferred it in this process as a durable live-turn-ended notice.
+async function proveLiveNotice(
+  dir: string,
+  store: BackgroundObligationStore,
+  owed: BackgroundObligationRef,
+  closed?: BackgroundObligationRef,
+) {
+  const row = (await store.get(owed.obligationId))!
   expect(row.phase).toBe('notice-owned')
-  const notices = await outbox.list()
-  expect(notices.map((notice) => notice.covers)).toEqual([
-    [{ store: 'background', id: owed.obligationId, generation: row.generation, parentSessionId: SESSION_ID }],
-  ])
+  const notices = (await new RecoveryOutbox(dir).list()).filter((notice) =>
+    notice.covers.some((cover) => cover.id === owed.obligationId),
+  )
+  expect(notices).toHaveLength(1)
   expect(notices[0]!.state).toBe('pending')
-  if (closed) expect((await boot.get(closed.obligationId))?.phase).toBe('closed')
-  const notice = notices[0]!
-  const lease = (await outbox.lease(notice.deliveryId, notice.generation))!
-  expect(await outbox.delivered(notice.deliveryId, lease, { confirmedAt: 2000 })).toBe(true)
-  await boot.importOldEpoch(outbox)
-  expect((await boot.get(owed.obligationId))?.outcome).toMatchObject({
-    kind: 'delivered',
-    deliveryId: notice.deliveryId,
+  expect(recoveryNoticeCause(notices[0]!)).toBe('live-turn-ended')
+  expect(notices[0]!.covers.find((cover) => cover.id === owed.obligationId)).toEqual({
+    store: 'background',
+    id: owed.obligationId,
+    generation: row.generation,
+    parentSessionId: SESSION_ID,
   })
+  if (closed) expect((await store.get(closed.obligationId))?.phase).toBe('closed')
 }
 
 const allowReview: ReviewVerdictGuard = {
@@ -257,10 +260,9 @@ for (const publication of ['APPROVE', 'COMMENT', 'duplicate-request-changes-comm
       expect(f.outputs.map((output) => output.backgroundCoverage)).toEqual([before])
       expect(before.map((ref) => ref.obligationId)).toEqual([a.obligationId])
       expect((await f.store.get(a.obligationId))?.outcome?.kind).toBe('delivered')
-      expect((await f.store.get(b.obligationId))?.phase).toBe('turn-owned')
       expect(f.session.prompts).toHaveLength(2)
       expect(f.sent).toEqual(fallback ? ['Review findings.'] : [])
-      await proveBootNotice(f.dir, b, a)
+      await proveLiveNotice(f.dir, f.store, b, a)
     } finally {
       release.resolve()
       await f.cleanup()
@@ -278,10 +280,9 @@ test('uncaptured direct review recognition suppresses empty-output fallback with
       f.session.finish('')
     }
     await f.turn('review the changes')
-    expect((await f.store.get(a.obligationId))?.phase).toBe('turn-owned')
     expect(f.session.prompts).toHaveLength(2)
     expect(f.sent).toEqual([])
-    await proveBootNotice(f.dir, a)
+    await proveLiveNotice(f.dir, f.store, a)
   } finally {
     await f.cleanup()
   }

@@ -6,6 +6,7 @@ import { join } from 'node:path'
 import { noopPermissionService } from '@/permissions'
 
 import { BackgroundObligationStore } from './background-obligations'
+import { LIVE_TURN_ENDED_NOTICE_TEXT, RECOVERY_NOTICE_TEXT, recoveryNoticeCause } from './continuity-types'
 import { RecoveryDispatcher } from './recovery-dispatcher'
 import { createRecoveryNotice } from './recovery-notice'
 import { RecoveryOutbox } from './recovery-outbox'
@@ -13,6 +14,7 @@ import { createChannelRouter } from './router'
 import { defaultHistoryConfig } from './schema'
 
 const target = { adapter: 'slack-bot' as const, workspace: 'team', chat: 'room', thread: null }
+const liveChild = { key: target, accountIdentity: 'actor', parentSessionId: 'live', taskId: 'live' }
 
 async function fixture() {
   const dir = await mkdtemp(join(tmpdir(), 'background-dispatch-'))
@@ -24,6 +26,8 @@ async function fixture() {
   const transport = Promise.withResolvers<void>()
   let holdSend = false
   const sent: string[] = []
+  const texts: (string | undefined)[] = []
+  const sentWaiters: { count: number; resolve: () => void }[] = []
   const source = new BackgroundObligationStore(dir, {
     epoch: 'boot',
     onDurability: (phase, row) => {
@@ -64,6 +68,8 @@ async function fixture() {
   })
   router.registerOutbound('slack-bot', async (message) => {
     sent.push(message.sendOptions?.accounting === 'recovery' ? message.sendOptions.deliveryId : 'unknown')
+    texts.push(message.text)
+    for (const waiter of sentWaiters) if (sent.length >= waiter.count) waiter.resolve()
     sending.resolve()
     if (holdSend) await transport.promise
     return { ok: true, messageId: 'remote-notice' }
@@ -83,6 +89,13 @@ async function fixture() {
     sending,
     transport,
     sent,
+    texts,
+    sentCount: (count: number) => {
+      const waiter = Promise.withResolvers<void>()
+      if (sent.length >= count) waiter.resolve()
+      else sentWaiters.push({ count, resolve: waiter.resolve })
+      return waiter.promise
+    },
     failAck: () => {
       failAck = true
     },
@@ -109,10 +122,18 @@ test('confirmed real-router transport closes exactly its background source', asy
       phase: 'closed',
       outcome: { kind: 'delivered', deliveryId: f.notice.deliveryId },
     })
-    expect(await f.outbox.get(f.notice.deliveryId)).toMatchObject({
+    // Acknowledged and source-resolved: the active record is retired behind its immutable fence.
+    expect(await f.outbox.get(f.notice.deliveryId)).toBeUndefined()
+    expect(await f.outbox.list()).toEqual([])
+    expect(await f.outbox.retired(f.notice.deliveryId)).toMatchObject({
+      deliveryId: f.notice.deliveryId,
+      dispatch: { state: 'delivered', receipt: { messageId: 'remote-notice' } },
+    })
+    expect(await f.outbox.import(f.notice)).toMatchObject({
       state: 'delivered',
       receipt: { messageId: 'remote-notice' },
     })
+    expect(await f.outbox.list()).toEqual([])
   } finally {
     await f.cleanup()
   }
@@ -211,7 +232,8 @@ test('stop source suppression precedes outbox suppression and prevents dispatch'
         phase: 'closed',
         outcome: { kind: 'intentionally-suppressed', reason: 'user-stop' },
       })
-      expect(await f.outbox.get(f.notice.deliveryId)).toMatchObject({ state: 'suppressed' })
+      expect(await f.outbox.get(f.notice.deliveryId)).toBeUndefined()
+      expect(await f.outbox.retired(f.notice.deliveryId)).toMatchObject({ dispatch: { state: 'suppressed' } })
       expect(f.sent).toEqual([])
     } finally {
       await dispatcher.stop()
@@ -230,10 +252,11 @@ test('stop during in-flight real-router send retains remote receipt and never re
     await f.dispatcher.suppressParent(target, 'parent')
     f.transport.resolve()
     await f.dispatcher.stop()
-    expect(await f.outbox.get(f.notice.deliveryId)).toMatchObject({
-      state: 'suppressed',
-      receipt: { messageId: 'remote-notice' },
+    // The in-flight send landed after /stop: its receipt is kept on the suppressed fence.
+    expect(await f.outbox.retired(f.notice.deliveryId)).toMatchObject({
+      dispatch: { state: 'suppressed', receipt: { messageId: 'remote-notice' } },
     })
+    expect(await f.outbox.get(f.notice.deliveryId)).toBeUndefined()
     expect(await f.source.get(f.accepted.obligationId)).toMatchObject({
       phase: 'closed',
       outcome: { kind: 'intentionally-suppressed' },
@@ -304,6 +327,168 @@ test('journal failure during transport preflight prevents leasing while independ
     expect(f.sent).toEqual([independent.deliveryId])
   } finally {
     release.resolve()
+    await f.cleanup()
+  }
+})
+
+test('same-epoch live-turn-ended transfer dispatches promptly with its frozen non-restart text, then retires', async () => {
+  const f = await fixture()
+  try {
+    // Boot: the old epoch's child gets the frozen restart notice.
+    const restartSent = f.sentCount(1)
+    await f.dispatcher.wake()
+    await restartSent
+    // Same process, no restart: a live turn abandons a consumed child result.
+    const live = await f.source.accept(liveChild)
+    const ready = (await f.source.resultReady(live.obligationId))!
+    const prepared = (await f.source.withTargetLane(target, () =>
+      f.source.prepareNotice(ready.obligationId, ready.generation, 'live-turn-ended'),
+    ))!
+    const transfer = prepared.transfer!
+    expect(recoveryNoticeCause(transfer)).toBe('live-turn-ended')
+    expect(transfer).toMatchObject({ schemaVersion: 2, cause: 'live-turn-ended', text: LIVE_TURN_ENDED_NOTICE_TEXT })
+    expect(transfer.text).not.toContain('restart')
+    // The cause is frozen at preparation; a later (default restart) prepare returns the same transfer.
+    expect((await f.source.prepareNotice(prepared.obligationId, prepared.generation))!.transfer).toEqual(transfer)
+    const liveSent = f.sentCount(2)
+    await f.source.withTargetLane(target, async () => {
+      const imported = await f.outbox.import(transfer)
+      await f.source.ownNotice(prepared.obligationId, prepared.generation, imported.deliveryId)
+    })
+    // No manual wake: the durable import itself wakes the already-booted dispatcher.
+    await liveSent
+    await f.dispatcher.stop()
+    expect(f.sent).toEqual([f.notice.deliveryId, transfer.deliveryId])
+    expect(f.texts).toEqual([RECOVERY_NOTICE_TEXT, LIVE_TURN_ENDED_NOTICE_TEXT])
+    expect(await f.source.get(live.obligationId)).toMatchObject({
+      phase: 'closed',
+      outcome: { kind: 'delivered', deliveryId: transfer.deliveryId },
+    })
+    expect(await f.outbox.retired(transfer.deliveryId)).toMatchObject({ dispatch: { state: 'delivered' } })
+    // Two later boots neither resend it nor turn it into a restart notice.
+    for (const epoch of ['reboot-1', 'reboot-2']) {
+      const store = new BackgroundObligationStore(f.dir, { epoch })
+      const outbox = new RecoveryOutbox(f.dir, { epoch })
+      await store.importOldEpoch(outbox)
+      const dispatcher = new RecoveryDispatcher(outbox, f.router, { backgroundObligations: store })
+      try {
+        await dispatcher.wake()
+      } finally {
+        await dispatcher.stop()
+      }
+      expect(await outbox.list()).toEqual([])
+    }
+    expect(f.sent).toEqual([f.notice.deliveryId, transfer.deliveryId])
+  } finally {
+    await f.cleanup()
+  }
+})
+
+test('live-turn-ended transfer stranded by process death is re-imported unchanged at boot, never as a restart', async () => {
+  const f = await fixture()
+  try {
+    await f.outbox.suppress(f.notice.deliveryId, 'test-replacement', 'replacement')
+    const dying = new BackgroundObligationStore(f.dir, { epoch: 'dying' })
+    const live = await dying.accept(liveChild)
+    const ready = (await dying.resultReady(live.obligationId))!
+    // Died after freezing the live transfer, before the outbox import.
+    const transfer = (await dying.prepareNotice(ready.obligationId, ready.generation, 'live-turn-ended'))!.transfer!
+    const store = new BackgroundObligationStore(f.dir, { epoch: 'reboot' })
+    const outbox = new RecoveryOutbox(f.dir, { epoch: 'reboot' })
+    await store.importOldEpoch(outbox)
+    const pending = (await outbox.list()).filter((record) => record.state === 'pending')
+    expect(pending).toEqual([transfer])
+    expect(recoveryNoticeCause(pending[0]!)).toBe('live-turn-ended')
+    const sent = f.sentCount(1)
+    const dispatcher = new RecoveryDispatcher(outbox, f.router, { backgroundObligations: store })
+    try {
+      await dispatcher.wake()
+      await sent
+    } finally {
+      await dispatcher.stop()
+    }
+    expect(f.sent).toEqual([transfer.deliveryId])
+    expect(f.texts).toEqual([LIVE_TURN_ENDED_NOTICE_TEXT])
+  } finally {
+    await f.cleanup()
+  }
+})
+
+test('death after source acknowledgment but before retirement converges across reboots without a send', async () => {
+  const f = await fixture()
+  try {
+    // The remote send and its source acknowledgment both landed; the process died before retirement.
+    const lease = (await f.outbox.lease(f.notice.deliveryId, f.notice.generation))!
+    await f.outbox.delivered(f.notice.deliveryId, lease, { confirmedAt: 1, messageId: 'landed-before-death' })
+    const delivered = (await f.outbox.get(f.notice.deliveryId))!
+    await f.source.withTargetLane(target, () => f.source.acknowledgeNotice(delivered))
+    expect(await f.source.get(f.accepted.obligationId)).toMatchObject({ phase: 'closed' })
+    for (const epoch of ['reboot-1', 'reboot-2']) {
+      const store = new BackgroundObligationStore(f.dir, { epoch })
+      const outbox = new RecoveryOutbox(f.dir, { epoch })
+      await store.importOldEpoch(outbox)
+      const dispatcher = new RecoveryDispatcher(outbox, f.router, { backgroundObligations: store })
+      try {
+        await dispatcher.wake()
+      } finally {
+        await dispatcher.stop()
+      }
+      expect(await outbox.list()).toEqual([])
+      // Replaying the frozen transfer resolves to the finished delivery, never a new pending send.
+      expect(await outbox.import(f.notice)).toMatchObject({
+        state: 'delivered',
+        receipt: { messageId: 'landed-before-death' },
+      })
+      expect(await outbox.lease(f.notice.deliveryId, delivered.generation)).toBeUndefined()
+      expect(await outbox.list()).toEqual([])
+    }
+    // A different payload under the same delivery identity is rejected, not re-queued.
+    await expect(f.outbox.import({ ...f.notice, transferId: 'forged-transfer' })).rejects.toThrow(
+      'Conflicting recovery import',
+    )
+    expect((await f.outbox.listRetired()).map((fence) => fence.deliveryId)).toEqual([f.notice.deliveryId])
+    expect(f.sent).toEqual([])
+  } finally {
+    await f.cleanup()
+  }
+})
+
+test('unresolved source authority keeps a delivered record active instead of retiring it', async () => {
+  const f = await fixture()
+  try {
+    f.failAck()
+    await f.dispatcher.wake()
+    await f.error.promise
+    await f.dispatcher.stop()
+    // The send landed but the source never acknowledged: the outbox record remains the authority.
+    expect(await f.source.get(f.accepted.obligationId)).toMatchObject({ phase: 'notice-owned' })
+    expect(await f.outbox.get(f.notice.deliveryId)).toMatchObject({ state: 'delivered' })
+    expect(await f.outbox.retired(f.notice.deliveryId)).toBeUndefined()
+    expect(f.sent).toEqual([f.notice.deliveryId])
+  } finally {
+    await f.cleanup()
+  }
+})
+
+test('/stop before dispatch suppresses a live-turn-ended notice with its source and never sends it', async () => {
+  const f = await fixture()
+  try {
+    await f.outbox.suppress(f.notice.deliveryId, 'test-replacement', 'replacement')
+    const live = await f.source.accept(liveChild)
+    const ready = (await f.source.resultReady(live.obligationId))!
+    const prepared = (await f.source.prepareNotice(ready.obligationId, ready.generation, 'live-turn-ended'))!
+    await f.outbox.import(prepared.transfer!)
+    await f.source.ownNotice(prepared.obligationId, prepared.generation, prepared.transfer!.deliveryId)
+    await f.dispatcher.suppressParent(target, 'live')
+    await f.dispatcher.wake()
+    await f.dispatcher.stop()
+    expect(f.sent).toEqual([])
+    expect(await f.source.get(live.obligationId)).toMatchObject({
+      phase: 'closed',
+      outcome: { kind: 'intentionally-suppressed', reason: 'user-stop' },
+    })
+    expect(await f.outbox.retired(prepared.transfer!.deliveryId)).toMatchObject({ dispatch: { state: 'suppressed' } })
+  } finally {
     await f.cleanup()
   }
 })

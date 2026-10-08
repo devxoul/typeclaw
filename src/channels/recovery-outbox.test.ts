@@ -1,9 +1,18 @@
 import { afterEach, describe, expect, test } from 'bun:test'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { parseRecoveryRecord, recoveryDeliveryId, validateRecoveryRecord } from './continuity-types'
+import {
+  LIVE_TURN_ENDED_NOTICE_TEXT,
+  parseRecoveryRecord,
+  RECOVERY_NOTICE_TEXT,
+  recoveryDeliveryId,
+  recoveryNoticeCause,
+  recoveryPayload,
+  recoveryPayloadDigest,
+  validateRecoveryRecord,
+} from './continuity-types'
 import type { RecoveryRecord } from './continuity-types'
 import { createRecoveryNotice } from './recovery-notice'
 import { RecoveryOutbox } from './recovery-outbox'
@@ -31,8 +40,8 @@ function notice(): RecoveryRecord {
 async function crash(
   dir: string,
   record: RecoveryRecord,
-  operation: 'import' | 'lease' | 'delivered',
-  phase: 'temp-synced' | 'replaced' | 'directory-synced',
+  operation: 'import' | 'lease' | 'delivered' | 'retire',
+  phase: 'temp-synced' | 'replaced' | 'directory-synced' | 'retirement-synced' | 'retired',
 ): Promise<void> {
   const source = `
     import { RecoveryOutbox } from ${JSON.stringify(new URL('./recovery-outbox.ts', import.meta.url).href)};
@@ -47,7 +56,7 @@ async function crash(
       }
     }});
     if (operation === 'import') await store.import(record);
-    else { const lease = await store.lease(record.deliveryId, record.generation); if (!lease) throw new Error('missing lease'); if (operation === 'delivered') await store.delivered(record.deliveryId, lease, {confirmedAt:200,messageId:'remote-message'}); }
+    else { const lease = await store.lease(record.deliveryId, record.generation); if (!lease) throw new Error('missing lease'); if (operation !== 'lease') await store.delivered(record.deliveryId, lease, {confirmedAt:200,messageId:'remote-message'}); if (operation === 'retire') await store.retire(record.deliveryId, lease.generation); }
     throw new Error('crash boundary not reached');
   `
   const child = Bun.spawn([process.execPath, '-e', source], {
@@ -325,4 +334,225 @@ describe('recovery outbox durable ownership', () => {
     expect(await store.delivered(record.deliveryId, lease, { messageId: 'message', confirmedAt: 700 })).toBe(true)
     expect(await store.delivered(record.deliveryId, lease, { confirmedAt: 701 })).toBe(false)
   })
+})
+
+const golden = {
+  target: { adapter: 'slack-bot' as const, workspace: 'w', chat: 'c', thread: 't' },
+  accountIdentity: 'actor-1',
+  principal: {
+    kind: 'channel' as const,
+    adapter: 'slack-bot' as const,
+    workspace: 'w',
+    chat: 'c',
+    lastInboundAuthorId: 'human',
+  },
+  sourceParentSessionId: 'golden-parent',
+  covers: [{ store: 'inbound' as const, id: 'golden-input', generation: 2, parentSessionId: 'golden-parent' }],
+  transferId: 'golden-transfer',
+  recoveryGeneration: 'golden-generation',
+  createdAt: 100,
+}
+// sha256 of the frozen RFC v1 identity tuple; computed independently of the implementation.
+const GOLDEN_RESTART_ID = 'd3355b17bf84aabc9a2f6dfd06c23b5980f125f89fd8afc39ddec870c0adf7bf'
+const GOLDEN_LIVE_ID = 'eb58949391d20527e2e672a36c4ff364ed7496bbc50efaf17d350a37e0920cad'
+
+describe('recovery notice causes', () => {
+  test('restart remains the frozen en/v1 record: identity, template, payload and old bytes unchanged', async () => {
+    // Exactly the record shape every earlier release persisted.
+    const legacy = {
+      schemaVersion: 1,
+      deliveryId: GOLDEN_RESTART_ID,
+      purpose: 'interruption-notice',
+      target: golden.target,
+      accountIdentity: golden.accountIdentity,
+      principal: golden.principal,
+      sourceParentSessionId: golden.sourceParentSessionId,
+      covers: golden.covers,
+      transferId: golden.transferId,
+      recoveryGeneration: golden.recoveryGeneration,
+      templateVersion: 1,
+      locale: 'en',
+      text: "⚠️ I restarted before I could confirm a reply to your earlier request. I didn't rerun it automatically — please ask again if you still need it.",
+      createdAt: 100,
+      generation: 1,
+      state: 'pending',
+      attempts: 0,
+    }
+    const restart = createRecoveryNotice(golden)
+    expect(restart).toEqual(parseRecoveryRecord(legacy))
+    expect(createRecoveryNotice({ ...golden, cause: 'restart' })).toEqual(restart)
+    expect(restart.deliveryId).toBe(GOLDEN_RESTART_ID)
+    expect(restart.text).toBe(RECOVERY_NOTICE_TEXT)
+    expect('cause' in restart).toBe(false)
+    expect(recoveryNoticeCause(restart)).toBe('restart')
+    const canonical = (value: object) =>
+      JSON.stringify(
+        Object.entries(value)
+          .filter(([, field]) => field !== undefined)
+          .sort(([a], [b]) => a.localeCompare(b)),
+      )
+    expect(recoveryPayload(restart)).toBe(
+      JSON.stringify([
+        GOLDEN_RESTART_ID,
+        'interruption-notice',
+        'slack-bot',
+        'w',
+        'c',
+        't',
+        'actor-1',
+        null,
+        canonical(golden.principal),
+        'golden-parent',
+        golden.covers.map(canonical).sort(),
+        'golden-transfer',
+        'golden-generation',
+        1,
+        'en',
+        RECOVERY_NOTICE_TEXT,
+        100,
+      ]),
+    )
+    // A record file written by an earlier release is read and re-imported without being rewritten.
+    const dir = await directory()
+    const path = join(dir, 'channels', 'recovery-outbox', `${GOLDEN_RESTART_ID}.json`)
+    await mkdir(join(dir, 'channels', 'recovery-outbox'), { recursive: true })
+    const bytes = `${JSON.stringify(legacy)}\n`
+    await writeFile(path, bytes)
+    const store = new RecoveryOutbox(dir, { epoch: 'upgraded' })
+    expect(await store.import(restart)).toEqual(restart)
+    expect(await readFile(path, 'utf8')).toBe(bytes)
+    expect(await store.lease(GOLDEN_RESTART_ID, 1)).toBeDefined()
+  })
+
+  test('live-turn-ended is a distinct versioned record that never claims a restart', async () => {
+    const live = createRecoveryNotice({ ...golden, cause: 'live-turn-ended' })
+    expect(live.deliveryId).toBe(GOLDEN_LIVE_ID)
+    expect(live).toMatchObject({
+      schemaVersion: 2,
+      purpose: 'interruption-notice',
+      cause: 'live-turn-ended',
+      templateVersion: 1,
+      locale: 'en',
+      text: LIVE_TURN_ENDED_NOTICE_TEXT,
+    })
+    expect(recoveryNoticeCause(live)).toBe('live-turn-ended')
+    expect(live.text).not.toContain('restart')
+    expect(recoveryPayload(live)).not.toBe(recoveryPayload(createRecoveryNotice(golden)))
+    // Each cause pins its own template, version and identity seed.
+    for (const malformed of [
+      { ...live, text: RECOVERY_NOTICE_TEXT },
+      { ...live, cause: undefined },
+      { ...live, schemaVersion: 1 },
+      { ...live, cause: 'restart' },
+      { ...live, templateVersion: 2 },
+      { ...live, deliveryId: GOLDEN_RESTART_ID },
+      { ...createRecoveryNotice(golden), cause: 'live-turn-ended' },
+      { ...createRecoveryNotice(golden), text: LIVE_TURN_ENDED_NOTICE_TEXT },
+    ])
+      expect(validateRecoveryRecord(malformed)).toBe(false)
+    // Durable like any notice: it survives reboot and a landed receipt is never re-leased.
+    const dir = await directory()
+    const first = new RecoveryOutbox(dir, { epoch: 'live' })
+    await first.import(live)
+    const restart = await first.import(createRecoveryNotice(golden))
+    expect(restart.deliveryId).not.toBe(live.deliveryId)
+    const lease = (await first.lease(live.deliveryId, 1))!
+    expect(await first.delivered(live.deliveryId, lease, { confirmedAt: 5, messageId: 'live-posted' })).toBe(true)
+    const reboot = new RecoveryOutbox(dir, { epoch: 'reboot' })
+    const recovered = await reboot.import(live)
+    expect(recovered).toMatchObject({ state: 'delivered', cause: 'live-turn-ended', text: LIVE_TURN_ENDED_NOTICE_TEXT })
+    expect(await reboot.lease(live.deliveryId, recovered.generation)).toBeUndefined()
+  })
+})
+
+describe('recovery outbox terminal retirement', () => {
+  test('retirement keeps only an immutable fence and replayed imports return the finished delivery', async () => {
+    const dir = await directory()
+    const store = new RecoveryOutbox(dir, { epoch: 'e', now: () => 900 })
+    const imported: string[] = []
+    const unsubscribe = store.subscribe((record) => imported.push(record.deliveryId))
+    const record = notice()
+    await store.import(record)
+    await store.import(record)
+    expect(imported).toEqual([record.deliveryId])
+    expect(await store.retire(record.deliveryId, 1)).toBe(false)
+    const lease = (await store.lease(record.deliveryId, 1))!
+    expect(await store.retire(record.deliveryId, lease.generation)).toBe(false)
+    expect(await store.delivered(record.deliveryId, lease, { confirmedAt: 901, messageId: 'posted' })).toBe(true)
+    expect(await store.retire(record.deliveryId, 1)).toBe(false)
+    expect(await store.retire(record.deliveryId, lease.generation)).toBe(true)
+    expect(await store.retire(record.deliveryId, lease.generation)).toBe(true)
+    expect(await store.get(record.deliveryId)).toBeUndefined()
+    expect(await store.list()).toEqual([])
+    const fence = (await store.retired(record.deliveryId))!
+    expect(fence).toEqual({
+      schemaVersion: 1,
+      deliveryId: record.deliveryId,
+      payloadDigest: recoveryPayloadDigest(record),
+      retiredAt: 900,
+      dispatch: {
+        state: 'delivered',
+        generation: lease.generation,
+        attempts: 1,
+        lease,
+        receipt: { confirmedAt: 901, messageId: 'posted' },
+      },
+    })
+    // The fence does not duplicate the frozen payload.
+    expect(JSON.stringify(fence)).not.toContain(record.text)
+    expect(await store.listRetired()).toEqual([fence])
+    const reboot = new RecoveryOutbox(dir, { epoch: 'reboot' })
+    const replay = await reboot.import(record)
+    expect(replay).toMatchObject({
+      deliveryId: record.deliveryId,
+      state: 'delivered',
+      receipt: { messageId: 'posted' },
+    })
+    expect(recoveryPayload(replay)).toBe(recoveryPayload(record))
+    expect(await reboot.list()).toEqual([])
+    expect(await reboot.lease(record.deliveryId, replay.generation)).toBeUndefined()
+    expect(await reboot.suppress(record.deliveryId, 'late-stop', 'late')).toBe(false)
+    await expect(reboot.import({ ...record, transferId: 'other' })).rejects.toThrow('Conflicting recovery import')
+    expect(imported).toEqual([record.deliveryId])
+    unsubscribe()
+    await store.import(createRecoveryNotice({ ...record, recoveryGeneration: 'after-unsubscribe' }))
+    expect(imported).toEqual([record.deliveryId])
+  })
+
+  test('a suppressed record that never dispatched retires to a suppression fence', async () => {
+    const dir = await directory()
+    const store = new RecoveryOutbox(dir, { epoch: 'e' })
+    const record = notice()
+    await store.import(record)
+    expect(await store.suppress(record.deliveryId, 'user_stop', 'stop-decision')).toBe(true)
+    expect(await store.retire(record.deliveryId, 2)).toBe(true)
+    expect((await store.retired(record.deliveryId))?.dispatch).toEqual({
+      state: 'suppressed',
+      generation: 2,
+      attempts: 0,
+      suppression: { reason: 'user_stop', decisionId: 'stop-decision' },
+    })
+    expect(await new RecoveryOutbox(dir, { epoch: 'reboot' }).import(record)).toMatchObject({
+      state: 'suppressed',
+      suppression: { decisionId: 'stop-decision' },
+    })
+  })
+
+  for (const phase of ['retirement-synced', 'retired'] as const) {
+    test(`death during retirement at ${phase} never re-queues the delivery`, async () => {
+      const dir = await directory()
+      const record = notice()
+      await new RecoveryOutbox(dir).import(record)
+      await crash(dir, record, 'retire', phase)
+      const reboot = new RecoveryOutbox(dir, { epoch: 'next' })
+      const active = await reboot.get(record.deliveryId)
+      expect(active?.state).toBe(phase === 'retirement-synced' ? 'delivered' : undefined)
+      expect((await reboot.retired(record.deliveryId))?.dispatch.state).toBe('delivered')
+      expect((await reboot.import(record)).state).toBe('delivered')
+      if (active) expect(await reboot.retire(record.deliveryId, active.generation)).toBe(true)
+      expect(await reboot.list()).toEqual([])
+      expect((await reboot.import(record)).receipt?.messageId).toBe('remote-message')
+      expect(await reboot.lease(record.deliveryId, 3)).toBeUndefined()
+    })
+  }
 })

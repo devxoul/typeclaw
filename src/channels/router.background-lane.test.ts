@@ -10,6 +10,7 @@ import type { SessionEntry } from '@earendil-works/pi-coding-agent'
 import type { AgentSession } from '@/agent'
 
 import { BackgroundObligationStore } from './background-obligations'
+import { recoveryNoticeCause } from './continuity-types'
 import { InboundJournal } from './inbound-journal'
 import { RecoveryOutbox } from './recovery-outbox'
 import { createChannelRouter, SESSION_GRACE_HARD_TTL_MS } from './router'
@@ -240,6 +241,42 @@ test('an active parent fetch retires its queued completion before terminal reply
     expect(f.sent).toEqual(['Final result is 42.'])
     await f.independent('unrelated human question after fetch')
     expect(f.logs.some((log) => log.includes('Invalid background'))).toBe(false)
+  } finally {
+    await f.router.stop()
+    await rm(f.dir, { recursive: true, force: true })
+  }
+})
+
+test('a fetched result a silent turn left owed is transferred at that turn end, before any rollover', async () => {
+  const f = await fixture()
+  try {
+    const ref = await f.accept('silent-fetch')
+    const parent = f.sessions[0]!
+    parent.onPrompt = async () => {
+      await f.complete('silent-fetch')
+      await f.router.attachBackgroundResultCoverage({ parentSessionId: 'parent-1', taskId: 'silent-fetch' })
+      parent.finish('NO_REPLY')
+    }
+    await f.router.route(f.inbound('what did the lookup find?'))
+    await f.flush()
+
+    // Explicit silence cannot answer a child result, and nothing continues the turn: it ends here,
+    // durably, as a live-turn-ended notice rather than waiting for a restart or the next message.
+    const transferred = await f.store.get(ref.obligationId)
+    expect(transferred?.phase).toBe('notice-owned')
+    const notices = (await new RecoveryOutbox(f.dir).list()).filter((notice) =>
+      notice.covers.some((cover) => cover.id === ref.obligationId),
+    )
+    expect(notices).toHaveLength(1)
+    expect(recoveryNoticeCause(notices[0]!)).toBe('live-turn-ended')
+
+    // Stale rollover finds nothing left to hand over; the successor never acquires the result.
+    const sessions = f.sessions.length
+    f.advance()
+    await f.independent('unrelated question after rollover')
+    expect(f.sessions.length).toBe(sessions + 1)
+    expect(await f.store.get(ref.obligationId)).toEqual(transferred)
+    expect(f.sent).toEqual([])
   } finally {
     await f.router.stop()
     await rm(f.dir, { recursive: true, force: true })

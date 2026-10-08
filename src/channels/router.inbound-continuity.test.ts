@@ -12,11 +12,18 @@ import { createChannelSendTool, type ChannelSendOrigin } from '../agent/tools/ch
 import { reloadConfig } from '../config/config'
 import { noopPermissionService } from '../permissions'
 import { createStream } from '../stream'
-import { BackgroundObligationStore } from './background-obligations'
+import { BackgroundObligationStore, type BackgroundObligation } from './background-obligations'
+import {
+  LIVE_TURN_ENDED_NOTICE_TEXT,
+  RECOVERY_NOTICE_TEXT,
+  recoveryNoticeCause,
+  recoveryPayload,
+  type RecoveryRecord,
+} from './continuity-types'
 import { InboundJournal } from './inbound-journal'
 import { RecoveryDispatcher } from './recovery-dispatcher'
 import { RecoveryOutbox } from './recovery-outbox'
-import { createChannelRouter } from './router'
+import { createChannelRouter, SESSION_GRACE_HARD_TTL_MS, SESSION_IDLE_MS } from './router'
 import { defaultHistoryConfig } from './schema'
 import type { ChannelKey, InboundMessage, OutboundCallback } from './types'
 
@@ -392,6 +399,8 @@ class ParentSession {
   prompts: string[] = []
   providerRequests = 0
   leaf: SessionEntry | undefined
+  private leaves = 0
+  private listeners: Array<(event: unknown) => void> = []
   onPrompt: (text: string) => Promise<void> = async () => {
     this.finish('NO_REPLY')
   }
@@ -427,15 +436,27 @@ class ParentSession {
   refreshContext = () => {}
   dispose = () => {}
   setThinkingLevel = () => {}
-  subscribe = () => () => {}
+  subscribe = (listener: (event: unknown) => void) => {
+    this.listeners.push(listener)
+    return () => {
+      this.listeners = this.listeners.filter((candidate) => candidate !== listener)
+    }
+  }
+  // Each assistant message is a new transcript entry, as in a real session.
   finish(text: string, stopReason: AssistantMessage['stopReason'] = 'stop') {
     this.leaf = {
       type: 'message',
-      id: 'leaf',
+      id: `leaf-${++this.leaves}`,
       parentId: null,
       timestamp: new Date(1000).toISOString(),
       message: assistantMessage(text, stopReason),
     }
+  }
+  // The provider rejects the call: the SDK emits the failed assistant message and ends the turn on it.
+  failProvider(errorMessage: string) {
+    const message = { ...assistantMessage('', 'error'), errorMessage }
+    for (const listener of this.listeners) listener({ type: 'message_end', message })
+    this.finish('', 'error')
   }
 }
 
@@ -462,9 +483,41 @@ async function debtFixture(
   const key = options.key ?? THREAD_KEY
   const dir = await mkdtemp(join(tmpdir(), 'typeclaw-router-debt-'))
   const store = new BackgroundObligationStore(dir)
-  const journal = new InboundJournal(dir, { backgroundObligations: store, epoch: store.epoch })
+  const durability: { failType?: string } = {}
+  const journal = new InboundJournal(dir, {
+    backgroundObligations: store,
+    epoch: store.epoch,
+    onDurability: (phase, record) => {
+      if (
+        durability.failType &&
+        phase === 'append-written' &&
+        record &&
+        typeof record === 'object' &&
+        'type' in record &&
+        record.type === durability.failType
+      )
+        throw new Error('controlled prepared source durability failure')
+    },
+  })
   await journal.initialize()
-  const outbox = new RecoveryOutbox(dir, { epoch: store.epoch })
+  const noticeTransitions = new Map<string, PromiseWithResolvers<void>>()
+  const noticeTransition = (id: string, phase: 'suppressed' | 'retired') => {
+    const key = `${id}:${phase}`
+    let signal = noticeTransitions.get(key)
+    if (!signal) {
+      signal = Promise.withResolvers<void>()
+      noticeTransitions.set(key, signal)
+    }
+    return signal
+  }
+  const outbox = new RecoveryOutbox(dir, {
+    epoch: store.epoch,
+    onDurability: (phase, record) => {
+      if (phase === 'retired') noticeTransition(record.deliveryId, 'retired').resolve()
+      if (phase === 'directory-synced' && record.state === 'suppressed')
+        noticeTransition(record.deliveryId, 'suppressed').resolve()
+    },
+  })
   const sessions: ParentSession[] = []
   // `existingSessionId` per factory call: undefined is a cold start, an id is a rehydrated successor.
   const creations: Array<string | undefined> = []
@@ -476,7 +529,10 @@ async function debtFixture(
     account: string
     messages: number
     closed: boolean
+    // Holds every outbound whose text starts with `text` until released.
     held?: { text: string; entered: PromiseWithResolvers<void>; release: PromiseWithResolvers<void> }
+    // The transport rejects every outbound whose text starts with this prefix.
+    reject?: string
     // Lets a test script a successor's model behavior before the router prompts it.
     onSessionCreated?: (session: ParentSession) => void
     // Rehydrations come back under this session ID instead of the requested one.
@@ -522,11 +578,12 @@ async function debtFixture(
   })
   const outbound: OutboundCallback = async (message) => {
     const held = state.held
-    if (held !== undefined && held.text === message.text) {
+    if (held !== undefined && message.text?.startsWith(held.text)) {
       held.entered.resolve()
       await held.release.promise
     }
-    if (message.text === FAILING_TEXT) return { ok: false, error: 'controlled transport failure' }
+    if (message.text === FAILING_TEXT || (state.reject !== undefined && message.text?.startsWith(state.reject)))
+      return { ok: false, error: 'controlled transport failure' }
     sent.push(message.text ?? `[attachments: ${(message.attachments ?? []).map((file) => file.path).join(', ')}]`)
     return { ok: true }
   }
@@ -553,9 +610,12 @@ async function debtFixture(
     ts: state.now,
     ...over,
   })
+  // Message ID → admitted input ID: a settled row keeps only a minimal tombstone.
+  const admitted = new Map<string, string>()
   const route = async (text: string): Promise<string> => {
     const event = inbound(text)
-    await router.route(event)
+    const receipt = await router.route(event)
+    if (receipt.kind === 'accepted') admitted.set(event.externalMessageId, receipt.inputId)
     return event.externalMessageId
   }
   const flush = () => router.__testing!.flushDebounce(key)
@@ -582,7 +642,9 @@ async function debtFixture(
     key,
     store,
     journal,
+    durability,
     outbox,
+    noticeTransition,
     router,
     sessions,
     creations,
@@ -593,7 +655,10 @@ async function debtFixture(
     inbound,
     route,
     flush,
-    inputRow: (messageId: string) => journal.list().find((row) => row.reference?.messageId === messageId),
+    inputRow: (messageId: string) => {
+      const inputId = admitted.get(messageId)
+      return inputId === undefined ? undefined : journal.get(inputId)
+    },
     childRow: async (taskId: string) => (await store.list()).find((row) => row.taskId === taskId),
     // Real channel_send tool from the `parent-1` session, followed by the router's after-tool hook as agent-core runs it.
     channelSend: async (session: ParentSession, params: SendParams, origin: ChannelSendOrigin | null = { ...key }) => {
@@ -630,6 +695,18 @@ async function debtFixture(
         { content: [], details: { ok: true, backgroundCoverage, inboundCoverage } },
       )
       session.finish(text, 'aborted')
+    },
+    // channel_reply({ more_work_this_turn: true }): a progress reply that keeps the turn alive.
+    continueReply: async (session: ParentSession, text: string, sessionId = 'parent-1') => {
+      const backgroundCoverage = await router.captureBackgroundResultCoverage!(sessionId)
+      const inboundCoverage = await router.captureInboundResultCoverage!(sessionId)
+      expect((await router.send({ ...key, text })).ok).toBe(true)
+      await afterTool(
+        session,
+        'channel_reply',
+        { text, more_work_this_turn: true },
+        { content: [], details: { ok: true, more_work_this_turn: true, backgroundCoverage, inboundCoverage } },
+      )
     },
     accept: (taskId: string, parentSessionId = 'parent-1') =>
       router.acceptBackgroundResponse({
@@ -672,11 +749,14 @@ async function debtFixture(
       state.held = held
       return held
     },
-    reboot: async (): Promise<number> => {
-      await router.stop()
-      await journal.close()
-      state.closed = true
-      const bootStore = new BackgroundObligationStore(dir, { epoch: 'reboot' })
+    // Boot recovery of the directory under `epoch`; the first call stops the live process.
+    reboot: async (epoch = 'reboot'): Promise<number> => {
+      if (!state.closed) {
+        await router.stop()
+        await journal.close()
+        state.closed = true
+      }
+      const bootStore = new BackgroundObligationStore(dir, { epoch })
       const bootJournal = new InboundJournal(dir, { backgroundObligations: bootStore, epoch: bootStore.epoch })
       const bootOutbox = new RecoveryOutbox(dir, { epoch: bootStore.epoch })
       try {
@@ -959,19 +1039,24 @@ for (const carrier of ['another parent', 'an earlier turn'] as const) {
       const prompts: string[] = []
       parent.onPrompt = async (text) => {
         prompts.push(text)
-        parent.finish('NO_REPLY')
+        await f.reply(parent, 'It is noon.')
       }
-      await f.route('Different topic: what time is it?')
+      const different = await f.route('Different topic: what time is it?')
       if (carrier === 'an earlier turn') await f.complete('earlier-task')
       else await f.complete('stranger-task', 'parent-9')
       await f.flush()
 
       expect(prompts).toHaveLength(1)
       expect(prompts[0]).toContain('Different topic')
+      // The new turn answers only what it owns; the abandoned request ended with its own live turn.
+      expect(f.inputRow(different)).toMatchObject({ phase: 'closed', outcome: { kind: 'delivered' } })
+      expect(f.inputRow(request)?.phase).toBe('notice-owned')
       const notices = await f.outbox.list()
       expect(notices).toHaveLength(1)
       expect(notices[0]!.covers.map((cover) => cover.id)).toEqual([f.inputRow(request)!.inputId])
       expect(notices[0]!.principal).toMatchObject({ kind: 'channel', lastInboundAuthorId: 'human' })
+      expect(recoveryNoticeCause(notices[0]!)).toBe('live-turn-ended')
+      expect(notices[0]!.text).toBe(LIVE_TURN_ENDED_NOTICE_TEXT)
     } finally {
       await f.cleanup()
     }
@@ -1200,11 +1285,16 @@ for (const next of ['an unrelated wake', 'a new request'] as const) {
     try {
       const parent = f.sessions[0]!
       await f.accept('child-a')
-      // The wake consumes the result and ends silent without starting more work.
+      // The wake consumes the result and ends silent without starting more work: silence cannot
+      // answer a child result, so its turn transfers it as ended in this process, not as a restart.
       await f.complete('child-a')
       await f.flush()
       const abandoned = await f.childRow('child-a')
-      expect(abandoned?.phase).toBe('turn-owned')
+      expect(abandoned?.phase).toBe('notice-owned')
+      const notices = await f.outbox.list()
+      expect(notices).toHaveLength(1)
+      expect(notices[0]!.covers.map((cover) => cover.id)).toEqual([abandoned!.obligationId])
+      expect(recoveryNoticeCause(notices[0]!)).toBe('live-turn-ended')
 
       parent.onPrompt = async () => f.reply(parent, 'Here is the answer.')
       // A completion with no durable obligation is a generic wake.
@@ -1213,16 +1303,8 @@ for (const next of ['an unrelated wake', 'a new request'] as const) {
       await f.flush()
 
       expect(f.sent).toEqual(['Here is the answer.'])
-      if (next === 'an unrelated wake') {
-        expect(await f.childRow('child-a')).toEqual(abandoned)
-        expect(await f.outbox.list()).toEqual([])
-      } else {
-        // A human batch with no deferred work pending transfers it, as for abandoned requests.
-        expect((await f.childRow('child-a'))?.phase).toBe('notice-owned')
-        const notices = await f.outbox.list()
-        expect(notices).toHaveLength(1)
-        expect(notices[0]!.covers.map((cover) => cover.id)).toEqual([abandoned!.obligationId])
-      }
+      expect(await f.childRow('child-a')).toEqual(abandoned)
+      expect(await f.outbox.list()).toEqual(notices)
     } finally {
       await f.cleanup()
     }
@@ -1560,3 +1642,750 @@ test('/stop leaves a reload handoff that holds only observed context alone', asy
     await f.cleanup()
   }
 })
+
+// Live-turn outcomes in a process that never restarts: a promise, a provider failure or a
+// lifecycle end decides owed coverage at the turn that owned it, never through a restart notice
+// and never through a later unrelated reply.
+
+for (const progress of [
+  { name: 'an English status send', text: "I'll check and get back to you.", continueReply: false },
+  { name: 'a Korean status send', text: '확인해볼게요, 잠시만요.', continueReply: false },
+  { name: 'an English more_work_this_turn reply', text: 'Let me check that.', continueReply: true },
+  { name: 'a Korean more_work_this_turn reply', text: '확인해볼게요.', continueReply: true },
+] as const) {
+  test(`${progress.name} then NO_REPLY ends the request with a live-turn-ended notice, never a restart`, async () => {
+    const f = await debtFixture()
+    try {
+      const parent = f.sessions[0]!
+      parent.onPrompt = async () => {
+        if (progress.continueReply) await f.continueReply(parent, progress.text)
+        else await f.channelSend(parent, { text: progress.text })
+        parent.finish('NO_REPLY')
+      }
+      const request = await f.route('Why did the deploy fail?')
+      await f.flush()
+
+      // The progress message promised an answer, so the silence after it settles nothing. The
+      // turn's own end transfers the request durably, before any later message arrives.
+      expect(f.sent).toEqual([progress.text])
+      const row = f.inputRow(request)!
+      expect(row.phase).toBe('notice-owned')
+      const notices = await f.outbox.list()
+      expect(notices).toHaveLength(1)
+      expect(notices[0]!.covers.map((cover) => cover.id)).toEqual([row.inputId])
+      expect(recoveryNoticeCause(notices[0]!)).toBe('live-turn-ended')
+      expect(notices[0]!.text).toBe(LIVE_TURN_ENDED_NOTICE_TEXT)
+
+      // An unrelated "Thanks!" is answered on its own; its reply never answers the earlier request.
+      parent.onPrompt = async () => f.reply(parent, 'You are welcome.')
+      const thanks = await f.route('Thanks!')
+      await f.flush()
+      expect(f.inputRow(thanks)).toMatchObject({ phase: 'closed', outcome: { kind: 'delivered' } })
+      expect(f.inputRow(request)?.phase).toBe('notice-owned')
+      expect(await f.outbox.list()).toEqual(notices)
+
+      // Boot recovery re-imports the frozen live notice and adds no restart notice for this epoch.
+      expect(await f.reboot()).toBe(1)
+      const recovered = await new RecoveryOutbox(f.dir).list()
+      expect(recovered.map((notice) => notice.deliveryId)).toEqual([notices[0]!.deliveryId])
+      expect(recovered.some((notice) => notice.text === RECOVERY_NOTICE_TEXT)).toBe(false)
+    } finally {
+      await f.cleanup()
+    }
+  })
+}
+
+for (const delivery of ['lands', 'is rejected'] as const) {
+  test(`a provider-error notice that ${delivery} never settles a consumed child result`, async () => {
+    const f = await debtFixture()
+    try {
+      const parent = f.sessions[0]!
+      if (delivery === 'is rejected') f.state.reject = '⚠️'
+      parent.onPrompt = async () => {
+        await f.accept('lookup')
+        await f.complete('lookup')
+        await f.router.attachBackgroundResultCoverage({ parentSessionId: 'parent-1', taskId: 'lookup' })
+        parent.failProvider('401 Unauthorized: invalid api key')
+      }
+      const request = await f.route('Summarize the lookup.')
+      await f.flush()
+
+      const child = (await f.childRow('lookup'))!
+      const notices = await f.outbox.list()
+      expect(notices.every((notice) => recoveryNoticeCause(notice) === 'live-turn-ended')).toBe(true)
+      expect(child.phase).toBe('notice-owned')
+      const covered = notices.flatMap((notice) => notice.covers.map((cover) => cover.id)).sort()
+      if (delivery === 'lands') {
+        expect(f.sent.filter((text) => text.startsWith('⚠️'))).toHaveLength(1)
+        // The landed notice answers the request it captured; the consumed result stays owed.
+        expect(f.inputRow(request)).toMatchObject({ phase: 'closed', outcome: { kind: 'delivered' } })
+        expect(covered).toEqual([child.obligationId])
+      } else {
+        // A rejected notice answered nothing: request and result both stay owed, durably.
+        expect(f.sent).toEqual([])
+        expect(f.inputRow(request)?.phase).toBe('notice-owned')
+        expect(covered).toEqual([f.inputRow(request)!.inputId, child.obligationId].sort())
+      }
+
+      f.state.reject = undefined
+      parent.onPrompt = async () => f.reply(parent, 'You are welcome.')
+      const thanks = await f.route('Thanks!')
+      await f.flush()
+      expect(f.inputRow(thanks)).toMatchObject({ phase: 'closed', outcome: { kind: 'delivered' } })
+      expect(await f.outbox.list()).toEqual(notices)
+      expect(await f.reboot()).toBe(notices.length)
+    } finally {
+      await f.cleanup()
+    }
+  })
+}
+
+test('a provider-error notice settles only the generation it captured before sending', async () => {
+  const f = await debtFixture()
+  try {
+    const parent = f.sessions[0]!
+    const held = f.hold('⚠️')
+    parent.onPrompt = async () => parent.failProvider('401 Unauthorized: invalid api key')
+    const request = await f.route('Summarize the incident.')
+    const draining = f.flush()
+    await held.entered.promise
+    // /stop decides the request while the notice is still in flight.
+    await f.route('/stop')
+    held.release.resolve()
+    await draining
+
+    expect(f.sent.filter((text) => text.startsWith('⚠️'))).toHaveLength(1)
+    expect(f.inputRow(request)).toMatchObject({ phase: 'closed', outcome: { kind: 'intentionally-suppressed' } })
+    expect(await f.outbox.list()).toEqual([])
+  } finally {
+    await f.cleanup()
+  }
+})
+
+test('/stop after a promise-only turn suppresses the live-turn-ended notice before it is sent', async () => {
+  const f = await debtFixture()
+  let dispatcher: RecoveryDispatcher | undefined
+  try {
+    const parent = f.sessions[0]!
+    parent.onPrompt = async () => {
+      await f.channelSend(parent, { text: '확인해볼게요, 잠시만요.' })
+      parent.finish('NO_REPLY')
+    }
+    const request = await f.route('배포가 왜 실패했는지 확인해줘.')
+    await f.flush()
+    const [notice] = await f.outbox.list()
+    expect(recoveryNoticeCause(notice!)).toBe('live-turn-ended')
+
+    // The dispatcher's stop authority, without waking it: the notice is still unsent.
+    dispatcher = new RecoveryDispatcher(f.outbox, f.router, {
+      backgroundObligations: f.store,
+      inboundJournal: f.journal,
+    })
+    await f.route('/stop')
+
+    expect(f.inputRow(request)).toMatchObject({ phase: 'closed', outcome: { kind: 'intentionally-suppressed' } })
+    const pending = await f.outbox.get(notice!.deliveryId)
+    const retired = pending === undefined ? await f.outbox.retired(notice!.deliveryId) : undefined
+    expect(pending?.state ?? retired?.dispatch.state).toBe('suppressed')
+    expect(f.sent).toEqual(['확인해볼게요, 잠시만요.', 'Stopped the current turn.'])
+  } finally {
+    await dispatcher?.stop()
+    await f.cleanup()
+  }
+})
+
+// A deferred child that vanished without reporting back leaves two independent debts: the
+// request, which its live turn already ended with a live-turn-ended notice, and the child's own
+// result. That result stays owed and untransferred in the live epoch, so a late completion can
+// still land; only a restart that really ends the child hands it to boot recovery, as its own
+// notice. Repeated boots re-import both unchanged, and no row is ever covered twice.
+async function expectChildRecoveredApart(
+  f: {
+    dir: string
+    childRow: (taskId: string) => Promise<BackgroundObligation | undefined>
+    reboot: (epoch?: string) => Promise<number>
+  },
+  live: RecoveryRecord,
+  inputId: string,
+  taskId: string,
+) {
+  const child = (await f.childRow(taskId))!
+  expect(child.phase).toBe('accepted')
+  expect(child.transfer).toBeUndefined()
+  const coverage = (notice: RecoveryRecord) => ({
+    deliveryId: notice.deliveryId,
+    cause: recoveryNoticeCause(notice),
+    text: notice.text,
+    covers: notice.covers.map((cover) => ({ store: cover.store, id: cover.id, generation: cover.generation })),
+  })
+  const boots: unknown[] = []
+  for (const epoch of ['first-boot', 'second-boot']) {
+    await f.reboot(epoch)
+    const recovered = await new RecoveryOutbox(f.dir).list()
+    // The request keeps exactly the live notice that ended it.
+    expect(recovered.filter((notice) => notice.covers.some((cover) => cover.id === inputId)).map(coverage)).toEqual([
+      coverage(live),
+    ])
+    // The child is recovered alone, as ended by the restart.
+    const childNotices = recovered.filter((notice) => notice.covers.some((cover) => cover.id === child.obligationId))
+    expect(childNotices.map((notice) => notice.covers.map((cover) => [cover.store, cover.id]))).toEqual([
+      [['background', child.obligationId]],
+    ])
+    expect(recoveryNoticeCause(childNotices[0]!)).toBe('restart')
+    expect(childNotices[0]!.text).toBe(RECOVERY_NOTICE_TEXT)
+    // Nothing else is owed.
+    expect(recovered.map((notice) => notice.deliveryId).sort()).toEqual(
+      [live.deliveryId, childNotices[0]!.deliveryId].sort(),
+    )
+    boots.push(recovered.map(coverage).sort((a, b) => a.deliveryId.localeCompare(b.deliveryId)))
+  }
+  expect(boots[1]).toEqual(boots[0])
+}
+
+test('idle eviction transfers debt its deferred child abandoned and keeps the session when that fails', async () => {
+  const f = await debtFixture()
+  try {
+    const parent = f.sessions[0]!
+    f.deferToChild(parent, 'research')
+    const request = await f.route('Please research the incident.')
+    await f.flush()
+    f.state.now += SESSION_IDLE_MS + 1
+
+    // A running deferred child pins the session and keeps its debt live.
+    await f.router.__testing!.runIdleGc()
+    expect(f.router.liveCount()).toBe(1)
+    expect(f.inputRow(request)?.phase).toBe('turn-owned')
+
+    // The child disappears without reporting back. A failed transfer keeps the session and its ownership.
+    f.running.delete('parent-1')
+    const prepareNotice = f.journal.prepareNotice.bind(f.journal)
+    f.journal.prepareNotice = (async () => {
+      throw new Error('controlled transfer failure')
+    }) as typeof f.journal.prepareNotice
+    await f.router.__testing!.runIdleGc()
+    expect(f.router.liveCount()).toBe(1)
+    expect(f.inputRow(request)?.phase).toBe('turn-owned')
+    expect(await f.outbox.list()).toEqual([])
+
+    f.journal.prepareNotice = prepareNotice
+    await f.router.__testing!.runIdleGc()
+    expect(f.router.liveCount()).toBe(0)
+    expect(f.inputRow(request)?.phase).toBe('notice-owned')
+    const notices = await f.outbox.list()
+    expect(notices.map((notice) => notice.covers.map((cover) => cover.id))).toEqual([[f.inputRow(request)!.inputId]])
+    expect(recoveryNoticeCause(notices[0]!)).toBe('live-turn-ended')
+    await expectChildRecoveredApart(f, notices[0]!, f.inputRow(request)!.inputId, 'research')
+  } finally {
+    await f.cleanup()
+  }
+})
+
+test('stale rollover hands abandoned debt to its successor, which ends it without a restart notice', async () => {
+  const f = await debtFixture()
+  try {
+    const parent = f.sessions[0]!
+    f.deferToChild(parent, 'research')
+    const request = await f.route('Please research the incident.')
+    await f.flush()
+    f.running.delete('parent-1')
+    f.state.now += SESSION_GRACE_HARD_TTL_MS + 1
+    f.state.onSessionCreated = (successor) => {
+      successor.onPrompt = async () => f.reply(successor, 'It is noon.', 'parent-2')
+    }
+    const next = await f.route('Different question: what time is it?')
+    await f.flush()
+
+    expect(f.sessions).toHaveLength(2)
+    expect(f.sessions[1]!.prompts).toHaveLength(1)
+    expect(f.inputRow(next)).toMatchObject({ phase: 'closed', outcome: { kind: 'delivered' } })
+    expect(f.inputRow(request)?.phase).toBe('notice-owned')
+    const notices = await f.outbox.list()
+    expect(notices.map((notice) => notice.covers.map((cover) => cover.id))).toEqual([[f.inputRow(request)!.inputId]])
+    expect(recoveryNoticeCause(notices[0]!)).toBe('live-turn-ended')
+    // The successor's unrelated reply answered only its own request.
+    await expectChildRecoveredApart(f, notices[0]!, f.inputRow(request)!.inputId, 'research')
+  } finally {
+    await f.cleanup()
+  }
+})
+
+// Fail only this fixture's publication boundary; the source stores remain healthy.
+function interruptNoticeImport(outbox: RecoveryOutbox, published: boolean) {
+  const original = outbox.import.bind(outbox)
+  let blocked = true
+  outbox.import = async (record) => {
+    if (!blocked) return original(record)
+    if (published) await original(record)
+    throw new Error('controlled frozen notice import failure')
+  }
+  return () => {
+    blocked = false
+    outbox.import = original
+  }
+}
+
+interface DeferredNoticeFixture {
+  sessions: ParentSession[]
+  deferToChild: (session: ParentSession, taskId: string) => void
+  route: (text: string) => Promise<string>
+  flush: () => Promise<void>
+  consumeThenDefer: (request?: string) => Promise<string | undefined>
+  running: Map<string, number>
+  state: { now: number }
+  inputRow: (messageId: string) => { inputId: string } | undefined
+  childRow: (taskId: string) => Promise<BackgroundObligation | undefined>
+  journal: InboundJournal
+  store: BackgroundObligationStore
+}
+
+async function deferredNoticeDebt(f: DeferredNoticeFixture, shape: 'inbound' | 'background' | 'mixed') {
+  let request: string | undefined
+  if (shape === 'inbound') {
+    f.deferToChild(f.sessions[0]!, 'child-b')
+    request = await f.route('Keep this original request separate.')
+    await f.flush()
+  } else {
+    request = await f.consumeThenDefer(shape === 'mixed' ? 'Keep this original request separate.' : undefined)
+  }
+  f.running.delete('parent-1')
+  f.state.now += SESSION_IDLE_MS + 1
+  const inputId = request ? f.inputRow(request)!.inputId : undefined
+  const backgroundId = shape === 'inbound' ? undefined : (await f.childRow('child-a'))!.obligationId
+  return {
+    inputId,
+    backgroundId,
+    frozen: async () => {
+      const row = inputId ? f.journal.get(inputId) : await f.store.get(backgroundId!)
+      if (!row || !('transfer' in row) || !row.transfer) throw new Error('Expected frozen source debt')
+      return structuredClone(row.transfer)
+    },
+    expectPhase: async (phase: 'turn-owned' | 'notice-prepared' | 'notice-owned' | 'closed') => {
+      if (inputId) expect(f.journal.get(inputId)?.phase).toBe(phase)
+      if (backgroundId) expect((await f.store.get(backgroundId))?.phase).toBe(phase)
+    },
+  }
+}
+
+for (const published of [false, true]) {
+  for (const shape of ['inbound', 'background', 'mixed'] as const) {
+    test(`prepared transfer retry preserves ${shape} debt ${published ? 'after' : 'before'} publication and dispatches without reboot`, async () => {
+      const f = await debtFixture()
+      let restore = () => {}
+      let dispatcher: RecoveryDispatcher | undefined
+      try {
+        const debt = await deferredNoticeDebt(f, shape)
+        const prompts = f.sessions.map((session) => session.prompts.slice())
+        restore = interruptNoticeImport(f.outbox, published)
+        await f.router.__testing!.runIdleGc()
+        expect(f.router.liveCount()).toBe(1)
+        await debt.expectPhase('notice-prepared')
+        const frozen = await debt.frozen()
+        expect(frozen.text).toBe(LIVE_TURN_ENDED_NOTICE_TEXT)
+        expect(await f.outbox.list()).toEqual(published ? [frozen] : [])
+        if (published) {
+          await expect(
+            shape === 'background' ? f.store.validateNotice(frozen) : f.journal.validateNotice(frozen),
+          ).rejects.toThrow()
+        }
+        if (debt.backgroundId) {
+          const row = (await f.store.get(debt.backgroundId))!
+          expect(row.generation).toBe(frozen.covers.find((cover) => cover.id === debt.backgroundId)!.generation)
+          // Standalone preparation retains its stale claim; mixed preparation clears it.
+          if (shape === 'background') expect(row.claim!.generation).toBeLessThan(row.generation)
+          else expect(row.claim).toBeUndefined()
+        }
+        await f.router.__testing!.runIdleGc()
+        expect(f.router.liveCount()).toBe(1)
+        await debt.expectPhase('notice-prepared')
+        expect(await debt.frozen()).toEqual(frozen)
+        expect(f.journal.health().available).toBe(true)
+
+        restore()
+        await f.router.__testing!.runIdleGc()
+        expect(f.router.liveCount()).toBe(0)
+        await debt.expectPhase('notice-owned')
+        expect(await f.outbox.list()).toEqual([frozen])
+        expect(await (shape === 'background' ? f.store.validateNotice(frozen) : f.journal.validateNotice(frozen))).toBe(
+          'open',
+        )
+        const errors: unknown[] = []
+        dispatcher = new RecoveryDispatcher(f.outbox, f.router, {
+          backgroundObligations: f.store,
+          inboundJournal: f.journal,
+          onError: (error) => errors.push(error),
+        })
+        await dispatcher.wake()
+        await f.noticeTransition(frozen.deliveryId, 'retired').promise
+        await dispatcher.stop()
+        await debt.expectPhase('closed')
+        expect(f.sent).toEqual([frozen.text])
+        expect(errors).toEqual([])
+        expect(await f.outbox.list()).toEqual([])
+        expect(await f.outbox.retired(frozen.deliveryId)).toBeDefined()
+        expect((await f.outbox.import(frozen)).state).toBe('delivered')
+        await f.router.__testing!.runIdleGc()
+        expect(f.sessions.map((session) => session.prompts)).toEqual(prompts)
+        expect(f.sessions.every((session) => session.providerRequests === 0)).toBe(true)
+        for (const epoch of ['prepared-retry-boot-1', 'prepared-retry-boot-2']) {
+          await f.reboot(epoch)
+          const recovered = new RecoveryOutbox(f.dir)
+          expect((await recovered.list()).some((notice) => notice.deliveryId === frozen.deliveryId)).toBe(false)
+          expect((await recovered.import(frozen)).state).toBe('delivered')
+        }
+        expect(f.sent).toEqual([frozen.text])
+      } finally {
+        restore()
+        await dispatcher?.stop()
+        await f.cleanup()
+      }
+    })
+  }
+}
+
+for (const shape of ['background', 'mixed'] as const) {
+  for (const failure of ['false', 'throw', 'terminal'] as const) {
+    test(`prepared transfer retry checks ${shape} ownership ${failure} without losing its retry vehicle`, async () => {
+      const f = await debtFixture()
+      const ownNotice = f.store.ownNotice.bind(f.store)
+      try {
+        const debt = await deferredNoticeDebt(f, shape)
+        f.store.ownNotice = async () => {
+          if (failure === 'throw') throw new Error('controlled ownership write failure')
+          return undefined
+        }
+        await f.router.__testing!.runIdleGc()
+        expect(f.router.liveCount()).toBe(1)
+        await debt.expectPhase('notice-prepared')
+        const frozen = await debt.frozen()
+        await f.router.__testing!.runIdleGc()
+        expect(f.router.liveCount()).toBe(1)
+        expect(await debt.frozen()).toEqual(frozen)
+        if (failure === 'terminal') {
+          await f.outbox.suppress(frozen.deliveryId, 'user_stop', 'terminal-before-source-ack')
+          const terminal = (await f.outbox.list())[0]!
+          expect(await f.outbox.retire(terminal.deliveryId, terminal.generation)).toBe(true)
+        } else f.store.ownNotice = ownNotice
+        await f.router.__testing!.runIdleGc()
+        expect(f.router.liveCount()).toBe(0)
+        await debt.expectPhase(failure === 'terminal' ? 'closed' : 'notice-owned')
+        if (failure !== 'terminal') expect(recoveryPayload(await debt.frozen())).toBe(recoveryPayload(frozen))
+        expect((await f.outbox.import(frozen)).state).toBe(failure === 'terminal' ? 'suppressed' : 'pending')
+        expect(f.sent).toEqual([])
+      } finally {
+        f.store.ownNotice = ownNotice
+        await f.cleanup()
+      }
+    })
+  }
+}
+
+for (const next of ['new request', 'completion wake'] as const) {
+  test(`prepared transfer retry precedes ${next} and leaves queued input intact on failure`, async () => {
+    const f = await debtFixture()
+    let restore = () => {}
+    try {
+      const debt = await deferredNoticeDebt(f, 'mixed')
+      restore = interruptNoticeImport(f.outbox, true)
+      await f.router.__testing!.runIdleGc()
+      const frozen = await debt.frozen()
+      // Stay within freshness: this case exercises consume, not stale rollover.
+      f.state.now = 1020
+      const parent = f.sessions[0]!
+      const prompts = parent.prompts.length
+      parent.onPrompt = async () => f.reply(parent, 'Only the new work is answered.')
+      let request: string | undefined
+      if (next === 'new request') request = await f.route('A completely different question.')
+      else await f.complete('child-b')
+      await expect(f.flush()).rejects.toThrow('controlled frozen notice import failure')
+      expect(parent.prompts).toHaveLength(prompts)
+      await debt.expectPhase('notice-prepared')
+      if (request) expect(f.inputRow(request)?.phase).toBe('admitted')
+      else expect((await f.childRow('child-b'))?.phase).toBe('result-ready')
+      restore()
+      await f.flush()
+      expect(parent.prompts).toHaveLength(prompts + 1)
+      await debt.expectPhase('notice-owned')
+      expect(await f.outbox.list()).toEqual([frozen])
+      if (request) expect(f.inputRow(request)).toMatchObject({ phase: 'closed', outcome: { kind: 'delivered' } })
+      else expect(await f.childRow('child-b')).toMatchObject({ phase: 'closed', outcome: { kind: 'delivered' } })
+      expect(f.sent).toEqual(['Only the new work is answered.'])
+    } finally {
+      restore()
+      await f.cleanup()
+    }
+  })
+}
+
+for (const boundary of ['account replacement', 'stale rollover', 'reload', 'refused handoff'] as const) {
+  test(`prepared transfer retry survives ${boundary} with the original frozen principal`, async () => {
+    const f = await debtFixture(boundary === 'refused handoff' ? { handoffRetryItemLimit: 0 } : {})
+    let restore = () => {}
+    try {
+      const debt = await deferredNoticeDebt(f, 'mixed')
+      const originalPrompts = f.sessions[0]!.prompts.length
+      let queuedRequest: string | undefined
+      restore = interruptNoticeImport(f.outbox, false)
+      if (boundary === 'refused handoff') f.running.set('parent-1', f.state.now)
+      if (boundary === 'account replacement') f.state.account = 'account-b'
+      if (boundary === 'stale rollover') {
+        await f.router.__testing!.runIdleGc()
+        f.state.now += SESSION_GRACE_HARD_TTL_MS + 1
+        f.state.onSessionCreated = (session) => {
+          session.onPrompt = async () => f.reply(session, 'Fresh answer.', 'parent-2')
+        }
+        await f.route('Fresh question after rollover.')
+        await expect(f.flush()).rejects.toThrow('controlled frozen notice import failure')
+      } else {
+        await expect(f.router.tearDownAllLive()).rejects.toThrow('controlled frozen notice import failure')
+        expect(f.router.liveCount()).toBe(1)
+        if (boundary === 'reload') {
+          f.state.now = 1020
+          queuedRequest = await f.route('New input while reload storage is unavailable.')
+          await expect(f.flush()).rejects.toThrow('controlled frozen notice import failure')
+          expect(f.inputRow(queuedRequest)?.phase).toBe('admitted')
+          expect(f.sessions[0]!.prompts).toHaveLength(originalPrompts)
+          f.state.successorSessionId = 'parent-2'
+          f.state.onSessionCreated = (session) => {
+            session.onPrompt = async () => f.reply(session, 'Reloaded answer.', 'parent-2')
+          }
+        }
+        await expect(f.router.tearDownAllLive()).rejects.toThrow('controlled frozen notice import failure')
+      }
+      await debt.expectPhase('notice-prepared')
+      const frozen = await debt.frozen()
+      expect(frozen).toMatchObject({
+        accountIdentity: 'account-a',
+        sourceParentSessionId: 'parent-1',
+        principal: { kind: 'channel', lastInboundAuthorId: 'human' },
+      })
+      restore()
+      if (boundary === 'stale rollover') await f.flush()
+      else await f.router.tearDownAllLive()
+      if (queuedRequest) {
+        await f.flush()
+        expect(f.inputRow(queuedRequest)).toMatchObject({ phase: 'closed', outcome: { kind: 'delivered' } })
+        expect(f.sessions[0]!.prompts).toHaveLength(originalPrompts)
+        expect(f.sessions.at(-1)!.prompts).toHaveLength(1)
+      }
+      await debt.expectPhase('notice-owned')
+      expect(await f.outbox.list()).toEqual([frozen])
+      if (boundary === 'account replacement') expect(await f.router.validateRecovery(frozen)).toBeDefined()
+      expect(f.logs.some((line) => line.includes('Invalid journal move'))).toBe(false)
+    } finally {
+      restore()
+      await f.cleanup()
+    }
+  })
+}
+
+for (const partition of ['principal', 'account'] as const) {
+  test(`prepared transfer retry keeps ${partition} partitions separate after one partition publishes`, async () => {
+    const f = await debtFixture({ handoffRetryItemLimit: 0 })
+    const original = f.outbox.import.bind(f.outbox)
+    try {
+      const receipts = []
+      for (const author of ['alice', 'bob']) {
+        if (partition === 'account' && author === 'bob') f.state.account = 'account-b'
+        receipts.push(
+          await f.router.route(
+            f.inbound(`Question from ${author}`, { authorId: partition === 'principal' ? author : 'human' }),
+          ),
+        )
+      }
+      let failed: RecoveryRecord | undefined
+      f.outbox.import = async (record) => {
+        if (
+          partition === 'account'
+            ? record.accountIdentity === 'account-b'
+            : record.principal.kind === 'channel' && record.principal.lastInboundAuthorId === 'bob'
+        ) {
+          failed = structuredClone(record)
+          throw new Error('controlled partition failure')
+        }
+        return original(record)
+      }
+      await expect(f.router.tearDownAllLive()).rejects.toThrow('controlled partition failure')
+      expect(f.router.liveCount()).toBe(1)
+      const first = (await f.outbox.list())[0]!
+      expect(first).toMatchObject({
+        accountIdentity: 'account-a',
+        principal: { lastInboundAuthorId: partition === 'principal' ? 'alice' : 'human' },
+      })
+      await expect(f.router.tearDownAllLive()).rejects.toThrow('controlled partition failure')
+      expect(await f.outbox.list()).toEqual([first])
+      expect(failed).toBeDefined()
+      f.outbox.import = original
+      await f.router.tearDownAllLive()
+      const notices = await f.outbox.list()
+      expect(notices.map(recoveryPayload).sort()).toEqual([first, failed!].map(recoveryPayload).sort())
+      const ids = receipts.flatMap((receipt) => (receipt.kind === 'accepted' ? [receipt.inputId] : []))
+      expect(notices.flatMap((notice) => notice.covers.map((cover) => cover.id)).sort()).toEqual(ids.sort())
+      for (const id of ids) expect(f.journal.get(id)?.phase).toBe('notice-owned')
+      expect(f.sessions[0]!.prompts).toHaveLength(1)
+    } finally {
+      f.outbox.import = original
+      await f.cleanup()
+    }
+  })
+}
+
+test('prepared transfer retry retires reboxed retry identities before a successor can move them', async () => {
+  const f = await debtFixture({ handoffRetryItemLimit: 0 })
+  let restore = () => {}
+  try {
+    const parent = f.sessions[0]!
+    parent.onPrompt = async () => {
+      await f.router.tearDownAllLive()
+      parent.finish('', 'length')
+    }
+    restore = interruptNoticeImport(f.outbox, true)
+    const request = await f.route('Answer this request.')
+    await expect(f.flush()).rejects.toThrow('controlled frozen notice import failure')
+    expect(f.router.liveCount()).toBe(1)
+    const row = f.inputRow(request)
+    expect(row?.phase).toBe('notice-prepared')
+    if (!row || row.phase !== 'notice-prepared' || !row.transfer) throw new Error('Expected prepared source transfer')
+    const frozen = structuredClone(row.transfer)
+    const prompts = parent.prompts.length
+    await expect(f.flush()).rejects.toThrow('controlled frozen notice import failure')
+    expect(parent.prompts).toHaveLength(prompts)
+    restore()
+    await f.flush()
+    expect(f.inputRow(request)?.phase).toBe('notice-owned')
+    expect(await f.outbox.list()).toEqual([frozen])
+    expect(parent.prompts).toHaveLength(prompts)
+    expect(f.logs.some((line) => line.includes('Invalid journal move'))).toBe(false)
+    await f.router.tearDownAllLive()
+    f.state.successorSessionId = 'parent-2'
+    f.state.onSessionCreated = (session) => {
+      session.onPrompt = async () => f.reply(session, 'A new answer.', 'parent-2')
+    }
+    const next = await f.route('A new request.')
+    await f.flush()
+    expect(f.inputRow(next)).toMatchObject({ phase: 'closed', outcome: { kind: 'delivered' } })
+    expect(await f.outbox.list()).toEqual([frozen])
+  } finally {
+    restore()
+    await f.cleanup()
+  }
+})
+
+for (const published of [false, true]) {
+  for (const shape of ['inbound', 'background', 'mixed'] as const) {
+    test(`prepared transfer retry cannot resurrect stopped ${shape} debt ${published ? 'after' : 'before'} publication`, async () => {
+      const f = await debtFixture()
+      let restore = () => {}
+      let dispatcher: RecoveryDispatcher | undefined
+      try {
+        const debt = await deferredNoticeDebt(f, shape)
+        restore = interruptNoticeImport(f.outbox, published)
+        await f.router.__testing!.runIdleGc()
+        const frozen = await debt.frozen()
+        // No dispatcher stop handler: withdrawal must not depend on an outbox record.
+        await f.route('/stop')
+        await debt.expectPhase('closed')
+        if (debt.inputId)
+          expect(f.journal.get(debt.inputId)).toMatchObject({ outcome: { kind: 'intentionally-suppressed' } })
+        if (debt.backgroundId)
+          expect(await f.store.get(debt.backgroundId)).toMatchObject({ outcome: { kind: 'intentionally-suppressed' } })
+        expect((await f.childRow('child-b'))?.phase).toBe('accepted')
+        restore()
+        await f.route('/stop')
+        await f.router.__testing!.runIdleGc()
+        dispatcher = new RecoveryDispatcher(f.outbox, f.router, {
+          backgroundObligations: f.store,
+          inboundJournal: f.journal,
+        })
+        await dispatcher.wake()
+        if (published) {
+          await f.noticeTransition(frozen.deliveryId, 'suppressed').promise
+          await dispatcher.stop()
+          dispatcher = new RecoveryDispatcher(f.outbox, f.router, {
+            backgroundObligations: f.store,
+            inboundJournal: f.journal,
+          })
+          await dispatcher.wake()
+          await f.noticeTransition(frozen.deliveryId, 'retired').promise
+        }
+        await dispatcher.stop()
+        expect(f.sent.filter((text) => text === frozen.text)).toEqual([])
+        expect(await f.outbox.list()).toEqual([])
+        for (const epoch of ['stopped-prepared-1', 'stopped-prepared-2']) {
+          await f.reboot(epoch)
+          expect(
+            (await new RecoveryOutbox(f.dir).list()).some((record) =>
+              record.covers.some((cover) => cover.id === debt.inputId || cover.id === debt.backgroundId),
+            ),
+          ).toBe(false)
+        }
+      } finally {
+        restore()
+        await dispatcher?.stop()
+        await f.cleanup()
+      }
+    })
+  }
+}
+
+test('prepared transfer retry retains an expired handoff until frozen source ownership completes', async () => {
+  const f = await debtFixture({ failCreationAttempts: [2], handoffRetryRetentionMs: 50 })
+  let restore = () => {}
+  try {
+    f.deferToChild(f.sessions[0]!, 'child-b')
+    const request = await f.route('Keep the expired request owed.')
+    await f.flush()
+    await f.router.tearDownAllLive()
+    expect(f.router.liveCount()).toBe(0)
+    f.state.now += 100
+    restore = interruptNoticeImport(f.outbox, true)
+    await f.router.__testing!.runIdleGc()
+    const row = f.inputRow(request)
+    expect(row?.phase).toBe('notice-prepared')
+    if (!row || row.phase !== 'notice-prepared' || !row.transfer) throw new Error('Expected prepared source transfer')
+    const frozen = structuredClone(row.transfer)
+    await f.router.__testing!.runIdleGc()
+    expect(f.inputRow(request)?.phase).toBe('notice-prepared')
+    expect(await f.outbox.list()).toEqual([frozen])
+    restore()
+    await f.router.__testing!.runIdleGc()
+    expect(f.inputRow(request)?.phase).toBe('notice-owned')
+    expect(await f.outbox.list()).toEqual([frozen])
+    f.state.successorSessionId = 'parent-2'
+    f.state.onSessionCreated = (session) => {
+      session.onPrompt = async () => f.reply(session, 'Only this new request.', 'parent-2')
+    }
+    const next = await f.route('New question after expiry.')
+    await f.flush()
+    expect(f.inputRow(next)).toMatchObject({ phase: 'closed', outcome: { kind: 'delivered' } })
+    expect(await f.outbox.list()).toEqual([frozen])
+  } finally {
+    restore()
+    await f.cleanup()
+  }
+})
+
+for (const decision of ['notice-owned', 'outcome-decided'] as const) {
+  test(`prepared transfer retry fails closed when durable ${decision} fails`, async () => {
+    const f = await debtFixture()
+    let restore = () => {}
+    try {
+      await deferredNoticeDebt(f, 'mixed')
+      restore = interruptNoticeImport(f.outbox, true)
+      await f.router.__testing!.runIdleGc()
+      restore()
+      f.durability.failType = decision
+      if (decision === 'notice-owned') await f.router.__testing!.runIdleGc()
+      else await f.route('/stop')
+      expect(f.journal.health().available).toBe(false)
+      expect(() => f.journal.list()).toThrow('frozen')
+      expect(() => f.store.assertAvailable()).toThrow('frozen')
+      expect(f.router.liveCount()).toBe(1)
+      expect(f.logs.some((line) => line.includes('controlled prepared source durability failure'))).toBe(true)
+      expect((await f.outbox.list())[0]!.state).toBe('pending')
+      expect(f.sent.some((text) => text === LIVE_TURN_ENDED_NOTICE_TEXT)).toBe(false)
+    } finally {
+      restore()
+      await f.cleanup()
+    }
+  })
+}

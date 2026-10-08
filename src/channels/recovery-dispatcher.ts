@@ -10,6 +10,11 @@ export class RecoveryDispatcher {
   private readonly lanes = new Map<string, Promise<void>>()
   private timer: NodeJS.Timeout | undefined
   private stopped = false
+  /** Set by the first (boot) wake; imports never dispatch before adapters are ready. */
+  private woken = false
+  private readonly unsubscribe: () => void
+  /** Destinations whose due work was skipped while an earlier pass still held their lane. */
+  private readonly deferred = new Set<string>()
 
   constructor(
     private readonly outbox: RecoveryOutbox,
@@ -23,6 +28,14 @@ export class RecoveryDispatcher {
     } = {},
   ) {
     router.setRecoveryStopHandler((target, parent) => this.suppressParent(target, parent))
+    // A transfer made durable after boot (a live turn that ended unanswered) dispatches now
+    // instead of at the next poll; multiple imports in one tick coalesce into one wake.
+    this.unsubscribe = outbox.subscribe(() => {
+      if (!this.woken || this.stopped) return
+      clearTimeout(this.timer)
+      this.timer = undefined
+      this.schedule(0)
+    })
   }
 
   private async validateCoverageInLane(record: RecoveryRecord): Promise<'open' | 'resolved'> {
@@ -57,15 +70,38 @@ export class RecoveryDispatcher {
     }
   }
 
+  /**
+   * Source acknowledgment, then retirement of the terminal outbox record. Retirement requires the
+   * source to validate the delivery as resolved in its lane, so no open or re-importable coverage
+   * can still point at it; the outbox keeps an immutable fence for any later identical import.
+   */
+  private async finish(record: RecoveryRecord, retire: boolean): Promise<void> {
+    await this.acknowledge(record)
+    if (!retire) return
+    const source = this.options.backgroundObligations
+    const coverage =
+      source && record.covers.some((cover) => cover.store !== 'inventory')
+        ? await source.withTargetLane(record.target, () => this.validateCoverageInLane(record))
+        : await this.validateCoverageInLane(record)
+    if (coverage === 'resolved') await this.outbox.retire(record.deliveryId, record.generation)
+  }
+
   async wake(): Promise<void> {
     if (this.stopped) return
+    this.woken = true
     clearTimeout(this.timer)
     this.timer = undefined
     const now = this.options.now?.() ?? Date.now()
     let next = now + 30_000
+    const started = new Set<string>()
     for (const record of await this.outbox.list()) {
+      const key = channelKeyId(record.target)
       if (record.state === 'delivered' || record.state === 'suppressed') {
-        await this.acknowledge(record).catch((error) => this.options.onError?.(error))
+        // A lane from an earlier pass may still hold this record's in-flight send (a /stop raced
+        // it), so it is retired on a later pass. A lane started by this pass skips terminal records.
+        await this.finish(record, !this.lanes.has(key) || started.has(key)).catch((error) =>
+          this.options.onError?.(error),
+        )
         continue
       }
       const due = record.nextAttemptAt ?? 0
@@ -73,13 +109,21 @@ export class RecoveryDispatcher {
         next = Math.min(next, due)
         continue
       }
-      const key = channelKeyId(record.target)
-      if (this.lanes.has(key)) continue
+      if (this.lanes.has(key)) {
+        // That lane listed the outbox before this record was due or existed; run again after it.
+        if (!started.has(key)) this.deferred.add(key)
+        continue
+      }
+      started.add(key)
       const lane = this.dispatchTarget(key)
         .catch((error) => this.options.onError?.(error))
         .finally(() => {
           this.lanes.delete(key)
-          this.schedule(30_000)
+          if (this.deferred.delete(key)) {
+            clearTimeout(this.timer)
+            this.timer = undefined
+            this.schedule(0)
+          } else this.schedule(30_000)
         })
       this.lanes.set(key, lane)
     }
@@ -171,7 +215,7 @@ export class RecoveryDispatcher {
             ...(found.messageIds === undefined ? {} : { messageIds: [...found.messageIds] }),
           })
           const delivered = await this.outbox.get(record.deliveryId)
-          if (delivered) await this.acknowledge(delivered).catch((error) => this.options.onError?.(error))
+          if (delivered) await this.finish(delivered, true).catch((error) => this.options.onError?.(error))
           continue
         }
       }
@@ -236,7 +280,7 @@ export class RecoveryDispatcher {
             ...(result.messageIds === undefined ? {} : { messageIds: [...result.messageIds] }),
           })
           const delivered = await this.outbox.get(record.deliveryId)
-          if (delivered) await this.acknowledge(delivered).catch((error) => this.options.onError?.(error))
+          if (delivered) await this.finish(delivered, true).catch((error) => this.options.onError?.(error))
         } else {
           if (record.covers.some((cover) => cover.store !== 'inventory')) {
             this.options.inboundJournal?.assertAvailable()
@@ -309,6 +353,7 @@ export class RecoveryDispatcher {
 
   async stop(): Promise<void> {
     this.stopped = true
+    this.unsubscribe()
     clearTimeout(this.timer)
     this.timer = undefined
     await Promise.all(this.lanes.values())

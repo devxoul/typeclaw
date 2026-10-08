@@ -4,6 +4,8 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { BackgroundObligationStore } from './background-obligations'
+import { LIVE_TURN_ENDED_NOTICE_TEXT, RECOVERY_NOTICE_TEXT } from './continuity-types'
+import { createRecoveryNotice } from './recovery-notice'
 import { RecoveryOutbox } from './recovery-outbox'
 const target = { adapter: 'discord-bot' as const, workspace: 'w', chat: 'c', thread: 't' }
 const acceptance = { taskId: 'task', parentSessionId: 'parent', target, accountIdentity: 'actor' }
@@ -181,3 +183,86 @@ for (const malformed of ['zero-generation', 'future-generation', 'duplicate-tran
     }
   })
 }
+
+test('parent/task lookups are indexed, keep closed tombstones authoritative, and never resurrect', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'obligation-index-'))
+  try {
+    const store = new BackgroundObligationStore(dir, { epoch: 'one' })
+    const accepted = await store.accept(acceptance)
+    const other = { ...target, chat: 'other-room' }
+    const sibling = await store.accept({ ...acceptance, parentSessionId: 'sibling', target: other })
+    expect((await store.lookup('parent', 'task'))?.obligationId).toBe(accepted.obligationId)
+    expect((await store.lookup('sibling', 'task'))?.obligationId).toBe(sibling.obligationId)
+    expect(await store.lookup('parent', 'missing')).toBeUndefined()
+    expect(await store.lookup('stranger', 'task')).toBeUndefined()
+    // A successor on the same destination resolves the predecessor's task; another destination cannot.
+    expect((await store.lookupTask('task', target))?.obligationId).toBe(accepted.obligationId)
+    expect((await store.lookupTask('task', other))?.obligationId).toBe(sibling.obligationId)
+    expect(await store.lookupTask('task', { ...target, thread: 'elsewhere' })).toBeUndefined()
+    // Rows written by another instance in this process stay visible.
+    const late = await new BackgroundObligationStore(dir, { epoch: 'one' }).accept({ ...acceptance, taskId: 'late' })
+    expect((await store.lookup('parent', 'late'))?.obligationId).toBe(late.obligationId)
+    const after = await store.accept({ ...acceptance, taskId: 'after-index' })
+    expect((await store.lookup('parent', 'after-index'))?.obligationId).toBe(after.obligationId)
+    // Lookups read exact candidates, not the directory: an unreadable unrelated row cannot fail them.
+    await writeFile(join(dir, 'channels/background-obligations', `${'f'.repeat(64)}.json`), '{corrupt')
+    await expect(store.list()).rejects.toThrow()
+    expect((await store.lookup('parent', 'task'))?.obligationId).toBe(accepted.obligationId)
+    // A closed row stays the task's authority: late completion and re-acceptance cannot reopen it.
+    const ready = (await store.resultReady({ parentSessionId: 'parent', taskId: 'task' }))!
+    await store.settle([ready], { kind: 'delivered', decisionId: 'answered' })
+    expect(await store.lookup('parent', 'task')).toMatchObject({ phase: 'closed' })
+    expect(await store.resultReady({ parentSessionId: 'parent', taskId: 'task' })).toBeUndefined()
+    expect((await store.accept(acceptance)).phase).toBe('closed')
+    // The acceptance identity fence still rejects another author for the same task.
+    await expect(store.accept({ ...acceptance, triggeringAuthorId: 'intruder' })).rejects.toThrow(
+      'Conflicting background acceptance',
+    )
+    expect(await store.lookup('parent', 'task')).toMatchObject({
+      phase: 'closed',
+      outcome: { kind: 'delivered', decisionId: 'answered' },
+    })
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('notice preparation freezes its cause: restart stays the default v1 transfer, live-turn-ended is distinct', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'obligation-cause-'))
+  try {
+    const store = new BackgroundObligationStore(dir, { epoch: 'one' })
+    const restartRow = await store.accept(acceptance)
+    const liveRow = await store.accept({ ...acceptance, taskId: 'live' })
+    const restart = (await store.prepareNotice(restartRow.obligationId, restartRow.generation))!.transfer!
+    const live = (await store.prepareNotice(liveRow.obligationId, liveRow.generation, 'live-turn-ended'))!.transfer!
+    expect(restart).toMatchObject({ schemaVersion: 1, text: RECOVERY_NOTICE_TEXT })
+    expect('cause' in restart).toBe(false)
+    expect(restart).toEqual(
+      createRecoveryNotice({
+        target,
+        accountIdentity: 'actor',
+        principal: restartRow.principal,
+        covers: [{ store: 'background', id: restartRow.obligationId, generation: 2, parentSessionId: 'parent' }],
+        recoveryGeneration: `${restartRow.obligationId}:2`,
+        transferId: restart.transferId,
+        sourceParentSessionId: 'parent',
+        createdAt: restart.createdAt,
+      }),
+    )
+    expect(live).toMatchObject({ schemaVersion: 2, cause: 'live-turn-ended', text: LIVE_TURN_ENDED_NOTICE_TEXT })
+    // Frozen at preparation: a later request with another cause returns the original transfer.
+    expect((await store.prepareNotice(liveRow.obligationId, liveRow.generation))!.transfer).toEqual(live)
+    expect(
+      (await store.prepareNotice(restartRow.obligationId, restartRow.generation, 'live-turn-ended'))!.transfer,
+    ).toEqual(restart)
+    // Boot recovery re-imports each frozen transfer unchanged.
+    const outbox = new RecoveryOutbox(dir, { epoch: 'reboot' })
+    await new BackgroundObligationStore(dir, { epoch: 'reboot' }).importOldEpoch(outbox)
+    expect((await outbox.list()).map((record) => record.deliveryId).sort()).toEqual(
+      [restart.deliveryId, live.deliveryId].sort(),
+    )
+    expect(await outbox.get(live.deliveryId)).toEqual(live)
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})

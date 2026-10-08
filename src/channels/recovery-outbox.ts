@@ -1,8 +1,10 @@
 import { randomUUID } from 'node:crypto'
 import { link, mkdir, open, readFile, readdir, rename, unlink } from 'node:fs/promises'
-import { dirname, join, resolve } from 'node:path'
+import { basename, dirname, join, resolve } from 'node:path'
 
-import { parseRecoveryRecord, recoveryPayload } from './continuity-types'
+import { z } from 'zod'
+
+import { parseRecoveryRecord, recoveryPayload, recoveryPayloadDigest } from './continuity-types'
 import type { RecoveryFailure, RecoveryLease, RecoveryReceipt, RecoveryRecord } from './continuity-types'
 
 const operations = new Map<string, Promise<void>>()
@@ -13,10 +15,46 @@ export type RecoveryOutboxOptions = {
   onError?: (error: unknown) => void
   /** Fault-injection boundary; production callers leave this unset. */
   onDurability?: (
-    phase: 'temp-synced' | 'replaced' | 'directory-synced',
+    phase: 'temp-synced' | 'replaced' | 'directory-synced' | 'retirement-synced' | 'retired',
     record: RecoveryRecord,
   ) => void | Promise<void>
 }
+/**
+ * Immutable fence left when a terminal record leaves the active outbox. It keeps only the frozen
+ * payload digest and terminal dispatch state, so a later import of the same frozen transfer
+ * resolves to the finished delivery instead of creating a new send, without retaining the payload.
+ */
+export type RecoveryRetirement = {
+  schemaVersion: 1
+  deliveryId: string
+  payloadDigest: string
+  retiredAt: number
+  dispatch: Pick<
+    RecoveryRecord,
+    'generation' | 'attempts' | 'lease' | 'receipt' | 'failure' | 'suppression' | 'boundAccountIdentity'
+  > & { state: 'delivered' | 'suppressed' }
+}
+const retirementSchema = z
+  .object({
+    schemaVersion: z.literal(1),
+    deliveryId: z.string().regex(idPattern),
+    payloadDigest: z.string().regex(idPattern),
+    retiredAt: z.number().finite().nonnegative(),
+    // Nested dispatch fields are validated in full when a fence is joined back to its payload.
+    dispatch: z
+      .object({
+        state: z.enum(['delivered', 'suppressed']),
+        generation: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+        attempts: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+        lease: z.unknown().optional(),
+        receipt: z.unknown().optional(),
+        failure: z.unknown().optional(),
+        suppression: z.unknown().optional(),
+        boundAccountIdentity: z.string().min(1).optional(),
+      })
+      .strict(),
+  })
+  .strict()
 
 async function syncDirectory(path: string): Promise<void> {
   // POSIX process-death durability. Windows lacks directory-sync power-loss guarantees.
@@ -32,12 +70,15 @@ async function syncDirectory(path: string): Promise<void> {
 export class RecoveryOutbox {
   readonly epoch: string
   private readonly directory: string
+  private readonly retiredDirectory: string
   private readonly now: () => number
   private readonly options: RecoveryOutboxOptions
   private readonly pending = new Set<Promise<unknown>>()
+  private readonly importListeners = new Set<(record: RecoveryRecord) => void>()
 
   constructor(agentDir: string, options: RecoveryOutboxOptions = {}) {
     this.directory = resolve(agentDir, 'channels', 'recovery-outbox')
+    this.retiredDirectory = join(this.directory, 'retired')
     this.epoch = options.epoch ?? randomUUID()
     this.now = options.now ?? Date.now
     this.options = options
@@ -59,6 +100,19 @@ export class RecoveryOutbox {
     const record = parseRecoveryRecord(JSON.parse(bytes))
     if (record.deliveryId !== id) throw new Error(`Recovery filename identity mismatch: ${id}`)
     return record
+  }
+
+  private async readRetirement(id: string): Promise<RecoveryRetirement | undefined> {
+    let bytes: string
+    try {
+      bytes = await readFile(join(this.retiredDirectory, basename(this.path(id))), 'utf8')
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined
+      throw error
+    }
+    const fence = retirementSchema.parse(JSON.parse(bytes)) as RecoveryRetirement
+    if (fence.deliveryId !== id) throw new Error(`Recovery retirement identity mismatch: ${id}`)
+    return fence
   }
 
   private async publish(record: RecoveryRecord, exclusive = false): Promise<boolean> {
@@ -124,6 +178,25 @@ export class RecoveryOutbox {
         await syncDirectory(this.directory)
         return existing
       }
+      const retired = await this.readRetirement(record.deliveryId)
+      if (retired) {
+        // A finished delivery stays finished: re-importing its frozen transfer never queues another send.
+        if (retired.payloadDigest !== recoveryPayloadDigest(record))
+          throw new Error(`Conflicting recovery import: ${record.deliveryId}`)
+        const {
+          state: _state,
+          generation: _generation,
+          attempts: _attempts,
+          lease: _lease,
+          receipt: _receipt,
+          failure: _failure,
+          suppression: _suppression,
+          nextAttemptAt: _next,
+          boundAccountIdentity: _bound,
+          ...payload
+        } = record
+        return parseRecoveryRecord({ ...payload, ...retired.dispatch })
+      }
       if (
         record.state !== 'pending' ||
         record.generation !== 1 ||
@@ -140,8 +213,100 @@ export class RecoveryOutbox {
         await syncDirectory(this.directory)
         return winner
       }
+      for (const listener of this.importListeners) listener(record)
       return record
     })
+  }
+
+  /** Called after each new record becomes durable; listeners must not throw. */
+  subscribe(listener: (record: RecoveryRecord) => void): () => void {
+    this.importListeners.add(listener)
+    return () => this.importListeners.delete(listener)
+  }
+
+  /**
+   * Moves a terminal record out of the active outbox once its source has acknowledged it and
+   * validates as resolved. The fence is durable before the active file is removed, so every crash
+   * point leaves the record, the fence, or both (the next retirement converges them).
+   */
+  retire(id: string, expectedGeneration: number): Promise<boolean> {
+    return this.serialized(id, async () => {
+      const record = await this.read(id)
+      if (!record) return (await this.readRetirement(id)) !== undefined
+      if (record.generation !== expectedGeneration || (record.state !== 'delivered' && record.state !== 'suppressed'))
+        return false
+      const payloadDigest = recoveryPayloadDigest(record)
+      const prior = await this.readRetirement(id)
+      if (prior && prior.payloadDigest !== payloadDigest) throw new Error(`Conflicting recovery retirement: ${id}`)
+      if (!prior) {
+        const fence: RecoveryRetirement = {
+          schemaVersion: 1,
+          deliveryId: id,
+          payloadDigest,
+          retiredAt: this.now(),
+          dispatch: {
+            state: record.state === 'delivered' ? 'delivered' : 'suppressed',
+            generation: record.generation,
+            attempts: record.attempts,
+            ...(record.lease ? { lease: record.lease } : {}),
+            ...(record.receipt ? { receipt: record.receipt } : {}),
+            ...(record.failure ? { failure: record.failure } : {}),
+            ...(record.suppression ? { suppression: record.suppression } : {}),
+            ...(record.boundAccountIdentity !== undefined ? { boundAccountIdentity: record.boundAccountIdentity } : {}),
+          },
+        }
+        await mkdir(this.retiredDirectory, { recursive: true })
+        await syncDirectory(this.directory)
+        const path = join(this.retiredDirectory, `${id}.json`)
+        const temp = `${path}.${randomUUID()}.tmp`
+        try {
+          const handle = await open(temp, 'wx', 0o600)
+          try {
+            await handle.writeFile(`${JSON.stringify(fence)}\n`, 'utf8')
+            await handle.sync()
+          } finally {
+            await handle.close()
+          }
+          await rename(temp, path)
+          await syncDirectory(this.retiredDirectory)
+        } finally {
+          await unlink(temp).catch((error: NodeJS.ErrnoException) => {
+            if (error.code !== 'ENOENT') throw error
+          })
+        }
+      }
+      await this.options.onDurability?.('retirement-synced', record)
+      await unlink(this.path(id))
+      await syncDirectory(this.directory)
+      await this.options.onDurability?.('retired', record)
+      return true
+    })
+  }
+
+  retired(id: string): Promise<RecoveryRetirement | undefined> {
+    return this.serialized(id, () => this.readRetirement(id))
+  }
+
+  async listRetired(): Promise<RecoveryRetirement[]> {
+    let names: string[]
+    try {
+      names = await readdir(this.retiredDirectory)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []
+      throw error
+    }
+    const fences: RecoveryRetirement[] = []
+    for (const name of names.sort()) {
+      if (!/^[a-f0-9]{64}\.json$/.test(name)) continue
+      try {
+        const fence = await this.retired(name.slice(0, -5))
+        if (fence) fences.push(fence)
+      } catch (error) {
+        if (this.options.onError) this.options.onError(error)
+        else console.error('Recovery retirement fence unavailable:', name, error)
+      }
+    }
+    return fences
   }
 
   get(id: string): Promise<RecoveryRecord | undefined> {
