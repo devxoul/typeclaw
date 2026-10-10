@@ -317,7 +317,7 @@ async function creditVerifiedReview(
 }
 
 async function captureCoverage(router: ChannelRouter, sessionId: string): Promise<ReviewResultCoverage> {
-  const expectedAccountIdentity = await router.captureTurnAccountIdentity?.(sessionId)
+  const expectedAccountIdentity = await router.captureTurnAccountIdentity?.(sessionId, 'github')
   return {
     inboundCoverage: (await router.captureInboundResultCoverage?.(sessionId)) ?? [],
     backgroundCoverage: (await router.captureBackgroundResultCoverage?.(sessionId)) ?? [],

@@ -914,7 +914,7 @@ async function startAgentRuntime(
   // through the GitHub API, not the channel send path. In-process router call — no
   // stream fan-out, since this is the recording session's own bookkeeping.
   setReviewCoverageCapture(async (sessionId) => ({
-    expectedAccountIdentity: await channelManager.router.captureTurnAccountIdentity?.(sessionId),
+    expectedAccountIdentity: await channelManager.router.captureTurnAccountIdentity?.(sessionId, 'github'),
     inboundCoverage: (await channelManager.router.captureInboundResultCoverage?.(sessionId)) ?? [],
     backgroundCoverage: (await channelManager.router.captureBackgroundResultCoverage?.(sessionId)) ?? [],
   }))

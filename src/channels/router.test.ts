@@ -4021,6 +4021,43 @@ describe('ChannelRouter reaction cleanup on deliberate silence', () => {
   })
 })
 
+describe('ChannelRouter captureTurnAccountIdentity', () => {
+  test('binds a GitHub review to the turn account only when the turn came from GitHub', async () => {
+    const dir = await tempDir()
+    const { router, sessions } = makeRouter(dir)
+    const key: ChannelKey = { adapter: 'github', workspace: 'acme/repo', chat: 'pr:7', thread: null }
+    router.registerOutbound('github', async () => ({ ok: true }))
+    let captured: string | undefined
+    await router.route(inbound({ ...key, accountIdentity: 'github:42' }))
+    sessions[0]!.onPrompt = async () => {
+      captured = await router.captureTurnAccountIdentity?.('ses_fake_1', 'github')
+      sessions[0]!.setAssistantText('')
+    }
+    await router.__testing!.flushDebounce(key)
+
+    await waitFor(() => captured !== undefined)
+    expect(captured).toBe('github:42')
+  })
+
+  test('does not bind a GitHub review to a KakaoTalk turn account', async () => {
+    const dir = await tempDir()
+    const { router, sessions } = makeRouter(dir)
+    const key: ChannelKey = { adapter: 'kakaotalk', workspace: '@kakao-group', chat: '1000', thread: null }
+    router.registerOutbound('kakaotalk', async () => ({ ok: true }))
+    const results: Array<string | undefined> = []
+    await router.route(inbound({ ...key, accountIdentity: 'kakaotalk:@kakao-group:9', text: '타이피야 PR 리뷰해줘' }))
+    sessions[0]!.onPrompt = async () => {
+      results.push(await router.captureTurnAccountIdentity?.('ses_fake_1', 'github'))
+      results.push(await router.captureTurnAccountIdentity?.('ses_fake_1', 'kakaotalk'))
+      sessions[0]!.setAssistantText('')
+    }
+    await router.__testing!.flushDebounce(key)
+
+    await waitFor(() => results.length === 2)
+    expect(results).toEqual([undefined, 'kakaotalk:@kakao-group:9'])
+  })
+})
+
 describe('ChannelRouter persistent output acknowledgements', () => {
   test('keeps a GitHub review acknowledgement until a later channel reply', async () => {
     const dir = await tempDir()
