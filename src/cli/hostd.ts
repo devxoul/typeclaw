@@ -8,6 +8,7 @@ import {
   type RestartOptions,
   type RestartResult,
 } from '@/container'
+import { isDaemonReachable } from '@/hostd/client'
 import {
   applyCredentialRotation,
   type CredentialRotationApplyResult,
@@ -19,7 +20,8 @@ import { createKakaoRenewalManager } from '@/hostd/kakao-renewal-manager'
 import { createPortbrokerManager } from '@/hostd/portbroker-manager'
 import type { SupervisorLogEvent, SupervisorRestart } from '@/hostd/supervisor'
 import { createTeamsRenewalManager } from '@/hostd/teams-renewal-manager'
-import { computeSourceVersion, resolveSrcRoot, UNVERSIONED_SENTINEL } from '@/hostd/version'
+import { computeSourceVersion, hostBunVersionWarning, resolveSrcRoot, UNVERSIONED_SENTINEL } from '@/hostd/version'
+import { runWatchdog, spawnProcessWorker, watchForOrphaning } from '@/hostd/watchdog'
 import { createWebexRenewalManager } from '@/hostd/webex-renewal-manager'
 import { validateRestartDeps, type RestartDepsPreflightResult } from '@/init/restart-deps-preflight'
 import { requestReloadWithFallback } from '@/reload'
@@ -30,8 +32,29 @@ export const hostdCommand = defineCommand({
     description: 'internal: host-side typeclaw daemon (do not invoke directly)',
     hidden: true,
   },
-  async run() {
+  args: {
+    worker: { type: 'boolean', description: 'internal: run the daemon itself under the watchdog' },
+    'watchdog-pid': { type: 'string', description: 'internal: pid of the supervising watchdog parent' },
+  },
+  async run({ args }) {
     const cliEntry = process.argv[1] ?? ''
+    if (!args.worker) {
+      await runHostdWatchdog(cliEntry)
+      return
+    }
+    let shutdown: (() => void) | null = null
+    const watchdogPid = Number(args['watchdog-pid'])
+    if (Number.isSafeInteger(watchdogPid) && watchdogPid > 0) {
+      watchForOrphaning({
+        watchdogPid,
+        onOrphaned: () => {
+          writeLogLine(`[hostd] watchdog parent ${watchdogPid} is gone; exiting`)
+          if (shutdown) shutdown()
+          else process.exit(1)
+        },
+      })
+    }
+
     const srcRoot = resolveSrcRoot(cliEntry)
     const version = srcRoot === null ? UNVERSIONED_SENTINEL : await computeSourceVersion({ srcRoot })
 
@@ -97,7 +120,7 @@ export const hostdCommand = defineCommand({
       restart: hostdRestart,
     })
 
-    const shutdown = (): void => {
+    shutdown = (): void => {
       void daemon
         .stop()
         .then(() => portbroker.drain())
@@ -112,6 +135,27 @@ export const hostdCommand = defineCommand({
     await new Promise<void>(() => {})
   },
 })
+
+const WATCHDOG_PROBE_TIMEOUT_MS = 2_000
+
+async function runHostdWatchdog(cliEntry: string): Promise<void> {
+  const log = (message: string): void => writeLogLine(`[hostd-watchdog] ${message}`)
+  const bunWarning = hostBunVersionWarning(process.versions.bun)
+  if (bunWarning) log(`WARNING: ${bunWarning}`)
+
+  const watchdog = runWatchdog({
+    spawnWorker: () =>
+      spawnProcessWorker([process.execPath, cliEntry, '_hostd', '--worker', '--watchdog-pid', String(process.pid)]),
+    probe: () => isDaemonReachable(WATCHDOG_PROBE_TIMEOUT_MS),
+    onLog: log,
+  })
+  const shutdown = (): void => {
+    void watchdog.stop().then(() => process.exit(0))
+  }
+  process.on('SIGTERM', shutdown)
+  process.on('SIGINT', shutdown)
+  process.exit(await watchdog.done)
+}
 
 export type HostdRestartDeps = {
   validateConfig: (cwd: string) => ValidateConfigResult

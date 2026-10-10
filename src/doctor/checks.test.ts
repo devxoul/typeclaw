@@ -11,6 +11,7 @@ import { buildGitignore, GITIGNORE_FILE } from '@/init/gitignore'
 
 import {
   buildStaticChecks,
+  bunRuntime,
   detectWindowsBindMountIssues,
   windowsBindMount,
   windowsSecretPerms,
@@ -34,6 +35,22 @@ function deps(overrides: Partial<WslDriveMountDeps> = {}): WslDriveMountDeps {
     ...overrides,
   }
 }
+
+const ctx: CheckContext = { cwd: tmpdir(), hasAgentFolder: false }
+
+describe('bunRuntime', () => {
+  test('warns with an upgrade fix when the host Bun is older than the tested version', async () => {
+    const result = await bunRuntime('1.3.14').run(ctx)
+    expect(result.status).toBe('warning')
+    expect(result.message).toContain('1.3.14')
+    expect(result.fix?.description).toContain('bun upgrade')
+  })
+
+  test('passes on a current host Bun', async () => {
+    const result = await bunRuntime('1.4.3').run(ctx)
+    expect(result).toEqual({ status: 'ok', message: 'Bun 1.4.3' })
+  })
+})
 
 describe('wslDriveMount', () => {
   test('passes when not running under WSL', async () => {

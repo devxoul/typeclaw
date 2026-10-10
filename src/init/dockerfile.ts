@@ -2,6 +2,7 @@ import { CONTAINER_AGENT_MESSENGER_CONFIG_DIR } from '@/agent-messenger/config-d
 import { ASKPASS_SCRIPT, TYPECLAW_GIT_ASKPASS_PATH } from '@/bundled-plugins/github-cli-auth/git-askpass'
 import { validateDockerfileAppendLine } from '@/config/config'
 import type { DockerfileConfig, DockerfileFeatureToggle } from '@/config/config'
+import { TESTED_BUN_VERSION } from '@/hostd/version'
 import {
   CLAUDE_CREDENTIALS_FILE_NAME,
   CLAUDE_CREDENTIALS_RELATIVE_PATH,
@@ -1601,8 +1602,10 @@ const bunCacheMount = (buildKit: boolean): string => (buildKit ? BUN_CACHE_MOUNT
 // resolving to Bun 1.4.0 the day it shipped — that would put an unvalidated
 // runtime in every container while CI still tested 1.3.14. Bump this in the
 // same change as the `bun-version:` pins in .github/workflows/*.yml so the
-// host-stage checks and the container-stage runtime never disagree.
-export const BUN_BASE_IMAGE = 'oven/bun:1.4.0-slim'
+// host-stage checks and the container-stage runtime never disagree. The
+// version itself lives in `TESTED_BUN_VERSION`, which also drives the host-Bun
+// warning in `typeclaw doctor` and the host daemon log.
+export const BUN_BASE_IMAGE = `oven/bun:${TESTED_BUN_VERSION}-slim`
 
 const FROM_AND_WORKDIR = `FROM ${BUN_BASE_IMAGE}
 

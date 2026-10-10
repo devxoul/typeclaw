@@ -81,10 +81,13 @@ jobs:
           # in ci.yml and release.yml so all three jobs use the same Bun.
           bun-version: 1.4.0
 
+      # dockerfile.ts has runtime imports (e.g. validateDockerfileAppendLine
+      # from @/config/config, which pulls in pi-ai), so the emit script needs
+      # dependencies installed — same as release.yml.
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
       - name: Generate base Dockerfile
-        # No `bun install` needed — scripts/emit-base-dockerfile.ts only
-        # imports dockerfile.ts, which has type-only imports from
-        # @/config/config.
         run: bun run scripts/emit-base-dockerfile.ts > base.Dockerfile
 
       - name: Show generated Dockerfile

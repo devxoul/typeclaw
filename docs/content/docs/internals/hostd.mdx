@@ -20,7 +20,8 @@ host:
   typeclaw start/stop  →  short-lived clients of hostd
                           (Unix socket ~/.typeclaw/run/hostd.sock)
 
-  typeclaw _hostd (singleton)
+  typeclaw _hostd (singleton watchdog parent; pidfile points here)
+  └─ typeclaw _hostd --worker (the daemon)
     ├─ supervisor                          (restart capability)
     ├─ portbroker-manager                  (one Broker per container)
     │     └─ ws → /portbroker on each agent
@@ -37,6 +38,10 @@ container:  typeclaw run
 The daemon is `typeclaw _hostd` (hidden subcommand). First container launch spawns it detached via `Bun.spawn` + `proc.unref()`. **This is the only detached spawn in the codebase.** Subsequent `start` calls connect, probe the daemon's source fingerprint via the `version` RPC, and respawn on mismatch via `shutdown` RPC. A 30s GC tick deregisters containers that no longer exist.
 
 A healthy daemon is only ever stopped over the `shutdown` RPC. The pidfile is signalled in exactly two self-healing cases, both in `src/hostd/spawn.ts`: a pidfile child still unreachable 30s after it was spawned (wedged — e.g. stuck in Bun's crash handler after a segfault — rather than slow-booting), and a daemon that acknowledged `shutdown` and unlinked its socket but did not exit within 2s (it would otherwise keep the HTTP control port and renewal timers next to the fresh daemon). PID-reuse safety comes from an identity check: the pid is signalled (SIGTERM, then SIGKILL) only when `ps` reports a command line that is exactly the daemon launch signature — three tokens: the `bun` executable, the typeclaw CLI entry, and `_hostd` — so a recycled pid that merely mentions `_hostd`, or carries the signature as arguments to another program, is never touched. Paths containing whitespace are ambiguous and fail closed (the child is adopted as before, never signalled). Both replacements are logged to `hostd.log` as `[hostd-spawn]` lines.
+
+Those cases only fire when a host CLI command runs, so between commands a crashed daemon would stay down; in the field one sat dead for 12 days. `_hostd` is therefore a thin watchdog parent (`src/hostd/watchdog.ts`) that runs the real daemon as `_hostd --worker`. Every 10s it probes the socket with `list`. A worker that exits non-zero is respawned. A worker that misses 3 probes in a row is SIGKILLed and respawned; a wedged crash handler never runs signal handlers, so SIGTERM is skipped. Misses don't count during a 30s startup grace unless the worker has already answered once. Respawns back off exponentially from 1s up to 60s, and the backoff resets once a worker has stayed up for 5 minutes. A clean (code 0) worker exit is an intentional `shutdown` or SIGTERM, so the parent exits with it and the drift-respawn flow above is unchanged. The worker's command line does not match the launch signature, so `spawn.ts` only ever signals the parent. SIGTERM to the parent forwards to the worker and force-kills it after 1.5s, inside `spawn.ts`'s 2s SIGKILL escalation. A worker whose parent was SIGKILLed notices the reparent within 5s and shuts down. Watchdog actions are logged as `[hostd-watchdog]` lines. Respawning loses nothing because registrations are replayed from disk on boot.
+
+The source fingerprint also covers the Bun runtime version. After `bun upgrade`, the next `start` sees drift and respawns the daemon on the new runtime. The watchdog parent and `typeclaw doctor` (`runtime.bun-available`) warn when the host Bun is older than `TESTED_BUN_VERSION` (`src/hostd/version.ts`), which is the same version the container base image and CI pin. The daemon runs on the host's Bun, not the container's, so an untested runtime would otherwise go unnoticed.
 
 ## Container ↔ host channels
 
@@ -62,8 +67,9 @@ NDJSON over the Unix socket. Connection-per-request. Kinds: `register`, `deregis
 - `kakao-renewal-manager.ts` / `webex-renewal-manager.ts` / `teams-renewal-manager.ts` — per-container renewal ticks (daily / hourly / 5-minutely). `shouldRenew` gate (CLI plumbs a predicate that reads `typeclaw.json#channels.<adapter>`). All three route `onRenewalOk` through `credential-rotation-apply.ts`.
 - `credential-rotation-apply.ts` — propagates a freshly written credential into the live adapter. The renewal cron writes `secrets.json`, but the running adapter captured the old credential in a client closure at `start()`, so it has to be told to re-read. Sends a `channels`-scoped reload carrying `cause: { kind: 'credential-rotation', adapter }` over the existing reload transport (host WebSocket, falling back to `docker exec`), which bounces **only that adapter**. Falls back to a full container restart when neither transport lands, or when the adapter could not be stopped. Does **not** fall back when the adapter is already down under supervision — recreating the container cannot fix a credential the platform rejected. Teams tokens expire every ~6h, so the previous restart-the-container-every-time behavior destroyed unrelated in-flight work ~4x a day.
 - `client.ts` — `isDaemonReachable()`, `send(req)` (Unix socket), `sendHttp(req, opts)` (HTTP from container).
+- `watchdog.ts` — the `_hostd` parent: spawns the `--worker` daemon, probes it, and kills and respawns it with backoff.
 - `spawn.ts` — `ensureDaemon()`. Lockfile-arbitrated spawn race; version-drift detection via `version` + `shutdown`.
-- `version.ts` — sha256 fingerprint over `src/**/*.ts` (tests excluded). `UNVERSIONED_SENTINEL` fallback when `src/` ancestor isn't findable.
+- `version.ts` — sha256 fingerprint over `src/**/*.ts` (tests excluded) plus the Bun runtime version; `TESTED_BUN_VERSION` and the host-Bun warning. `UNVERSIONED_SENTINEL` fallback when `src/` ancestor isn't findable.
 - `paths.ts` — `~/.typeclaw/` paths. Honors `TYPECLAW_HOME`.
 
 ## Managed image-build cache

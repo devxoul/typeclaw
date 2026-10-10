@@ -28,6 +28,11 @@ import { dirname, join, resolve, sep } from 'node:path'
 //    callback in `src/cli/hostd.ts` reaches into `src/container/` and
 //    `src/config/`). Over-respawning on `src/agent/` changes is acceptable
 //    cost: a daemon spawn is < 100ms.
+//
+// The Bun runtime version is folded in too. The daemon keeps running on the
+// binary it was spawned with, so after `bun upgrade` it would otherwise stay on
+// the old runtime until killed by hand — and an old runtime crashing is exactly
+// what took hostd down in the field.
 
 export type SourceVersion = string
 
@@ -38,6 +43,8 @@ export type ComputeOptions = {
   // Test seam. Tests inject an in-memory file map to keep the unit tests
   // hermetic; production reads the real filesystem.
   fs?: VersionFs
+  // Test seam: defaults to the Bun running this process.
+  runtimeVersion?: string
 }
 
 export type VersionFs = {
@@ -60,6 +67,7 @@ export async function computeSourceVersion(opts: ComputeOptions): Promise<Source
   files.sort()
 
   const hash = createHash('sha256')
+  hash.update(`bun:${opts.runtimeVersion ?? process.versions.bun ?? 'unknown'}\u0000`)
   for (const rel of files) {
     const abs = join(root, rel)
     const bytes = await fs.readFile(abs)
@@ -113,3 +121,15 @@ export function resolveSrcRoot(cliEntry: string): string | null {
 // preserves correctness for non-dev installs at the cost of disabling drift
 // detection there.
 export const UNVERSIONED_SENTINEL: SourceVersion = 'unversioned'
+
+// The Bun that CI and the container base image (`BUN_BASE_IMAGE`) run. Bump it
+// together with the `bun-version:` pins in .github/workflows/*.yml.
+export const TESTED_BUN_VERSION = '1.4.0'
+
+// The host daemon runs on the host's Bun, not the container's pinned one, so an
+// operator can silently stay on a runtime CI never tested (Bun 1.3.14's
+// segfault-then-wedge is what took a host daemon down for days).
+export function hostBunVersionWarning(hostBunVersion: string | undefined): string | null {
+  if (!hostBunVersion || Bun.semver.order(hostBunVersion, TESTED_BUN_VERSION) >= 0) return null
+  return `host Bun ${hostBunVersion} is older than Bun ${TESTED_BUN_VERSION}, which typeclaw is tested on; older runtimes have known crash bugs that take the host daemon down. Run \`bun upgrade\`.`
+}
