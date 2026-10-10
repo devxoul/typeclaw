@@ -17,6 +17,7 @@ import {
   type DockerExec,
 } from '@/container'
 import { homeRoot, isDaemonReachable, send } from '@/hostd'
+import { hostBunVersionWarning } from '@/hostd/version'
 import { resolveBaseImageVersion } from '@/init/cli-version'
 import { buildDockerfile, DOCKERFILE } from '@/init/dockerfile'
 import { detectMissingDeps } from '@/init/ensure-deps'
@@ -99,7 +100,7 @@ function dockerDaemonFix(reason: DockerUnavailableReason): string {
   }
 }
 
-function bunRuntime(): DoctorCheck {
+export function bunRuntime(bunVersion: string | undefined = process.versions.bun): DoctorCheck {
   return {
     name: 'runtime.bun-available',
     category: 'runtime',
@@ -113,7 +114,18 @@ function bunRuntime(): DoctorCheck {
           fix: { description: 'Install Bun (https://bun.sh) and ensure the typeclaw CLI runs under it.' },
         }
       }
-      return { status: 'ok', message: `Bun ${process.versions.bun ?? 'present'}` }
+      const outdated = hostBunVersionWarning(bunVersion)
+      if (outdated) {
+        return {
+          status: 'warning',
+          message: outdated,
+          fix: {
+            description:
+              'Run `bun upgrade`. The host daemon respawns on the new runtime at the next `typeclaw start` or `restart`.',
+          },
+        }
+      }
+      return { status: 'ok', message: `Bun ${bunVersion ?? 'present'}` }
     },
   }
 }
