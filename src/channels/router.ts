@@ -1468,7 +1468,9 @@ export type ChannelRouter = {
   attachBackgroundResultCoverage: (args: { parentSessionId: string; taskId: string }) => Promise<void>
   captureBackgroundResultCoverage?: (parentSessionId: string) => Promise<BackgroundObligationRef[]>
   captureInboundResultCoverage?: (parentSessionId: string) => Promise<InboundRef[]>
-  captureTurnAccountIdentity?: (parentSessionId: string) => Promise<string | undefined>
+  // Scoped to `adapter`: an identity is only comparable with accounts on the same
+  // platform, so a turn that came from another adapter has no binding to enforce.
+  captureTurnAccountIdentity?: (parentSessionId: string, adapter: ChannelKey['adapter']) => Promise<string | undefined>
   getConsecutiveSendCount: (target: {
     adapter: ChannelKey['adapter']
     workspace: string
@@ -8569,11 +8571,12 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
 
   const captureTurnAccountIdentity: NonNullable<ChannelRouter['captureTurnAccountIdentity']> = async (
     parentSessionId,
+    adapter,
   ) => {
     const live = [...liveSessions.values()].find(
       (candidate) => !candidate.destroyed && candidate.sessionId === parentSessionId,
     )
-    if (!live) return undefined
+    if (!live || live.key.adapter !== adapter) return undefined
     return backgroundObligations.withTargetLane(live.key, async () => {
       await ready
       inboundJournal.assertAvailable()
