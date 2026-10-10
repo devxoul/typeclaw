@@ -3,7 +3,14 @@ import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
 
-import { computeSourceVersion, resolveSrcRoot, UNVERSIONED_SENTINEL, type VersionFs } from './version'
+import {
+  computeSourceVersion,
+  hostBunVersionWarning,
+  resolveSrcRoot,
+  TESTED_BUN_VERSION,
+  UNVERSIONED_SENTINEL,
+  type VersionFs,
+} from './version'
 
 function fakeFs(files: Record<string, string>): VersionFs {
   const dirs = new Map<string, Set<string>>()
@@ -68,6 +75,13 @@ describe('computeSourceVersion', () => {
       fs: fakeFs({ [srcPath('a.ts')]: 'export const a = 2' }),
     })
     expect(original).not.toBe(modified)
+  })
+
+  test('changes when the Bun runtime changes, so `bun upgrade` respawns the daemon', async () => {
+    const files = { [srcPath('a.ts')]: 'export const a = 1' }
+    const old = await computeSourceVersion({ srcRoot: fakeSrcRoot, fs: fakeFs(files), runtimeVersion: '1.3.14' })
+    const upgraded = await computeSourceVersion({ srcRoot: fakeSrcRoot, fs: fakeFs(files), runtimeVersion: '1.4.3' })
+    expect(old).not.toBe(upgraded)
   })
 
   test('ignores test files', async () => {
@@ -169,5 +183,21 @@ describe('resolveSrcRoot', () => {
 describe('UNVERSIONED_SENTINEL', () => {
   test('is a stable string both peers can compare', () => {
     expect(UNVERSIONED_SENTINEL).toBe('unversioned')
+  })
+})
+
+describe('hostBunVersionWarning', () => {
+  test('warns on a host Bun older than the tested version', () => {
+    expect(hostBunVersionWarning('1.3.14')).toContain('bun upgrade')
+  })
+
+  test('is silent on the tested version or newer', () => {
+    expect(hostBunVersionWarning(TESTED_BUN_VERSION)).toBeNull()
+    expect(hostBunVersionWarning('1.4.3')).toBeNull()
+    expect(hostBunVersionWarning('2.0.0')).toBeNull()
+  })
+
+  test('is silent when the runtime is not Bun', () => {
+    expect(hostBunVersionWarning(undefined)).toBeNull()
   })
 })
