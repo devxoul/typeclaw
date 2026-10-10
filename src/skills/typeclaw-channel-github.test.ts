@@ -36,4 +36,16 @@ describe('typeclaw-channel-github PR review instructions', () => {
     expect(lower).toContain('skip_response')
     expect(lower).toContain('one participant-facing message')
   })
+
+  test('re-review query is gh-compatible and prints nothing when no decisive review exists', () => {
+    const query = skill
+      .split('\n')
+      .find((line) => line.trim().startsWith('gh api --paginate --slurp /repos/owner/repo/pulls/<N>/reviews'))
+    expect(query).toBeDefined()
+    // gh rejects --slurp combined with --jq; the filter must run in a piped jq.
+    expect(query).not.toContain('--jq')
+    expect(query).toContain('| jq -r')
+    // The flat-comment fallback is gated on "(a) is empty", so a missing state must not print `null`.
+    expect(query).toContain('| last | .state // empty')
+  })
 })
