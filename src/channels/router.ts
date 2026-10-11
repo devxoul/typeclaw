@@ -3823,6 +3823,17 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     }
   }
 
+  // A GitHub thread close-out decided (or still owed) this turn owns the turn's
+  // end: the willingness nudge never runs for it, so future-intent wording there
+  // ("해결할게요", "I'll go ahead and resolve") names the resolution itself, not
+  // a follow-up. Settlement and the nudge must agree, or an answered request is
+  // left owed until a live-turn-ended notice.
+  const githubCloseoutOwnsTurn = (live: LiveSession): boolean =>
+    live.githubReviewThreadCloseout !== null || live.githubReviewThreadCloseoutDecisionTurn === live.turnSeq
+
+  const promisesUnfinishedWork = (live: LiveSession, text: unknown): boolean =>
+    typeof text === 'string' && detectContinuationWillingness(text) && !githubCloseoutOwnsTurn(live)
+
   const installChannelReplyTerminalHook = (live: LiveSession): void => {
     const { agent } = live.session
     const prior = agent.afterToolCall
@@ -3853,7 +3864,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         // explicit more_work_this_turn flag tells us whether the delivered reply
         // renewed the promise or terminally fulfilled it.
         const text = (context.toolCall.arguments as { text?: unknown } | undefined)?.text
-        if (!keepTurnAlive && !(typeof text === 'string' && detectContinuationWillingness(text))) {
+        if (!keepTurnAlive && !promisesUnfinishedWork(live, text)) {
           await recordLandedBackgroundResponse(
             live,
             'terminal-channel-reply',
@@ -3876,10 +3887,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         const backgroundCoverage = Array.isArray(details.backgroundCoverage) ? details.backgroundCoverage : []
         const inboundCoverage = Array.isArray(details.inboundCoverage) ? details.inboundCoverage : []
         const text = (context.toolCall.arguments as { text?: unknown } | undefined)?.text
-        if (
-          (backgroundCoverage.length > 0 || inboundCoverage.length > 0) &&
-          !(typeof text === 'string' && detectContinuationWillingness(text))
-        ) {
+        if ((backgroundCoverage.length > 0 || inboundCoverage.length > 0) && !promisesUnfinishedWork(live, text)) {
           await recordLandedBackgroundResponse(live, 'origin-channel-send', backgroundCoverage, inboundCoverage)
         }
       }
@@ -7296,9 +7304,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     const record = live.lastTerminalReplyCompletion
     live.lastTerminalReplyCompletion = null
     if (record === null || record.turnSeq !== live.turnSeq) return
-    if (live.githubReviewThreadCloseout !== null || live.githubReviewThreadCloseoutDecisionTurn === live.turnSeq) {
-      return
-    }
+    if (githubCloseoutOwnsTurn(live)) return
     if (live.willingnessNudges >= MAX_WILLINGNESS_NUDGES) return
     if (live.promptQueue.length > 0) return
     if (record.text === undefined) return

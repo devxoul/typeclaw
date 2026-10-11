@@ -904,6 +904,54 @@ test('a GitHub already-resolved channel_send no-op settles no origin debt', asyn
   }
 })
 
+// "해결할게요" / "I'll go ahead and resolve" on a close-out names the resolution the same tool call
+// just performed. The willingness nudge never runs for a close-out turn, so withholding settlement
+// on that wording stranded the answered request until a live-turn-ended (or restart) notice.
+for (const tool of ['channel_send', 'channel_reply'] as const) {
+  for (const text of [
+    '제안이 반영되어 이 스레드는 해결할게요.',
+    "Addressed in abc123, I'll go ahead and resolve this thread.",
+  ]) {
+    test(`a GitHub ${tool} close-out worded as future intent closes its request: ${text}`, async () => {
+      const f = await debtFixture({ key: GITHUB_THREAD_KEY })
+      try {
+        f.router.registerReviewThreadResolver('github', async () => ({ ok: true }))
+        f.router.registerReviewStateResolver('github', async () => ({
+          ok: true,
+          selfBlocking: false,
+          selfBlockingReviewId: null,
+          approve: true,
+        }))
+        const parent = f.sessions[0]!
+        parent.onPrompt = async () => {
+          if (tool === 'channel_send') {
+            await f.channelSend(parent, { text, resolve_review_thread: true })
+            parent.finish('NO_REPLY')
+            return
+          }
+          // channel_reply's handler records the close-out decision before its after-tool hook runs.
+          f.router.finishGithubReviewThreadCloseout!({
+            sessionId: 'parent-1',
+            workspace: GITHUB_THREAD_KEY.workspace,
+            prNumber: 7,
+            thread: GITHUB_THREAD_KEY.thread,
+            decision: 'resolved',
+          })
+          await f.reply(parent, text)
+        }
+        const request = await f.route('Fixed in abc123.')
+        await f.flush()
+
+        expect(f.sent).toEqual([text])
+        expect(f.inputRow(request)).toMatchObject({ phase: 'closed', outcome: { kind: 'delivered' } })
+        expect(await f.outbox.list()).toEqual([])
+      } finally {
+        await f.cleanup()
+      }
+    })
+  }
+}
+
 for (const supersede of ['newer input', 'stop', 'account transfer'] as const) {
   test(`a held origin channel_send settles only its captured generation after ${supersede}`, async () => {
     const f = await debtFixture()
