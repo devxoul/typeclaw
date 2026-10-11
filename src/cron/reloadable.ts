@@ -3,7 +3,7 @@ import type { Reloadable, ReloadResult } from '@/reload'
 
 import { loadCron } from './index'
 import type { JobDiff, Scheduler } from './scheduler'
-import type { CronJob } from './schema'
+import type { CronJob, HandlerJob, ParsedCronJob } from './schema'
 
 export type CreateCronReloadableOptions = {
   cwd: string
@@ -74,7 +74,28 @@ async function doReload({
     return { scope: 'cron', ok: false, reason: `apply failed (schedule unchanged): ${message}` }
   }
 
-  return { scope: 'cron', ok: true, summary: formatSummary(diff, nextJobs.length), details: diff }
+  return { scope: 'cron', ok: true, summary: formatSummary(diff, nextJobs.length), details: plainDiff(diff) }
+}
+
+// `details` lands in the reload tool result, which pi structuredClones on every
+// later request in that session. A plugin handler job's function would make
+// that clone throw DataCloneError and wedge the session, so details carry data only.
+type CronJobData = ParsedCronJob | Omit<HandlerJob, 'handler'>
+type CronReloadDetails = Record<keyof JobDiff, CronJobData[]>
+
+function plainDiff(diff: JobDiff): CronReloadDetails {
+  const plain = (jobs: CronJob[]): CronJobData[] =>
+    jobs.map((job) => {
+      if (job.kind !== 'handler') return job
+      const { handler: _handler, ...data } = job
+      return data
+    })
+  return {
+    added: plain(diff.added),
+    removed: plain(diff.removed),
+    updated: plain(diff.updated),
+    unchanged: plain(diff.unchanged),
+  }
 }
 
 function formatSummary(diff: JobDiff, total: number): string {
