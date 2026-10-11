@@ -369,6 +369,37 @@ describe('createCronReloadable', () => {
     const details = result.details as { added: { id: string }[] }
     expect(details.added.map((j) => j.id)).toEqual(['new'])
   })
+
+  test('details stay structured-cloneable when plugin handler jobs are in the diff', async () => {
+    // The reload tool puts details into the session transcript, which pi
+    // structuredClones before every provider request.
+    const handlerJob: CronJob = {
+      id: 'memory-dreaming',
+      schedule: '*/30 * * * *',
+      kind: 'handler',
+      enabled: true,
+      handler: async () => {},
+    }
+    const scheduler: Scheduler = {
+      start: () => {},
+      stop: () => {},
+      replaceJobs: () => ({
+        added: [handlerJob],
+        removed: [handlerJob],
+        updated: [handlerJob],
+        unchanged: [handlerJob],
+      }),
+      currentJobs: () => [],
+    }
+    await writeFile(join(agentDir, 'cron.json'), JSON.stringify({ jobs: [] }))
+
+    const result = await asSuccess(createCronReloadable({ cwd: agentDir, scheduler }).reload())
+
+    const cloned = structuredClone(result.details) as Record<string, unknown[]>
+    for (const key of ['added', 'removed', 'updated', 'unchanged']) {
+      expect(cloned[key]).toEqual([{ id: 'memory-dreaming', schedule: '*/30 * * * *', kind: 'handler', enabled: true }])
+    }
+  })
 })
 
 function job(id: string): CronJob {
