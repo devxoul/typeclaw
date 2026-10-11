@@ -16,12 +16,16 @@ const rowSchema = z.object({
   thread_ts: z.string().optional(),
   author: z.object({ id: z.string() }).optional(),
   nonce: z.union([z.string(), z.number()]).nullish(),
-  metadata: z.object({ event_type: z.string(), event_payload: z.object({ delivery_id: z.string() }) }).optional(),
+  // Other apps' message metadata in the same history page must not fail the whole parse.
+  metadata: z
+    .object({ event_type: z.string().optional(), event_payload: z.record(z.string(), z.unknown()).optional() })
+    .optional(),
 })
 const responseSchema = z.object({
   ok: z.boolean().optional(),
   error: z.string().optional(),
-  message: z.string().optional(),
+  // Discord errors carry a string; Slack chat.postMessage returns the posted message object.
+  message: z.unknown().optional(),
   has_more: z.boolean().optional(),
   errors: z.array(z.unknown()).optional(),
   team_id: z.string().optional(),
@@ -101,19 +105,18 @@ export function createBotRecoveryCallbacks(
         let rows: z.infer<typeof rowSchema>[]
         let next: string | undefined
         if (slack) {
+          // Form-encoded like createSlackHistoryCallback: the JSON body for conversations.replies came back
+          // `invalid_arguments` in production, so reconcile never saw the notice it had already posted.
+          const form = new URLSearchParams({ channel: target.chat, limit: '100', include_all_metadata: 'true' })
+          if (target.thread) form.set('ts', target.thread)
+          if (cursor) form.set('cursor', cursor)
           const data = await json(
             fetchImpl,
             `https://slack.com/api/conversations.${target.thread ? 'replies' : 'history'}`,
             {
               method: 'POST',
-              headers,
-              body: JSON.stringify({
-                channel: target.chat,
-                ts: target.thread ?? undefined,
-                limit: 100,
-                cursor,
-                include_all_metadata: true,
-              }),
+              headers: { ...headers, 'Content-Type': 'application/x-www-form-urlencoded; charset=utf-8' },
+              body: form.toString(),
             },
           )
           if (!data.messages) throw new Error('recovery-history-missing-messages')

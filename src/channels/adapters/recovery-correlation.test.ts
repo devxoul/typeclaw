@@ -39,12 +39,18 @@ test('Slack reconciles own metadata on later page, never another actor or thread
   let page = 0
   const api = transport((url, init) => {
     if (url.endsWith('auth.test')) return { ok: true, team_id: 'T', user_id: 'U' }
-    const payload = JSON.parse(String(init?.body))
+    const headers = new Headers(init?.headers)
+    if (!headers.get('Content-Type')?.startsWith('application/x-www-form-urlencoded'))
+      return { ok: false, error: 'invalid_arguments' }
+    const payload = new URLSearchParams(String(init?.body))
+    expect(payload.get('include_all_metadata')).toBe('true')
     page++
-    if (!payload.cursor)
+    if (!payload.get('cursor'))
       return {
         ok: true,
         messages: [
+          { ts: '0', user: 'other-app', metadata: { event_type: 'task_created', event_payload: { id: 7 } } },
+          { ts: '0.5', user: 'U', metadata: { event_type: 'typeclaw_recovery' } },
           {
             ts: '1',
             user: 'other',
@@ -239,7 +245,12 @@ test('Slack DM HTTP recovery preserves authenticated team/user and delivers meta
       requests.push(path)
       if (path === '/api/auth.test') return Response.json({ ok: true, team_id: 'T1', user_id: 'U_BOT' })
       posted = (await request.json()) as Record<string, unknown>
-      return Response.json({ ok: true, ts: '123.456' })
+      return Response.json({
+        ok: true,
+        channel: 'D1',
+        ts: '123.456',
+        message: { type: 'message', user: 'U_BOT', text: 'notice', ts: '123.456' },
+      })
     },
   })
   const http = ((input, init) => fetch(new URL(new URL(String(input)).pathname, server.url), init)) as typeof fetch
